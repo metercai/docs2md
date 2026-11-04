@@ -702,7 +702,7 @@ pub fn crop_line(
 }
 
 /// Right-pad ink maps to one width: (array [B, 1, H, Wm] row-major, widths).
-pub fn pad_batch(lines: &[InkMap], multiple: usize) -> (Vec<f32>, Vec<i32>) {
+pub fn pad_batch(lines: &[&InkMap], multiple: usize) -> (Vec<f32>, Vec<i32>) {
     let h = lines[0].h;
     let wm = lines.iter().map(|l| l.w).max().unwrap_or(0);
     let wm = wm.div_ceil(multiple) * multiple;

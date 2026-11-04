@@ -11,6 +11,7 @@ pub mod det;
 pub mod lm;
 pub mod npz;
 pub mod preproc;
+pub mod rec;
 pub mod vocab;
 
 use std::collections::HashMap;
