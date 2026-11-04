@@ -1,0 +1,14 @@
+[package]
+name = "docs2md-l2d"
+version = "0.1.0"
+edition = "2021"
+description = "docs2md L2 service wrapper: supervises a llama-server process (PaddleOCR-VL or any OpenAI-compatible VLA) and keeps it healthy."
+license = "MPL-2.0"
+repository = "https://github.com/metercai/docs2md"
+
+[[bin]]
+name = "docs2md-l2d"
+path = "src/main.rs"
+
+# Dependency-free on purpose: the supervisor is std-only (spawn + a single
+# raw-TCP /health GET), so it builds anywhere with zero download.

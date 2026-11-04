@@ -1,0 +1,44 @@
+[workspace]
+members = [".", "crates/ocr", "services/docs2md-l2d"]
+resolver = "2"
+
+[package]
+name = "docs2md"
+version = "0.1.0"
+edition = "2021"
+description = "PDF → Markdown, three tiers: L0 native extraction / L1 embedded pure-Rust PP-OCRv6 (ONNX) / L2 external VLM service (llama-server wrapper)."
+license = "MPL-2.0"
+repository = "https://github.com/metercai/docs2md"
+keywords = ["pdf", "markdown", "ocr", "pp-ocr", "vla"]
+categories = ["command-line-utilities", "parsing"]
+
+[lib]
+name = "docs2md"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docs2md"
+path = "src/main.rs"
+
+[dependencies]
+docs2md-ocr = { path = "crates/ocr", default-features = false }
+pdf-inspector = "1.25"
+pdf_oxide = { version = "0.3", features = ["rendering"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+thiserror = "1"
+
+[features]
+default = []
+# Reserved slot: embed the Indra ONNX engine into the L1 engine trait.
+# Not ported to Rust yet (v1) — see models/indra/ and src/l1/indra.rs stub.
+indra = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 2
+strip = true

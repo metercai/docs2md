@@ -1,0 +1,658 @@
+use crate::calibration::{CalibrationOptions, OptimizationOptions};
+use crate::types::{ClsConfig, DetConfig, GlobalConfig, OrientConfig, RecConfig, UnwarpConfig};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Preset configuration for OCR model architectures
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelPreset {
+    pub det_limit_side_len: i32,
+    pub det_limit_type: &'static str,
+    pub det_thresh: f32,
+    pub det_box_thresh: f32,
+    pub det_unclip_ratio: f32,
+    pub det_use_dilation: bool,
+    pub det_score_mode: &'static str,
+    pub rec_img_shape: [i32; 3],
+    pub rec_batch_num: i32,
+    pub text_score: f32,
+}
+
+/// Default preset configuration for PP-OCRv6 models
+pub const PPV6_MODEL_CONFIG: ModelPreset = ModelPreset {
+    det_limit_side_len: 736,
+    det_limit_type: "min",
+    det_thresh: 0.3,
+    det_box_thresh: 0.6,
+    det_unclip_ratio: 2.0,
+    det_use_dilation: true,
+    det_score_mode: "slow",
+    rec_img_shape: [3, 48, 320],
+    rec_batch_num: 6,
+    text_score: 0.5,
+};
+
+/// Default preset configuration for PP-OCRv5 models
+pub const PPV5_MODEL_CONFIG: ModelPreset = ModelPreset {
+    det_limit_side_len: 736,
+    det_limit_type: "min",
+    det_thresh: 0.3,
+    det_box_thresh: 0.5,
+    det_unclip_ratio: 2.0,
+    det_use_dilation: true,
+    det_score_mode: "slow",
+    rec_img_shape: [3, 48, 320],
+    rec_batch_num: 6,
+    text_score: 0.5,
+};
+
+/// Default preset configuration for PP-OCRv4 models
+pub const PPV4_MODEL_CONFIG: ModelPreset = ModelPreset {
+    det_limit_side_len: 960,
+    det_limit_type: "max",
+    det_thresh: 0.3,
+    det_box_thresh: 0.6,
+    det_unclip_ratio: 1.5,
+    det_use_dilation: false,
+    det_score_mode: "slow",
+    rec_img_shape: [3, 48, 320],
+    rec_batch_num: 6,
+    text_score: 0.5,
+};
+
+/// Default preset configuration for PP-OCRv3 models
+pub const PPV3_MODEL_CONFIG: ModelPreset = ModelPreset {
+    det_limit_side_len: 960,
+    det_limit_type: "max",
+    det_thresh: 0.3,
+    det_box_thresh: 0.6,
+    det_unclip_ratio: 1.5,
+    det_use_dilation: false,
+    det_score_mode: "slow",
+    rec_img_shape: [3, 48, 320],
+    rec_batch_num: 6,
+    text_score: 0.5,
+};
+
+/// Main configuration for RustO OCR engine
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InitializeConfig {
+    /// Detection model configuration
+    pub det: DetConfig,
+
+    /// Recognition model configuration
+    pub rec: RecConfig,
+
+    /// Global OCR settings
+    pub global: GlobalConfig,
+
+    /// Optional: Orientation classification configuration
+    pub orient: Option<OrientConfig>,
+
+    /// Optional: Text rectification configuration
+    pub unwarp: Option<UnwarpConfig>,
+
+    /// Optional: Text classification (line orientation) configuration
+    pub cls: Option<ClsConfig>,
+}
+
+impl Default for InitializeConfig {
+    fn default() -> Self {
+        Self::from_preset(PPV6_MODEL_CONFIG, "det.rten", "rec.rten", "dict.txt")
+    }
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct DetectionConfigJson {
+    #[serde(alias = "useDet", alias = "use_det")]
+    enabled: Option<bool>,
+    #[serde(
+        alias = "modelPath",
+        alias = "detModelPath",
+        alias = "model_path",
+        alias = "det_model_path"
+    )]
+    model_path: Option<PathBuf>,
+    #[serde(alias = "detThresh", alias = "det_thresh")]
+    thresh: Option<f32>,
+    #[serde(
+        alias = "boxThresh",
+        alias = "detBoxThresh",
+        alias = "box_thresh",
+        alias = "det_box_thresh"
+    )]
+    box_thresh: Option<f32>,
+    #[serde(alias = "unclipRatio", alias = "unclip_ratio")]
+    unclip_ratio: Option<f32>,
+    #[serde(alias = "limitSideLen", alias = "limit_side_len")]
+    limit_side_len: Option<i32>,
+    #[serde(alias = "limitType", alias = "limit_type")]
+    limit_type: Option<String>,
+    #[serde(alias = "useDilation", alias = "use_dilation")]
+    use_dilation: Option<bool>,
+    #[serde(
+        alias = "scoreMode",
+        alias = "score_mode",
+        alias = "detScoreMode",
+        alias = "det_score_mode"
+    )]
+    score_mode: Option<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct RecognitionConfigJson {
+    #[serde(alias = "useRec", alias = "use_rec")]
+    enabled: Option<bool>,
+    #[serde(
+        alias = "modelPath",
+        alias = "recModelPath",
+        alias = "model_path",
+        alias = "rec_model_path"
+    )]
+    model_path: Option<PathBuf>,
+    #[serde(alias = "dictPath", alias = "dict_path")]
+    dict_path: Option<PathBuf>,
+    #[serde(
+        alias = "scoreThresh",
+        alias = "textScore",
+        alias = "score_thresh",
+        alias = "text_score"
+    )]
+    score_thresh: Option<f32>,
+    #[serde(alias = "returnWordBox", alias = "return_word_box")]
+    return_word_box: Option<bool>,
+    #[serde(alias = "returnSingleCharBox", alias = "return_single_char_box")]
+    return_single_char_box: Option<bool>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct ClassificationConfigJson {
+    #[serde(alias = "useCls", alias = "use_cls")]
+    enabled: Option<bool>,
+    #[serde(
+        alias = "modelPath",
+        alias = "clsModelPath",
+        alias = "model_path",
+        alias = "cls_model_path"
+    )]
+    model_path: Option<PathBuf>,
+    #[serde(
+        alias = "thresh",
+        alias = "clsThreshold",
+        alias = "cls_thresh",
+        alias = "cls_threshold"
+    )]
+    threshold: Option<f32>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct OrientationConfigJson {
+    #[serde(alias = "useOrient", alias = "use_orient")]
+    enabled: Option<bool>,
+    #[serde(
+        alias = "modelPath",
+        alias = "orientModelPath",
+        alias = "model_path",
+        alias = "orient_model_path"
+    )]
+    model_path: Option<PathBuf>,
+    #[serde(
+        alias = "thresh",
+        alias = "orientThreshold",
+        alias = "orient_thresh",
+        alias = "orient_threshold"
+    )]
+    threshold: Option<f32>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct UnwarpConfigJson {
+    #[serde(alias = "useUnwarp", alias = "use_unwarp")]
+    enabled: Option<bool>,
+    #[serde(
+        alias = "modelPath",
+        alias = "unwarpModelPath",
+        alias = "model_path",
+        alias = "unwarp_model_path"
+    )]
+    model_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct LayoutConfigJson {
+    #[serde(alias = "yThresholdMultiplier", alias = "y_threshold_multiplier")]
+    y_threshold_multiplier: Option<f32>,
+    #[serde(alias = "xThresholdMultiplier", alias = "x_threshold_multiplier")]
+    x_threshold_multiplier: Option<f32>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+struct FlatConfig {
+    #[serde(alias = "template")]
+    template: Option<String>,
+
+    detection: Option<DetectionConfigJson>,
+    recognition: Option<RecognitionConfigJson>,
+    classification: Option<ClassificationConfigJson>,
+    orientation: Option<OrientationConfigJson>,
+    unwarp: Option<UnwarpConfigJson>,
+    layout: Option<LayoutConfigJson>,
+}
+
+impl InitializeConfig {
+    /// Create a configuration with model paths using the default PPV6 template
+    pub fn new<P: Into<PathBuf>>(det_model_path: P, rec_model_path: P, dict_path: P) -> Self {
+        Self::from_preset(PPV6_MODEL_CONFIG, det_model_path, rec_model_path, dict_path)
+    }
+
+    /// Create a configuration from a template preset
+    pub fn from_preset<P: Into<PathBuf>>(
+        preset: ModelPreset,
+        det_model_path: P,
+        rec_model_path: P,
+        dict_path: P,
+    ) -> Self {
+        let det_path = det_model_path.into();
+        let rec_path = rec_model_path.into();
+        let dict = dict_path.into();
+
+        let mut det = DetConfig::default(det_path);
+        det.limit_side_len = preset.det_limit_side_len;
+        det.limit_type = preset.det_limit_type.to_string();
+        det.thresh = preset.det_thresh;
+        det.box_thresh = preset.det_box_thresh;
+        det.unclip_ratio = preset.det_unclip_ratio;
+        det.use_dilation = preset.det_use_dilation;
+        det.score_mode = preset.det_score_mode.to_string();
+
+        let mut rec = RecConfig::default(rec_path);
+        rec.rec_keys_path = Some(dict);
+        rec.rec_img_shape = preset.rec_img_shape;
+        rec.rec_batch_num = preset.rec_batch_num;
+
+        let global = GlobalConfig {
+            text_score: preset.text_score,
+            ..Default::default()
+        };
+
+        Self {
+            det,
+            rec,
+            global,
+            orient: None,
+            unwarp: None,
+            cls: None,
+        }
+    }
+
+    /// Create a configuration for PP-OCRv6 models
+    pub fn ppv6<P: Into<PathBuf>>(det_model_path: P, rec_model_path: P, dict_path: P) -> Self {
+        Self::from_preset(PPV6_MODEL_CONFIG, det_model_path, rec_model_path, dict_path)
+    }
+
+    /// Create a configuration for PP-OCRv5 models
+    pub fn ppv5<P: Into<PathBuf>>(det_model_path: P, rec_model_path: P, dict_path: P) -> Self {
+        Self::from_preset(PPV5_MODEL_CONFIG, det_model_path, rec_model_path, dict_path)
+    }
+
+    /// Create a configuration for PP-OCRv4 models
+    pub fn ppv4<P: Into<PathBuf>>(det_model_path: P, rec_model_path: P, dict_path: P) -> Self {
+        Self::from_preset(PPV4_MODEL_CONFIG, det_model_path, rec_model_path, dict_path)
+    }
+
+    /// Create a configuration for PP-OCRv3 models
+    pub fn ppv3<P: Into<PathBuf>>(det_model_path: P, rec_model_path: P, dict_path: P) -> Self {
+        Self::from_preset(PPV3_MODEL_CONFIG, det_model_path, rec_model_path, dict_path)
+    }
+
+    /// Parse configuration from a JSON string (supports direct structured and grouped JSON formats)
+    pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
+        // Try direct structured format first
+        if let Ok(config) = serde_json::from_str::<InitializeConfig>(json_str) {
+            return Ok(config);
+        }
+
+        // Fall back to grouped format
+        let flat: FlatConfig = serde_json::from_str(json_str)?;
+        let det_path = flat
+            .detection
+            .as_ref()
+            .and_then(|d| d.model_path.clone())
+            .unwrap_or_else(|| PathBuf::from("det.rten"));
+        let rec_path = flat
+            .recognition
+            .as_ref()
+            .and_then(|r| r.model_path.clone())
+            .unwrap_or_else(|| PathBuf::from("rec.rten"));
+        let dict_path = flat
+            .recognition
+            .as_ref()
+            .and_then(|r| r.dict_path.clone())
+            .unwrap_or_else(|| PathBuf::from("dict.txt"));
+
+        let preset = match flat.template.as_deref() {
+            Some("ppv5") | Some("PPOCRv5") | Some("v5") | Some("pp-ocrv5") => PPV5_MODEL_CONFIG,
+            Some("ppv4") | Some("PPOCRv4") | Some("v4") | Some("pp-ocrv4") => PPV4_MODEL_CONFIG,
+            Some("ppv3") | Some("PPOCRv3") | Some("v3") | Some("pp-ocrv3") => PPV3_MODEL_CONFIG,
+            _ => PPV6_MODEL_CONFIG,
+        };
+
+        let mut config = Self::from_preset(preset, det_path, rec_path, dict_path);
+
+        let orient_path = flat.orientation.as_ref().and_then(|o| o.model_path.clone());
+        let orient_thresh = flat.orientation.as_ref().and_then(|o| o.threshold);
+        if let Some(path) = orient_path {
+            if let Some(thresh) = orient_thresh {
+                config = config.with_orientation_threshold(path, thresh);
+            } else {
+                config = config.with_orientation(path);
+            }
+        }
+
+        let cls_path = flat
+            .classification
+            .as_ref()
+            .and_then(|c| c.model_path.clone());
+        let cls_thresh = flat.classification.as_ref().and_then(|c| c.threshold);
+        if let Some(path) = cls_path {
+            if let Some(thresh) = cls_thresh {
+                config = config.with_cls_threshold(path, thresh);
+            } else {
+                config = config.with_cls(path);
+            }
+        }
+
+        let unwarp_path = flat.unwarp.as_ref().and_then(|u| u.model_path.clone());
+        if let Some(path) = unwarp_path {
+            config = config.with_unwarp(path);
+        }
+
+        if let Some(score) = flat.recognition.as_ref().and_then(|r| r.score_thresh) {
+            config.global.text_score = score;
+        }
+        if let Some(thresh) = flat.detection.as_ref().and_then(|d| d.thresh) {
+            config.det.thresh = thresh;
+        }
+        if let Some(box_thresh) = flat.detection.as_ref().and_then(|d| d.box_thresh) {
+            config.det.box_thresh = box_thresh;
+        }
+        if let Some(side_len) = flat.detection.as_ref().and_then(|d| d.limit_side_len) {
+            config.det.limit_side_len = side_len;
+        }
+        if let Some(limit_type) = flat.detection.as_ref().and_then(|d| d.limit_type.clone()) {
+            config.det.limit_type = limit_type;
+        }
+        if let Some(unclip) = flat.detection.as_ref().and_then(|d| d.unclip_ratio) {
+            config.det.unclip_ratio = unclip;
+        }
+        if let Some(dilation) = flat.detection.as_ref().and_then(|d| d.use_dilation) {
+            config.det.use_dilation = dilation;
+        }
+        if let Some(score_mode) = flat.detection.as_ref().and_then(|d| d.score_mode.clone()) {
+            config.det.score_mode = score_mode;
+        }
+        if let Some(use_det) = flat.detection.as_ref().and_then(|d| d.enabled) {
+            config.global.use_det = use_det;
+        }
+        if let Some(use_rec) = flat.recognition.as_ref().and_then(|r| r.enabled) {
+            config.global.use_rec = use_rec;
+        }
+        if let Some(use_cls) = flat.classification.as_ref().and_then(|c| c.enabled) {
+            config.global.use_cls = use_cls;
+        }
+        if let Some(use_orient) = flat.orientation.as_ref().and_then(|o| o.enabled) {
+            config.global.use_orient = use_orient;
+        }
+        if let Some(use_unwarp) = flat.unwarp.as_ref().and_then(|u| u.enabled) {
+            config.global.use_unwarp = use_unwarp;
+        }
+        if let Some(word_box) = flat.recognition.as_ref().and_then(|r| r.return_word_box) {
+            config.global.return_word_box = word_box;
+        }
+        if let Some(char_box) = flat
+            .recognition
+            .as_ref()
+            .and_then(|r| r.return_single_char_box)
+        {
+            config.global.return_single_char_box = char_box;
+        }
+        if let Some(y_mult) = flat.layout.as_ref().and_then(|l| l.y_threshold_multiplier) {
+            config.global.y_threshold_multiplier = Some(y_mult);
+        }
+        if let Some(x_mult) = flat.layout.as_ref().and_then(|l| l.x_threshold_multiplier) {
+            config.global.x_threshold_multiplier = Some(x_mult);
+        }
+
+        Ok(config)
+    }
+
+    /// Serialize configuration to a JSON string
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Set detection model path
+    pub fn with_det_model<P: Into<PathBuf>>(mut self, model_path: P) -> Self {
+        self.det.model_path = model_path.into();
+        self
+    }
+
+    /// Set recognition model path
+    pub fn with_rec_model<P: Into<PathBuf>>(mut self, model_path: P) -> Self {
+        self.rec.model_path = model_path.into();
+        self
+    }
+
+    /// Set recognition dictionary path
+    pub fn with_dict<P: Into<PathBuf>>(mut self, dict_path: P) -> Self {
+        self.rec.rec_keys_path = Some(dict_path.into());
+        self
+    }
+
+    /// Add orientation classification to the configuration
+    pub fn with_orientation<P: Into<PathBuf>>(mut self, model_path: P) -> Self {
+        self.orient = Some(OrientConfig::default(model_path.into()));
+        self.global.use_orient = true;
+        self
+    }
+
+    /// Add orientation classification with custom confidence threshold
+    pub fn with_orientation_threshold<P: Into<PathBuf>>(
+        mut self,
+        model_path: P,
+        threshold: f32,
+    ) -> Self {
+        let mut config = OrientConfig::default(model_path.into());
+        config.confidence_threshold = threshold;
+        self.orient = Some(config);
+        self.global.use_orient = true;
+        self
+    }
+
+    /// Add text rectification to the configuration
+    pub fn with_unwarp<P: Into<PathBuf>>(mut self, model_path: P) -> Self {
+        self.unwarp = Some(UnwarpConfig::default(model_path.into()));
+        self.global.use_unwarp = true;
+        self
+    }
+
+    /// Add text classification (line orientation) to the configuration
+    pub fn with_cls<P: Into<PathBuf>>(mut self, model_path: P) -> Self {
+        self.cls = Some(ClsConfig::default(model_path.into()));
+        self.global.use_cls = true;
+        self
+    }
+
+    /// Add text classification (line orientation) with custom confidence threshold
+    pub fn with_cls_threshold<P: Into<PathBuf>>(mut self, model_path: P, threshold: f32) -> Self {
+        let mut config = ClsConfig::default(model_path.into());
+        config.cls_thresh = threshold;
+        self.cls = Some(config);
+        self.global.use_cls = true;
+        self
+    }
+
+    /// Enable debug images (oriented and rectified images will be included in output)
+    /// Note: This adds overhead and should only be used for debugging/development
+    pub fn with_debug_images(mut self, enabled: bool) -> Self {
+        self.global.debug_images = enabled;
+        self
+    }
+
+    /// Set text confidence score threshold (0.0 to 1.0)
+    pub fn with_text_score(mut self, score: f32) -> Self {
+        self.global.text_score = score;
+        self
+    }
+
+    /// Set minimum text box height
+    pub fn with_min_height(mut self, height: f32) -> Self {
+        self.global.min_height = height;
+        self
+    }
+
+    /// Set maximum image side length for detection
+    pub fn with_max_side_len(mut self, len: f32) -> Self {
+        self.global.max_side_len = len;
+        self
+    }
+
+    /// Set minimum image side length for detection
+    pub fn with_min_side_len(mut self, len: f32) -> Self {
+        self.global.min_side_len = len;
+        self
+    }
+
+    /// Enable/disable text detection
+    pub fn with_detection(mut self, enabled: bool) -> Self {
+        self.global.use_det = enabled;
+        self
+    }
+
+    /// Enable/disable text recognition
+    pub fn with_recognition(mut self, enabled: bool) -> Self {
+        self.global.use_rec = enabled;
+        self
+    }
+
+    /// Set XY threshold multipliers for spatial text line grouping and column spacing
+    pub fn with_xy_threshold(mut self, y_threshold: f32, x_threshold: f32) -> Self {
+        self.global.y_threshold_multiplier = Some(y_threshold);
+        self.global.x_threshold_multiplier = Some(x_threshold);
+        self
+    }
+
+    /// Set Y threshold multiplier for line grouping in spatial text
+    pub fn with_y_threshold(mut self, y_threshold: f32) -> Self {
+        self.global.y_threshold_multiplier = Some(y_threshold);
+        self
+    }
+
+    /// Set X threshold multiplier for word/column gap separation in spatial text
+    pub fn with_x_threshold(mut self, x_threshold: f32) -> Self {
+        self.global.x_threshold_multiplier = Some(x_threshold);
+        self
+    }
+
+    /// Set detection binarization threshold (0.0 to 1.0)
+    pub fn with_det_thresh(mut self, thresh: f32) -> Self {
+        self.det.thresh = thresh;
+        self
+    }
+
+    /// Set detection box score threshold (0.0 to 1.0)
+    pub fn with_det_box_thresh(mut self, box_thresh: f32) -> Self {
+        self.det.box_thresh = box_thresh;
+        self
+    }
+
+    /// Set detection limit side length
+    pub fn with_limit_side_len(mut self, len: i32) -> Self {
+        self.det.limit_side_len = len;
+        self
+    }
+
+    /// Set detection limit type ("min" or "max")
+    pub fn with_limit_type(mut self, limit_type: impl Into<String>) -> Self {
+        self.det.limit_type = limit_type.into();
+        self
+    }
+
+    /// Set detection unclip ratio
+    pub fn with_unclip_ratio(mut self, ratio: f32) -> Self {
+        self.det.unclip_ratio = ratio;
+        self
+    }
+
+    /// Set detection dilation flag
+    pub fn with_use_dilation(mut self, use_dilation: bool) -> Self {
+        self.det.use_dilation = use_dilation;
+        self
+    }
+
+    /// Enable/disable return word box
+    pub fn with_return_word_box(mut self, enabled: bool) -> Self {
+        self.global.return_word_box = enabled;
+        self
+    }
+
+    /// Enable/disable return single char box
+    pub fn with_return_single_char_box(mut self, enabled: bool) -> Self {
+        self.global.return_single_char_box = enabled;
+        self
+    }
+
+    /// Set recognition input image shape [channels, height, width]
+    pub fn with_rec_img_shape(mut self, shape: [i32; 3]) -> Self {
+        self.rec.rec_img_shape = shape;
+        self
+    }
+
+    /// Set recognition batch size
+    pub fn with_rec_batch_num(mut self, batch_num: i32) -> Self {
+        self.rec.rec_batch_num = batch_num;
+        self
+    }
+
+    /// Set maximum detection candidates
+    pub fn with_max_candidates(mut self, max_candidates: i32) -> Self {
+        self.det.max_candidates = max_candidates;
+        self
+    }
+
+    /// Set detection score mode ("fast" or "slow")
+    pub fn with_score_mode(mut self, score_mode: impl Into<String>) -> Self {
+        self.det.score_mode = score_mode.into();
+        self
+    }
+
+    /// Set detection normalization mean
+    pub fn with_det_mean(mut self, mean: [f32; 3]) -> Self {
+        self.det.mean = mean;
+        self
+    }
+
+    /// Set detection normalization standard deviation
+    pub fn with_det_std(mut self, std: [f32; 3]) -> Self {
+        self.det.std = std;
+        self
+    }
+
+    /// Set aspect ratio threshold for long text boxes
+    pub fn with_width_height_ratio(mut self, ratio: f32) -> Self {
+        self.global.width_height_ratio = ratio;
+        self
+    }
+
+    /// Set pre-OCR image calibration options
+    pub fn with_calibration(mut self, calibration: CalibrationOptions) -> Self {
+        self.global.calibration = Some(calibration);
+        self
+    }
+
+    /// Set runtime image optimization options
+    pub fn with_optimization(mut self, optimization: OptimizationOptions) -> Self {
+        self.global.optimization = Some(optimization);
+        self
+    }
+}

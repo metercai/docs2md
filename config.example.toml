@@ -1,0 +1,69 @@
+# docs2md configuration example.
+# Copy to ./docs2md.toml (or point at it with `docs2md -c <path>` /
+# $DOCS2MD_CONFIG). Every field has a default; a missing file runs on
+# defaults. Unknown keys are a hard error (typos fail loudly).
+
+# ── L0: native text extraction ──────────────────────────────────────────
+[l0]
+# Render DPI for needs-ocr pages (shared by G1 layout routing and the L2 send).
+dpi = 150
+
+# ── L1: embedded pure-Rust PP-OCRv6 (ONNX on rten) ─────────────────────
+[l1]
+# PP-OCRv6 tier. "small" is embedded in the binary (the "one binary" build).
+# "medium"/"tiny" are NOT embedded — selecting one requires [l1] model_dir
+# pointing at a dir that contains PPOCR_v6_<tier>_rten/{det,rec}.onnx.
+tier = "small"
+# External model dir for a non-embedded tier (ignored when tier = "small").
+# model_dir = "/path/to/rusto-models"
+# External PP-DocLayout ONNX (the ~130MB layout model is NOT embedded, and is
+# over GitHub's 100MB single-file limit, so it is fetched separately).
+# When unset, G1 layout routing is skipped and every OCR page defaults to
+# L1 (G2 output-level can still escalate to L2).
+# layout_model = "/path/to/DocOCR/pp_doclayout_plus_l.onnx"
+# Layout detector input size (long edge, pixels).
+layout_target_size = 800
+# Reserved slot: use the Indra engine instead of PP-OCRv6. The Indra engine
+# is not ported to Rust yet (v1) — leave false; true returns a clear error.
+use_indra = false
+
+# ── L2: external VLM service (a llama-server wrapper) ───────────────────
+[l2]
+# Base URL of the L2 service (OpenAI-compatible; typically launched by
+# docs2md-l2d). When empty, L2 is disabled and complex pages fall back to
+# L1 and are marked "needs a higher-tier OCR model".
+# base_url = "http://127.0.0.1:8080"
+# Model name in the chat-completion body (llama-server serves one model).
+# model = "docs2md"
+# Prompt prefix sent before the page image.
+prompt = "OCR:"
+max_tokens = 4096
+timeout_secs = 120
+# Probe {base_url}/health once at startup; on failure L2 is treated as
+# unavailable (L1 fallback) instead of failing every page.
+health_check = true
+
+# ── Routing thresholds (calibrated on the 623-page fixture corpus) ──────
+[route]
+# G2 output-level fallback (per the indra/PP-OCRv6 fit plan):
+#   hard fail    when chars < min_chars AND mean line conf < hard_conf
+#   medium doubt when chars < min_chars AND mean line conf < mid_conf
+[route.g2]
+min_chars = 60
+hard_conf = 0.5
+mid_conf = 0.75
+# G1 compact-complex-region: a table/figure/equation whose bbox covers
+# < compact_frac of the page and conf > compact_conf => L2.
+compact_frac = 0.5
+compact_conf = 0.4
+# G1 dense-text-blob: a TEXT region covering >= dense_frac of the page with
+# conf >= dense_conf => L2.
+dense_frac = 0.85
+dense_conf = 0.3
+
+# ── Output ──────────────────────────────────────────────────────────────
+[output]
+# Emit a <!-- page:N --> marker before each needs-ocr page.
+page_markers = true
+# Print a provenance/quality summary to stderr at the end.
+summary = true

@@ -1,0 +1,167 @@
+use std::time::Instant;
+
+use ndarray::{Array4, ArrayD};
+
+use crate::engine::{EngineError, EngineSession, InferenceSession};
+use crate::postprocess::{DBPostProcess, TextDetOutput};
+use crate::preprocess::DetPreProcess;
+use crate::rusto_ocr::{DetectionRunOptions, PostprocessRunOptions};
+use crate::types::DetConfig;
+
+#[cfg(feature = "use-opencv")]
+use opencv::{core::Mat, prelude::MatTraitConst};
+
+#[cfg(not(feature = "use-opencv"))]
+use crate::image_impl::Mat;
+
+pub struct TextDetector {
+    pub cfg: DetConfig,
+    pub session: EngineSession,
+}
+
+impl TextDetector {
+    pub fn new(cfg: DetConfig) -> Result<Self, EngineError> {
+        let session = EngineSession::from_det_config(&cfg)?;
+        Ok(Self { cfg, session })
+    }
+
+    /// Construct detector with a custom inference session implementation
+    pub fn with_custom_session(cfg: DetConfig, session: impl InferenceSession + 'static) -> Self {
+        Self {
+            cfg,
+            session: EngineSession::from_custom(session),
+        }
+    }
+
+    pub fn run(&mut self, img: &Mat) -> Result<TextDetOutput, EngineError> {
+        self.run_with_options(img, None, None)
+    }
+
+    pub fn run_with_options(
+        &mut self,
+        img: &Mat,
+        options: Option<&DetectionRunOptions>,
+        postprocess: Option<&PostprocessRunOptions>,
+    ) -> Result<TextDetOutput, EngineError> {
+        let start = Instant::now();
+        // Per-call fields override only supplied values; omitted fields retain
+        // initialized detector defaults for this request.
+        let options = options.cloned().unwrap_or_default();
+        let limit_type = options
+            .limit_type
+            .unwrap_or_else(|| self.cfg.limit_type.clone());
+        let configured_limit_side_len = options.limit_side_len.unwrap_or(self.cfg.limit_side_len);
+        let mean = options.mean.unwrap_or(self.cfg.mean);
+        let std = options.std.unwrap_or(self.cfg.std);
+        // Merge postprocessing options: top-level postprocess overrides nested detection.postprocess,
+        // which overrides detector defaults. Never mutate `self.cfg`.
+        let postprocess_options = match (postprocess, options.postprocess.as_ref()) {
+            (Some(root), Some(nested)) => PostprocessRunOptions {
+                threshold: root.threshold.or(nested.threshold),
+                box_threshold: root.box_threshold.or(nested.box_threshold),
+                max_candidates: root.max_candidates.or(nested.max_candidates),
+                unclip_ratio: root.unclip_ratio.or(nested.unclip_ratio),
+                use_dilation: root.use_dilation.or(nested.use_dilation),
+                score_mode: root
+                    .score_mode
+                    .clone()
+                    .or_else(|| nested.score_mode.clone()),
+            },
+            (Some(root), None) => root.clone(),
+            (None, Some(nested)) => nested.clone(),
+            (None, None) => PostprocessRunOptions::default(),
+        };
+
+        let ori_h = img.rows();
+        let ori_w = img.cols();
+        let max_wh = ori_h.max(ori_w);
+
+        let limit_side_len = if let Some(explicit_limit) = options.limit_side_len {
+            explicit_limit
+        } else if limit_type == "min" {
+            configured_limit_side_len
+        } else if max_wh < 960 {
+            960
+        } else if max_wh < 1500 {
+            1500
+        } else {
+            2000
+        };
+
+        let pre = DetPreProcess::new(limit_side_len, limit_type, mean, std);
+        let input = pre.run(img)?;
+        let input_dyn: ArrayD<f32> = input.into_dyn();
+        let preds_dyn = self.session.run(input_dyn)?;
+        let preds: Array4<f32> = preds_dyn
+            .into_dimensionality()
+            .map_err(|_| EngineError::InvalidInputShape)?;
+        let postprocess = DBPostProcess::new(
+            postprocess_options.threshold.unwrap_or(self.cfg.thresh),
+            postprocess_options
+                .box_threshold
+                .unwrap_or(self.cfg.box_thresh),
+            postprocess_options
+                .max_candidates
+                .unwrap_or(self.cfg.max_candidates),
+            postprocess_options
+                .unclip_ratio
+                .unwrap_or(self.cfg.unclip_ratio),
+            postprocess_options
+                .use_dilation
+                .unwrap_or(self.cfg.use_dilation),
+            postprocess_options
+                .score_mode
+                .as_deref()
+                .unwrap_or(&self.cfg.score_mode),
+        );
+        let (mut boxes, scores) = postprocess.process(&preds, ori_h, ori_w)?;
+        if boxes.is_empty() {
+            return Ok(TextDetOutput::empty());
+        }
+
+        self.sorted_boxes(&mut boxes);
+        let elapse = start.elapsed().as_secs_f64();
+
+        Ok(TextDetOutput {
+            img: None,
+            boxes: Some(boxes),
+            scores: Some(scores),
+            elapse,
+        })
+    }
+
+    #[cfg(feature = "use-opencv")]
+    pub fn sorted_boxes(&self, dt_boxes: &mut [[opencv::core::Point2f; 4]]) {
+        dt_boxes.sort_by(|a, b| {
+            let ay = a[0].y as i32;
+            let by = b[0].y as i32;
+            if ay != by {
+                ay.cmp(&by)
+            } else {
+                let ax = a[0].x as i32;
+                let bx = b[0].x as i32;
+                ax.cmp(&bx)
+            }
+        });
+    }
+
+    #[cfg(not(feature = "use-opencv"))]
+    pub fn sorted_boxes(&self, dt_boxes: &mut [[crate::image_impl::Point2f; 4]]) {
+        sort_det_boxes(dt_boxes);
+    }
+}
+
+#[cfg(not(feature = "use-opencv"))]
+pub fn sort_det_boxes(dt_boxes: &mut [[crate::image_impl::Point2f; 4]]) {
+    dt_boxes.sort_by(|a, b| {
+        let ay = a[0].y as i32;
+        let by = b[0].y as i32;
+        if ay != by {
+            ay.cmp(&by)
+        } else {
+            let ax = a[0].x as i32;
+            let bx = b[0].x as i32;
+            ax.cmp(&bx)
+        }
+    });
+}

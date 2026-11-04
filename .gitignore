@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+# local config (do not commit machine-specific paths)
+docs2md.toml
+# fetched external models (large; see scripts/fetch-models.sh)
+models/DocOCR/
+models/PPOCR_v6_*_rten/
+models/PPOCR_v6_*/
+# the reserved Indra embedding slot stays empty (placeholder only)
+models/indra/*
+!models/indra/.gitkeep
+# output artifacts
+*.md.bak
+.DS_Store

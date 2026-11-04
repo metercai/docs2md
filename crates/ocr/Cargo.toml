@@ -1,0 +1,43 @@
+# Vendored core of rusto-rs (byrizki/rusto-rs, MIT) — pure-Rust PP-OCRv4/5/6
+# det/rec + PP-DocLayout on the rten inference engine.
+#
+# Vendored (not a crates.io dependency) because:
+#   1. rusto-rs is not published to crates.io (0.3.2 is upstream-only);
+#   2. the working copy carries local changes (PP-OCRv6 preset, table
+#      structure fixes, calibration) that the published version does not
+#      have; vendoring pins the exact, validated state.
+#
+# Upstream: https://github.com/byrizki/rusto-rs (MIT).
+# The workspace root is NOT a member of the rusto-rs workspace; this crate
+# is a standalone package here.
+
+[package]
+name = "docs2md-ocr"
+version = "0.3.2"
+edition = "2021"
+description = "Vendored rusto-rs OCR core (PP-OCRv6, pure Rust, rten)"
+license = "MIT"
+repository = "https://github.com/byrizki/rusto-rs"
+
+[lib]
+name = "rusto"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+ndarray = { version = "0.16", features = ["rayon"] }
+thiserror = "1.0"
+clipper2-rust = "1.2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rayon = "1.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+nalgebra = "0.33"
+rten = { version = "0.27.0", features = ["onnx_format", "rten_format"] }
+rten-tensor = "0.27.0"
+# Optional OpenCV backend (off by default — pure-Rust image path).
+opencv = { version = "0.97.2", optional = true }
+
+[features]
+default = []
+use-opencv = ["opencv"]
