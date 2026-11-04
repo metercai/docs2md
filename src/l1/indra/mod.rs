@@ -9,6 +9,7 @@
 
 pub mod lm;
 pub mod npz;
+pub mod preproc;
 pub mod vocab;
 
 use std::collections::HashMap;
