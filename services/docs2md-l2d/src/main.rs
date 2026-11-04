@@ -32,7 +32,11 @@
 //! default.
 //!
 //! Responsibilities of this supervisor:
-//!   * fail fast if the model file or the port is unavailable,
+//!   * fail fast if the model file is missing (the one asset a
+//!     zero-config deployment must still fetch),
+//!   * start idempotently: if the configured port already serves a
+//!     healthy L2 service, reuse it and exit (no second VLM process);
+//!     a non-healthy occupant is a hard error with a diagnosis,
 //!   * spawn `llama-server` with the configured model + mmproj + port,
 //!   * poll `{base}/health` until 200 (llama-server answers 503
 //!     "Loading model" while the VLM loads — that is kept waiting),
@@ -228,20 +232,27 @@ fn build_command(cfg: &L2dConfig, base_dir: &std::path::Path) -> Command {
 
 // ── Health probe (std-only raw HTTP GET) ─────────────────────────────────
 
-fn wait_healthy(base: &str, timeout: Duration, child: &mut Child) -> Result<(), String> {
-    let url = format!("{base}/health");
+/// Poll `{url}` until it answers 2xx, or until `timeout`. Non-2xx keeps
+/// waiting — llama-server answers 503 "Loading model" while the VLM
+/// loads, so that is the normal case during startup. If a `child` is
+/// supplied and it has already exited, bail out early: its exit status
+/// is the real diagnosis (bind failure, bad model path).
+fn probe_healthy_until(
+    url: &str,
+    timeout: Duration,
+    mut child: Option<&mut Child>,
+) -> Result<(), String> {
     let start = Instant::now();
     let mut last = String::from("(no attempt yet)");
     loop {
-        // Bail out immediately if the child died early (bind failure, bad
-        // model path, ...): its exit status is the real diagnosis, better
-        // than a health-timeout against a dead process.
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "llama-server exited during startup: {status} (last health: {last})"
-            ));
+        if let Some(c) = child.as_deref_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                return Err(format!(
+                    "llama-server exited during startup: {status} (last health: {last})"
+                ));
+            }
         }
-        match health_get(&url) {
+        match health_get(url) {
             Ok(()) => return Ok(()),
             Err(e) => last = e, // 503 "Loading model" keeps waiting until timeout
         }
@@ -252,6 +263,10 @@ fn wait_healthy(base: &str, timeout: Duration, child: &mut Child) -> Result<(), 
     }
 }
 
+fn wait_healthy(base: &str, timeout: Duration, child: &mut Child) -> Result<(), String> {
+    probe_healthy_until(&format!("{base}/health"), timeout, Some(child))
+}
+
 /// Minimal HTTP GET that returns Ok on any 2xx. std::net on purpose: one
 /// health GET does not need a dependency.
 fn health_get(url: &str) -> Result<(), String> {
@@ -259,7 +274,7 @@ fn health_get(url: &str) -> Result<(), String> {
     let mut stream = std::net::TcpStream::connect((host, port))
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: docs2md-l2d/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())
@@ -350,6 +365,10 @@ See services/docs2md-l2d/l2d.example.toml for every key.
 
 Usage: docs2md-l2d [--config <path>]
 
+Starting is idempotent: if the configured port already serves a healthy
+L2 service (a previous l2d, or a manually started llama-server), it is
+reused and no new process is started.
+
 The ready URL is printed to stdout as: L2_READY http://<host>:<port>
 "#
 }
@@ -417,13 +436,39 @@ fn main() {
 
     install_signal_handler();
 
-    // Fail fast if something else owns the port (e.g. an orphaned
-    // llama-server from a previous run): otherwise the child dies at bind
-    // and we'd burn the health budget probing the orphan.
+    // Idempotent start (plan C): if the configured port already serves a
+    // healthy L2 service, reuse it and exit — do not start a second VLM.
+    // A second instance would only double ~1GB of RAM while the first
+    // holds the port; and docs2md talks to base_url, not to any process,
+    // so a healthy service on the configured port is by definition what
+    // it needs. A healthy occupant is reused immediately; a still-loading
+    // one (503) is given its full health budget to finish; an occupant
+    // that never becomes healthy is a hard error with the diagnosis.
     if port_in_use(&cfg.host, cfg.port) {
-        eprintln!("[l2d] port {} is already in use — is a llama-server (or another l2d) still running?", cfg.port);
-        eprintln!("[l2d] stop it first (e.g. pkill -f llama-server), or change `port` in the config");
-        std::process::exit(1);
+        match probe_healthy_until(
+            &format!("{base}/health"),
+            Duration::from_secs(cfg.health_timeout_secs),
+            None,
+        ) {
+            Ok(()) => {
+                eprintln!("[l2d] {base} already serves a healthy L2 service — reusing it (idempotent start, no new process)");
+                println!("L2_READY {base}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[l2d] port {} is already in use, and {base}/health never became 2xx: {e}",
+                    cfg.port
+                );
+                eprintln!(
+                    "[l2d]   the occupant may still be loading the model (503), or a stale instance holds the port;"
+                );
+                eprintln!(
+                    "[l2d]   wait longer (raise `health_timeout_secs`), or stop it first (e.g. pkill -f llama-server), or change `port` in the config"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     let mut attempt = 0u32;

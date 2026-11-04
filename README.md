@@ -142,6 +142,12 @@ l2d itself is configured by a TOML file with **every parameter defaulted**
 config: with the GGUF fetched into `./models`, a bare `docs2md-l2d`
 starts with zero configuration.
 
+Starting is **idempotent**: if the configured port already serves a
+healthy L2 service (a previous l2d, or a manually started llama-server)
+it is reused and no second VLM process is started; a still-loading one
+(503) is waited on within `health_timeout_secs` and then reused; an
+occupant that never becomes healthy is a hard error with the diagnosis.
+
 ## License
 
 MPL-2.0 (the project). The vendored OCR core (`crates/ocr/`) is MIT
