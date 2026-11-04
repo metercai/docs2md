@@ -12,3 +12,4 @@ models/indra/*
 # output artifacts
 *.md.bak
 .DS_Store
+.hermes/
