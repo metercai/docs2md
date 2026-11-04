@@ -201,7 +201,10 @@ pub fn detect(
     let (mut boxes, mut s, mut pics) = detect_at(det, gray, long_side);
     if let Some(ls) = preproc::adaptive_long_side(
         long_side,
-        &boxes.iter().map(|b| [b[0] as f64, b[1] as f64, b[2] as f64, b[3] as f64]).collect::<Vec<_>>(),
+        &boxes
+            .iter()
+            .map(|b| [b[0] as f64, b[1] as f64, b[2] as f64, b[3] as f64])
+            .collect::<Vec<_>>(),
         adaptive,
     ) {
         (boxes, s, pics) = detect_at(det, gray, ls);
@@ -230,23 +233,22 @@ mod tests {
     /// 2..4 (input rows 4..8), full width, prob 1, distances to the band.
     fn one_line(h: usize, w: usize) -> [Vec<f32>; 3] {
         let mut core = vec![10.0f32; h * w]; // sigmoid(10) ~ 1
-        for i in 0..h * w {
-            let y = i / w;
+        for y in 0..h {
             if !(2..5).contains(&y) {
-                core[i] = -10.0; // sigmoid ~ 0
+                for x in 0..w {
+                    core[y * w + x] = -10.0; // sigmoid ~ 0
+                }
             }
         }
-        let zero = vec![0.0f32; h * w];
-        let mut top = zero.clone();
-        let mut bot = zero.clone();
+        let mut top = vec![0.0f32; h * w];
+        let mut bot = vec![0.0f32; h * w];
         // distances: row y (1/2 res) centre = (y+0.5)*2 input px; the line
         // spans input rows 4..8, so top dist = centre-4, bottom = 8-centre.
-        for i in 0..h * w {
-            let y = i / w;
-            if (2..5).contains(&y) {
-                let cy = (y as f32 + 0.5) * 2.0;
-                top[i] = cy - 4.0;
-                bot[i] = 8.0 - cy;
+        for y in 2..5usize {
+            let cy = (y as f32 + 0.5) * 2.0;
+            for x in 0..w {
+                top[y * w + x] = cy - 4.0;
+                bot[y * w + x] = 8.0 - cy;
             }
         }
         [core, top, bot]
@@ -255,11 +257,7 @@ mod tests {
     #[test]
     fn decode_single_line_band() {
         let ch = one_line(8, 16);
-        let boxes = decode(
-            [&ch[0], &ch[1], &ch[2]],
-            8,
-            16,
-        );
+        let boxes = decode([&ch[0], &ch[1], &ch[2]], 8, 16);
         assert_eq!(boxes.len(), 1);
         let b = boxes[0];
         // rows 2..4 (1/2 res) -> input y0=4, y1=8; full width 0..32 input
@@ -296,12 +294,8 @@ mod tests {
         let mut core = vec![-10.0f32; h * w];
         let mut top = vec![0.0f32; h * w];
         let mut bot = vec![0.0f32; h * w];
-        for x in 10..20 {
-            core[x] = 10.0; // top row, x 10..19
-        }
-        for x in 2..20 {
-            core[w + x] = 10.0; // bottom row, x 2..19
-        }
+        core[10..20].fill(10.0); // top row, x 10..19
+        core[w + 2..w + 20].fill(10.0); // bottom row, x 2..19
         for (y, row) in (0..h).enumerate() {
             let cy = (y as f32 + 0.5) * 2.0; // line spans input rows 0..4
             for x in 0..w {
