@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # rustfmt is deliberately not a gate yet: the tree is not formatted (6 files,
+      # 24 hunks) and re-flowing the author's code is not CI's call. Run `cargo fmt -p
+      # docs2md` once, then add `cargo fmt -p docs2md --check` here.
+      - name: clippy (correctness + suspicious are fatal)
+        run: |
+          cargo clippy -p docs2md --all-targets -- -D clippy::correctness -D clippy::suspicious
+          total=$(cargo clippy -p docs2md --all-targets 2>&1 | grep -c '^warning: ' || true)
+          echo "clippy style warnings: ${total}"
+
+      - name: test
+        run: cargo test --locked -p docs2md
+
+      - name: build (release)
+        run: cargo build --release --locked -p docs2md
+
+      - name: smoke
+        run: ./target/release/docs2md --version

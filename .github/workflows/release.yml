@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to rebuild, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc, not musl: the embedded OCR walks deep stacks and musl's 128 KiB
+          # default thread stack segfaults on it (verified locally, rc=139).
+          # 22.04 keeps the floor at glibc 2.35 instead of 24.04's 2.39.
+          - { os: linux,   arch: amd64, runner: ubuntu-22.04,  target: x86_64-unknown-linux-gnu,  archive: tar.gz }
+          - { os: linux,   arch: arm64, runner: ubuntu-22.04,  target: aarch64-unknown-linux-gnu, archive: tar.gz, apt: gcc-aarch64-linux-gnu }
+          - { os: macos,   arch: arm64, runner: macos-14,      target: aarch64-apple-darwin,      archive: tar.gz }
+          - { os: windows, arch: amd64, runner: windows-2022,  target: x86_64-pc-windows-msvc,    archive: zip }
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: apt deps
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: build
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked -p docs2md --target ${{ matrix.target }}
+
+      - name: version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release/docs2md"
+          [ "${{ matrix.os }}" = "windows" ] && src="${src}.exe"
+          name="docs2md-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "dist/${name}.zip" "$src" >/dev/null
+          else
+            cp "$src" docs2md
+            tar -czf "dist/${name}.tar.gz" docs2md
+            rm -f docs2md
+          fi
+          cd dist
+          if command -v sha256sum >/dev/null; then sha256sum * > "${name}.sha256"; else shasum -a 256 * > "${name}.sha256"; fi
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$REPO" --title "docs2md ${tag#v}" \
+              --notes "Self-contained PDF → Markdown binary (embedded OCR). Two tiers: L0 native text, L1 PP-OCRv6; optional L2 external VLM. See README for usage."
+
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --repo "$REPO" --clobber
