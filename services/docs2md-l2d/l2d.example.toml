@@ -1,0 +1,58 @@
+# docs2md-l2d configuration example.
+#
+# Copy to ./docs2md-l2d.toml (or point at it with `docs2md-l2d --config
+# <path>` / $DOCS2MD_L2D_CONFIG / ~/.config/docs2md/l2d.toml).
+#
+# EVERY key has a default. An empty or missing file runs on defaults, so
+# on a machine where scripts/fetch-models.sh has already placed the
+# PaddleOCR-VL GGUF under ./models, `docs2md-l2d` starts with no config
+# at all. Unknown keys are a hard error (typos fail loudly).
+
+# ── Model (the only thing a default deployment must still provide) ──────
+# The VLM GGUF model. Relative paths resolve against this config file's
+# directory (against CWD when using built-in defaults).
+# Default: models/PaddleOCR-VL-1.6.gguf
+# model = "models/PaddleOCR-VL-1.6.gguf"
+
+# The multimodal projector GGUF.
+# Default: models/PaddleOCR-VL-1.6-mmproj.gguf
+# mmproj = "models/PaddleOCR-VL-1.6-mmproj.gguf"
+
+# ── Service ──────────────────────────────────────────────────────────────
+# llama-server binary (PATH name or absolute path).
+# Default: llama-server
+# cli = "llama-server"
+
+# Bind address. Default: 127.0.0.1 (local only — the docs2md binary is
+# expected to run on the same host).
+# host = "127.0.0.1"
+
+# Bind port. Default: 8080. After l2d prints `L2_READY http://<host>:<port>`,
+# set the same value in docs2md's [l2] base_url.
+# port = 8080
+
+# CPU threads for llama-server. Default: unset (llama-server picks).
+# Useful on shared boxes to cap CPU during model load.
+# threads = 8
+
+# ── Advanced (rarely needed) ─────────────────────────────────────────────
+# Override the chat template (llama-server --chat-template-file).
+# Default: unset — the official PaddleOCR-VL GGUF ships a llama.cpp-adapted
+# jinja template inside the model and that is the correct default. Only set
+# this for a GGUF build that does not ship one.
+# chat_template_file = "/path/to/template.jinja"
+
+# Override the mtmd image marker (env LLAMA_MEDIA_MARKER). Default: unset.
+# media_marker = "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>"
+
+# Max seconds to wait for the /health probe (a ~1GB VLM can take a while
+# to load). Default: 300. The child dying early is detected immediately
+# regardless of this budget.
+# health_timeout_secs = 300
+
+# Restart the child if it exits non-zero. Default: false.
+# restart = false
+
+# Extra args appended verbatim to the llama-server invocation.
+# Default: none.
+# extra = []

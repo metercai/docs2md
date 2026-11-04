@@ -82,9 +82,19 @@ pub struct L2Config {
     pub prompt: String,
     pub max_tokens: u32,
     pub timeout_secs: u64,
-    /// Probe `{base_url}/health` once at startup; if it fails, L2 is
-    /// treated as unavailable (L1 fallback) instead of failing every page.
+    /// Probe `{base_url}/health` at startup; if it fails, L2 is treated as
+    /// unavailable (L1 fallback) instead of failing every page.
     pub health_check: bool,
+    /// Max seconds to keep polling `/health` before giving up. llama-server
+    /// answers 503 `{"error":{"message":"Loading model"}}` while the GGUF is
+    /// still loading, so a single probe right after service start is too
+    /// early; we retry within this budget instead.
+    #[serde(default = "default_health_wait")]
+    pub health_wait_secs: u64,
+}
+
+fn default_health_wait() -> u64 {
+    30
 }
 impl Default for L2Config {
     fn default() -> Self {
@@ -95,6 +105,7 @@ impl Default for L2Config {
             max_tokens: 4096,
             timeout_secs: 120,
             health_check: true,
+            health_wait_secs: default_health_wait(),
         }
     }
 }

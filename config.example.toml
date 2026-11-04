@@ -39,9 +39,13 @@ use_indra = false
 prompt = "OCR:"
 max_tokens = 4096
 timeout_secs = 120
-# Probe {base_url}/health once at startup; on failure L2 is treated as
-# unavailable (L1 fallback) instead of failing every page.
+# Probe {base_url}/health at startup; on failure L2 is treated as
+# unavailable (L1 fallback) instead of failing every page. While
+# llama-server is still loading the model it answers 503 — that is kept
+# waiting (up to health_wait_secs) rather than treated as down.
 health_check = true
+# Seconds to keep probing /health through the 503 "Loading model" window.
+health_wait_secs = 30
 
 # ── Routing thresholds (calibrated on the 623-page fixture corpus) ──────
 [route]

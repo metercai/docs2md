@@ -56,8 +56,15 @@ if [ -n "${L2_GGUF_DIR:-}" ]; then
   echo "  L2_GGUF_DIR=$L2_GGUF_DIR (point [l2] at a llama-server serving it)"
 fi
 # The PaddleOCR-VL GGUF + mmproj are large (~1GB) and are NOT auto-downloaded.
-# Build/obtain them separately and run:
-#   docs2md-l2d --model /path/PaddleOCR-VL-1.6.gguf --mmproj /path/PaddleOCR-VL-1.6-mmproj.gguf --port 8080
+# Build/obtain them and place them under $DEST:
+#   $DEST/PaddleOCR-VL-1.6.gguf
+#   $DEST/PaddleOCR-VL-1.6-mmproj.gguf
+# then start the L2 service — l2d is config-file based with all-defaulted
+# parameters, so with the models in ./models (the default layout) a bare
+# invocation works with no config:
+#   docs2md-l2d
+# otherwise write a config (see services/docs2md-l2d/l2d.example.toml):
+#   docs2md-l2d --config ./docs2md-l2d.toml
 # then set [l2] base_url = "http://127.0.0.1:8080" in docs2md.toml.
 
 echo ""

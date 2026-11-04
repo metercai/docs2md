@@ -10,5 +10,11 @@ repository = "https://github.com/metercai/docs2md"
 name = "docs2md-l2d"
 path = "src/main.rs"
 
-# Dependency-free on purpose: the supervisor is std-only (spawn + a single
-# raw-TCP /health GET), so it builds anywhere with zero download.
+[dependencies]
+# System API bindings only (signal handling for child reaping on SIGTERM/
+# SIGINT). No frameworks; the supervisor stays effectively std-only.
+libc = "0.2"
+# Config file parsing (TOML), same versions as the workspace root so the
+# lockfile stays shared.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

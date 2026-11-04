@@ -60,11 +60,13 @@ cargo build --release
 # 2. (optional) fetch the external layout model for G1 routing
 ./scripts/fetch-models.sh          # → models/DocOCR/pp_doclayout_plus_l.onnx
 
-# 3. (optional) start the L2 service (a llama-server wrapper)
-cargo run -p docs2md-l2d -- \
-  --model /path/PaddleOCR-VL-1.6.gguf \
-  --mmproj /path/PaddleOCR-VL-1.6-mmproj.gguf \
-  --port 8080
+# 3. (optional) start the L2 service — a llama-server wrapper.
+#    l2d is config-file based with all-defaulted parameters:
+#    if the GGUF sits under ./models (scripts/fetch-models.sh layout),
+#    no config file is needed at all.
+cargo run -p docs2md-l2d
+#    or with a config file (see services/docs2md-l2d/l2d.example.toml):
+#    docs2md-l2d --config ./docs2md-l2d.toml
 #    prints: L2_READY http://127.0.0.1:8080
 
 # 4. configure (optional; defaults run without a file)
@@ -128,9 +130,17 @@ silently degrading.
 
 The L2 tier is a **llama-server wrapper**, not a bespoke service:
 `services/docs2md-l2d` supervises a `llama-server` process (a PaddleOCR-VL
-GGUF), waits for its `/health` endpoint, and keeps it running. `docs2md`
-consumes the OpenAI-compatible API. This means any OpenAI-compatible VLM
-endpoint (self-hosted or remote) can be pointed at via `[l2] base_url`.
+GGUF), waits for its `/health` endpoint (503 "Loading model" is kept
+waiting), and keeps it running — forwarding SIGTERM/SIGINT so no orphaned
+llama-server is left holding the port. `docs2md` consumes the
+OpenAI-compatible API. This means any OpenAI-compatible VLM endpoint
+(self-hosted or remote) can be pointed at via `[l2] base_url`.
+
+l2d itself is configured by a TOML file with **every parameter defaulted**
+(search: `--config` > `$DOCS2MD_L2D_CONFIG` > `./docs2md-l2d.toml` >
+`~/.config/docs2md/l2d.toml` > built-in defaults), mirroring docs2md's own
+config: with the GGUF fetched into `./models`, a bare `docs2md-l2d`
+starts with zero configuration.
 
 ## License
 

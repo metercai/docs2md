@@ -58,17 +58,51 @@ impl L2Client {
         c
     }
 
-    /// GET `{base}/health`. llama-server exposes this; a 200 (any body) means
-    /// the service is up.
+    /// GET `{base}/health`, retrying while llama-server reports it is still
+    /// loading the model (503 `{"error":{"message":"Loading model"}}`).
+    ///
+    /// llama-server starts listening before the GGUF is resident in memory;
+    /// during that window `/health` answers 503. A single probe right after
+    /// the supervisor reports "ready" (which itself polls this same
+    /// endpoint) can still race the tail of the load, so we retry within
+    /// `health_wait_secs`: 5xx = keep waiting, 2xx = up, connection error =
+    /// the service is gone, stop immediately.
     pub fn health(&self) -> Result<(), String> {
         let url = format!("{}/health", self.base());
-        let r = ureq::get(&url)
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(self.cfg.health_wait_secs);
+        loop {
+            match self.probe_once(&url) {
+                Probe::Up => return Ok(()),
+                Probe::Loading => {}
+                Probe::Down(reason) => return Err(reason),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "L2 service still loading model after {}s",
+                    self.cfg.health_wait_secs
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// One `/health` probe.
+    fn probe_once(&self, url: &str) -> Probe {
+        let res = ureq::get(url)
             .timeout(std::time::Duration::from_secs(5))
-            .call()
-            .map_err(|e| e.to_string())?;
-        // Consume the body to release the connection; status is already 2xx.
-        let _ = r.into_string();
-        Ok(())
+            .call();
+        match res {
+            Ok(r) => {
+                // ureq 2.x returns non-2xx as Err(Status), so Ok means 2xx.
+                let _ = r.into_string();
+                Probe::Up
+            }
+            // llama-server answers 503 while the GGUF is still loading.
+            Err(ureq::Error::Status(503, _)) => Probe::Loading,
+            // Any other status/connection error: treat as down.
+            Err(e) => Probe::Down(e.to_string()),
+        }
     }
 
     pub fn available(&self) -> bool {
@@ -176,6 +210,16 @@ impl L2Client {
             .trim_end_matches('/')
             .to_string()
     }
+}
+
+/// Outcome of one `/health` probe.
+enum Probe {
+    /// 2xx: service up and model resident.
+    Up,
+    /// 5xx: service is up but not ready yet (loading model).
+    Loading,
+    /// Connection-level failure: service is gone.
+    Down(String),
 }
 
 /// Strip a trailing llama-cli/llama-server status block if it leaks into the
