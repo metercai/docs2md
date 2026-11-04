@@ -58,7 +58,7 @@ def main():
         a = estimate_skew(small, pool=None)
         k = p.orientation(rotate_page(small, a) if abs(a) >= DESKEW_MIN else small)
         gray2, k2, skew = p._turn(gray, k, a, small)
-
+        first, _s1 = p._detect_at(gray2, p.long_side)  # first detect level
         boxes, pics = p.detect_all(gray2)
         dark = line_darkness(gray2, boxes[:, :4]) if len(boxes) else []
         b4 = boxes[:, :4] if len(boxes) else np.zeros((0, 4), np.float32)
@@ -80,11 +80,13 @@ def main():
         x1, s1 = page_to_input(gray2, p.long_side)
         meta["det1"] = {"scale": s1, "out": [x1.shape[0], x1.shape[1]]}
         cv2.imwrite(os.path.join(out, tag + ".det.png"), np.rint(x1 * 255).astype(np.uint8))
-        # adaptive re-detect (detect_all already ran detect(); replay the same
-        # rule to find the second long side): detect() fires it when the median
-        # line height is under ADAPTIVE_MIN_H input pixels.
-        if p.adaptive and len(boxes) >= 8:
-            med_h = float(np.median(boxes[:, 3] - boxes[:, 1]))
+        # Adaptive re-detect (detect_all already ran detect(); replay the same
+        # rule on the FIRST-level boxes — the boxes detect() sees — to find the
+        # second long side. Replaying on the post-adaptive boxes under-records:
+        # the rule can fire inside detect() yet no longer triggers on the
+        # taller re-detected lines.
+        if p.adaptive and len(first) >= 8:
+            med_h = float(np.median(first[:, 3] - first[:, 1]))
             if med_h < ADAPTIVE_MIN_H:
                 ls = int(min(ADAPTIVE_MAX_SIDE,
                              p.long_side * ADAPTIVE_TARGET_H / max(med_h, 1.0))) // 32 * 32

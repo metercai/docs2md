@@ -7,6 +7,7 @@
 //! rten 0.27 imports ONNX INT64 tensors as Int32 (onnx_loader.rs:350), so
 //! the rec model's widths/ids/topi I/O is handled as i32 throughout.
 
+pub mod det;
 pub mod lm;
 pub mod npz;
 pub mod preproc;
