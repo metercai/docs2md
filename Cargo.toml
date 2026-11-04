@@ -30,12 +30,19 @@ serde_json = "1"
 toml = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["json"] }
 thiserror = "1"
+# Indra (feature `indra`): rten inference for the embedded ONNX pipeline.
+rten = { version = "0.27.0", features = ["onnx_format", "rten_format"], optional = true }
+rten-tensor = { version = "0.27.0", optional = true }
+# Indra: lm.npz is a zip container of npy arrays (deflate).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 
 [features]
-default = []
-# Reserved slot: embed the Indra ONNX engine into the L1 engine trait.
-# Not ported to Rust yet (v1) — see models/indra/ and src/l1/indra.rs stub.
-indra = []
+default = ["indra"]
+# The Indra L1 engine (port of the indra-ocr 1.1.2 pipeline): 8 ONNX models +
+# 3 n-gram LM tables embedded in the binary under assets/models/indra/.
+# ONNX INT64 tensors are imported as Int32 by rten 0.27 (onnx_loader.rs),
+# so the rec model's widths/ids/topi I/O is handled as i32.
+indra = ["dep:rten", "dep:rten-tensor", "dep:flate2"]
 
 [profile.release]
 opt-level = 3

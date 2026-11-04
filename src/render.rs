@@ -12,11 +12,15 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 /// Render one page to PNG. Returns (png_bytes, render_box, rotation).
 /// `render_box` is CropBox ∩ MediaBox — the visible page box, identical to
 /// pdf_oxide's `page_render_box` (so the coordinate mapping matches).
+/// One rendered page: PNG bytes, the content box (x0, y0, x1, y1) in PDF
+/// points, and the page number.
+type RenderedPage = (Vec<u8>, (f32, f32, f32, f32), i32);
+
 pub fn render_pdf_page(
     doc: &PdfDocument,
     page: usize,
     dpi: u32,
-) -> Result<(Vec<u8>, (f32, f32, f32, f32), i32), String> {
+) -> Result<RenderedPage, String> {
     let info = doc.get_page_info(page).map_err(|e| e.to_string())?;
     let pbox = render_box(&info.media_box, info.crop_box.as_ref());
     let mut opts = RenderOptions::default();

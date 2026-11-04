@@ -392,7 +392,7 @@ impl TextRecognizer {
             if return_word_box {
                 for (local_idx, ((text, score), info)) in line_results
                     .into_iter()
-                    .zip(batch_word_infos.into_iter())
+                    .zip(batch_word_infos)
                     .enumerate()
                 {
                     let actual_idx = indices[beg + local_idx];

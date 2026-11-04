@@ -3,8 +3,10 @@
 //! mis-route).
 //!
 //! The config is the single source that locates the external pieces:
-//!   * L1 layout model (external ONNX, not embedded)
-//!   * L2 VLM service (a llama-server wrapper, e.g. `docs2md-l2d`)
+//!
+//! * L1 layout model (external ONNX, not embedded)
+//! * L2 VLM service (a llama-server wrapper, e.g. `docs2md-l2d`)
+//!
 //! Everything else (L0 native extraction, L1 embedded PP-OCRv6-small OCR)
 //! is self-contained in the binary.
 
@@ -51,8 +53,9 @@ pub struct L1Config {
     /// Layout detector input size (pixels on the long edge).
     pub layout_target_size: u32,
     /// When true, run the Indra engine (feature `indra`) instead of
-    /// PP-OCRv6. Reserved slot — not ported to Rust in v1; enabling this
-    /// returns a clear "not ported" error.
+    /// PP-OCRv6. The Indra pipeline (port of indra-ocr 1.1.2) is being
+    /// ported under src/l1/indra/; until the page pipeline lands, enabling
+    /// this returns a clear error per page.
     pub use_indra: bool,
 }
 impl Default for L1Config {

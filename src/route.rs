@@ -13,9 +13,11 @@
 //!   * otherwise                           => L1
 //!
 //! G2 is the output-level gate applied to an L1 result (per the fit plan):
-//!   * md_chars < min_chars AND mean_conf < hard_conf  => HARD fail
-//!   * md_chars < min_chars AND mean_conf < mid_conf   => MEDIUM doubt
-//!   * otherwise                                       => OK
+//!
+//! * md_chars < min_chars AND mean_conf < hard_conf  => HARD fail
+//! * md_chars < min_chars AND mean_conf < mid_conf   => MEDIUM doubt
+//! * otherwise                                       => OK
+//!
 //! A HARD/MEDIUM page is escalated to L2 (if available); if L2 is not
 //! available the L1 output is kept and the page is marked "needs a
 //! higher-tier OCR model".

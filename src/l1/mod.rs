@@ -1,6 +1,6 @@
-//! L1: embedded pure-Rust OCR (PP-OCRv6-small, ONNX on rten) behind an
-//! `L1Engine` trait, with a reserved slot for the Indra engine (feature
-//! `indra`, not ported to Rust in v1).
+//! L1: embedded pure-Rust OCR behind an `L1Engine` trait. Two engines:
+//! PP-OCRv6-small (vendored rusto, `crates/ocr`) and the Indra pipeline
+//! (feature `indra`, port of indra-ocr 1.1.2 under `src/l1/indra/`).
 //!
 //! The `small` tier's three files are `include_bytes!`-embedded (the "one
 //! binary" build). rusto's engine API loads models **by path**, so the
@@ -144,15 +144,32 @@ impl PpOcrEngine {
 
 // Embedded PP-OCRv6-small (rten) model. Total ≈ 31 MB, committed to the repo
 // and baked into the binary so the release is a single self-contained file.
-const EMBEDDED_DET_SMALL: &[u8] = include_bytes!("../assets/models/small/det.onnx");
-const EMBEDDED_REC_SMALL: &[u8] = include_bytes!("../assets/models/small/rec.onnx");
-const EMBEDDED_DICT_SMALL: &[u8] = include_bytes!("../assets/models/small/dict.txt");
+const EMBEDDED_DET_SMALL: &[u8] = include_bytes!("../../assets/models/small/det.onnx");
+const EMBEDDED_REC_SMALL: &[u8] = include_bytes!("../../assets/models/small/rec.onnx");
+const EMBEDDED_DICT_SMALL: &[u8] = include_bytes!("../../assets/models/small/dict.txt");
 
-/// Reserved slot: the Indra engine. Not ported to Rust in v1 (the Python
-/// pipeline is ~3.5k lines; see models/indra/). Selecting it returns a clear
-/// "not ported" error rather than silently falling back.
+/// The Indra engine (feature `indra`): port of the indra-ocr 1.1.2 pipeline,
+/// embedded under assets/models/indra/. P0-P2: loading and smoke inference;
+/// the full page pipeline (det -> rec -> order -> layout -> markdown) lands
+/// in P3-P6. Until then ocr_page returns a clear error so routing degrades
+/// to the configured fallback instead of silently producing nothing.
 #[cfg(feature = "indra")]
-pub struct IndraEngine;
+pub mod indra;
+
+#[cfg(feature = "indra")]
+pub struct IndraEngine {
+    /// Loaded models + LM tables; consumed by the page pipeline (P1+).
+    #[allow(dead_code)]
+    engine: indra::IndraEngine,
+}
+
+#[cfg(feature = "indra")]
+impl IndraEngine {
+    pub fn new() -> Result<Self, String> {
+        let engine = indra::IndraEngine::init()?;
+        Ok(Self { engine })
+    }
+}
 
 #[cfg(feature = "indra")]
 impl L1Engine for IndraEngine {
@@ -161,23 +178,23 @@ impl L1Engine for IndraEngine {
     }
 
     fn ocr_page(&mut self, _png: &[u8]) -> Result<OcrPage, String> {
-        Err("indra engine is a reserved slot and is not ported to Rust yet \
-             (v1); use PP-OCRv6 (l1.use_indra = false)".into())
+        Err("indra engine page pipeline is in progress (port P3-P6); \
+             use PP-OCRv6 (l1.use_indra = false)".into())
     }
 }
 
-/// Build the configured L1 engine (PP-OCRv6, or the reserved Indra slot).
+/// Build the configured L1 engine (Indra when enabled, else PP-OCRv6).
 pub fn build_engine(cfg: &L1Config) -> Result<Box<dyn L1Engine>, String> {
     if cfg.use_indra {
         #[cfg(feature = "indra")]
         {
-            return Ok(Box::new(IndraEngine));
+            return Ok(Box::new(IndraEngine::new()?));
         }
         #[cfg(not(feature = "indra"))]
         {
             return Err(
                 "l1.use_indra = true but this build was compiled without the \
-                 `indra` feature (the Indra engine is not ported to Rust yet)"
+                 `indra` feature"
                     .into(),
             );
         }

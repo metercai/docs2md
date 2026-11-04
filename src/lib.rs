@@ -96,7 +96,8 @@ impl Engine {
     /// unavailable (init failed), and `None` when ready.
     fn ensure_l1(&mut self) -> Option<&mut dyn L1Engine> {
         if self.l1.is_some() {
-            return Some(self.l1.as_mut().unwrap().as_mut());
+            let engine = self.l1.as_mut()?;
+            return Some(engine.as_mut());
         }
         if self.l1_failed {
             return None;
@@ -145,7 +146,7 @@ impl Engine {
     /// the pass to a set of 1-based page numbers (None = whole document).
     pub fn convert(&mut self, bytes: &[u8], pages: Option<&[u32]>) -> Result<DocResult, Error> {
         let t0 = std::time::Instant::now();
-        let l0 = l0::extract(bytes).map_err(|e| Error::Pdf(e))?;
+        let l0 = l0::extract(bytes).map_err(Error::Pdf)?;
         let page_count = l0.pages.len();
         eprintln!(
             "[l0] {} pages in {}ms",

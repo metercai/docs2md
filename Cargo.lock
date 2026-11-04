@@ -519,9 +519,12 @@ name = "docs2md"
 version = "0.1.0"
 dependencies = [
  "docs2md-ocr",
+ "flate2",
  "image",
  "pdf-inspector",
  "pdf_oxide",
+ "rten",
+ "rten-tensor",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
