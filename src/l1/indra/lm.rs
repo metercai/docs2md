@@ -63,9 +63,7 @@ impl NgramLm {
             _ => BITS_DEFAULT,
         };
         if order as u64 * bits as u64 > TAG_SHIFT as u64 {
-            return Err(format!(
-                "order {order} x {bits} bits do not fit a key"
-            ));
+            return Err(format!("order {order} x {bits} bits do not fit a key"));
         }
         let keys_of = |k: &str| -> Result<Vec<u64>, String> {
             match arr.get(k) {
@@ -149,12 +147,23 @@ impl NgramLm {
         }
     }
 
-    /// logp(hist, t) — exact port of the Python backoff loop, per-length tables.
+    /// logp(hist, t) — cached wrapper over the backoff lookup (Python
+    /// NgramLM.logp).
     pub fn logp(&mut self, hist: &[i64], t: i64) -> f64 {
         let ck = (hist.to_vec(), t);
         if let Some(v) = self.cache.get(&ck) {
             return *v;
         }
+        let v = self.logp_lookup(hist, t);
+        if self.cache.len() < 1_000_000 {
+            self.cache.insert(ck, v);
+        }
+        v
+    }
+
+    /// The backoff lookup itself (exact port of the Python backoff loop,
+    /// per-length tables), without the cache — the beam path shares it.
+    pub fn logp_lookup(&self, hist: &[i64], t: i64) -> f64 {
         let top = (hist.len() as u32).min(self.order - 1) as usize;
         // hs[n] = last n tokens (n = 0..=top)
         let mut hs: Vec<Vec<i64>> = Vec::with_capacity(top + 1);
@@ -183,11 +192,7 @@ impl NgramLm {
             let j = Self::find(&self.h_keys[n], hkey);
             acc += self.h_vals[n][j as usize];
         }
-        let v = v.unwrap_or_else(|| acc - (self.vocab_size as f64).ln());
-        if self.cache.len() < 1_000_000 {
-            self.cache.insert(ck, v);
-        }
-        v
+        v.unwrap_or_else(|| acc - (self.vocab_size as f64).ln())
     }
 }
 
@@ -198,6 +203,206 @@ fn pack_key_with_token(hist: &[i64], t: i64, bits: u32) -> u64 {
         k = (k << bits) | (if *x == BOS { 0 } else { (*x + 1) as u64 });
     }
     (k << bits) | (if t == BOS { 0 } else { (t + 1) as u64 })
+}
+
+/// log-sum-exp of two (stable form).
+fn lse(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+/// One live prefix of the CTC beam: (log p ending in blank, log p ending in
+/// non-blank, lm score, steps of the kept tokens, the packed last order-1
+/// tokens).
+#[derive(Clone)]
+struct BeamEntry {
+    prefix: Vec<i64>,
+    b: f64,
+    nb: f64,
+    s: f64,
+    steps: Vec<usize>,
+    hist: u64,
+}
+
+/// CTC prefix beam search (port of lm.py beam_search, line-for-line).
+/// `blank`: [T] blank log-probabilities; `topv`/`topi`: [T, k] the k best
+/// classes per step (blank included) and their log-probabilities; a class
+/// under `cand_floor` probability at a step is not tried. Returns (token
+/// ids, the step where each token was first emitted).
+///
+/// Determinism: the Python version iterates a dict (insertion order) and
+/// `max`/`min`/`sorted` are all stable first-wins, so the beam order — and
+/// with it the result — is fixed by the insertion order below.
+#[allow(clippy::too_many_arguments)] // mirrors the product's 9-arg beam_search
+pub fn beam_search(
+    blank: &[f64],
+    topv: &[f64],
+    topi: &[i64],
+    lm: &NgramLm,
+    alpha: f64,
+    beta: f64,
+    beam: usize,
+    cand_floor: f64,
+) -> (Vec<i64>, Vec<usize>) {
+    const BLANK_SKIP: f64 = 0.999;
+    let t = blank.len();
+    let k = if t == 0 || topi.is_empty() {
+        1
+    } else {
+        topv.len() / t
+    };
+    assert!(
+        topi.len() == t * k,
+        "topi length {} must be t({t}) x k({k})",
+        topi.len()
+    );
+    let bits = lm.bits;
+    let hmask = (1u64 << (bits * (lm.order - 1))) - 1;
+    let log_skip = BLANK_SKIP.ln();
+    let log_floor = cand_floor.ln();
+    let reach = beta + alpha * lm.max_logp();
+    let mut beams: Vec<BeamEntry> = vec![BeamEntry {
+        prefix: vec![],
+        b: 0.0,
+        nb: f64::NEG_INFINITY,
+        s: 0.0,
+        steps: vec![],
+        hist: 0,
+    }];
+    for t in 0..blank.len() {
+        let b0 = blank[t];
+        if b0 > log_skip {
+            // The step is blank with near-certainty: every beam just carries
+            // its blank probability forward.
+            for e in &mut beams {
+                e.b = lse(e.b, e.nb) + b0;
+                e.nb = f64::NEG_INFINITY;
+            }
+            continue;
+        }
+        let cands: Vec<(i64, f64)> = (0..k)
+            .map(|c| (topi[t * k + c], topv[t * k + c]))
+            .filter(|&(c, v)| c != 0 && v >= log_floor)
+            .collect();
+        // nxt: prefix -> entry, insertion order (the Python dict).
+        let mut nxt: Vec<BeamEntry> = vec![];
+        let add = |nxt: &mut Vec<BeamEntry>, e: BeamEntry| {
+            if let Some(old) = nxt.iter_mut().find(|x| x.prefix == e.prefix) {
+                old.b = lse(old.b, e.b);
+                old.nb = lse(old.nb, e.nb);
+            } else {
+                nxt.push(e);
+            }
+        };
+        // Every beam's own entries first: the blank, and a repeat that
+        // collapses.
+        for e in &beams {
+            let mut ne = e.clone();
+            ne.b = lse(e.b, e.nb) + b0;
+            ne.nb = f64::NEG_INFINITY;
+            add(&mut nxt, ne);
+            let last = e.prefix.last().copied();
+            for (c, lp) in &cands {
+                if Some(*c) == last {
+                    let mut ne = e.clone();
+                    ne.b = f64::NEG_INFINITY;
+                    ne.nb = e.nb + lp;
+                    add(&mut nxt, ne);
+                }
+            }
+        }
+        let floor = if beams.len() >= beam {
+            nxt.iter()
+                .map(|e| lse(e.b, e.nb) + e.s)
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            f64::NEG_INFINITY
+        };
+        // New prefixes: an existing beam merges (its lm score stays), a new
+        // prefix is tried only if it can still reach the floor.
+        let mut ext: Vec<(BeamEntry, f64)> = vec![];
+        for e in &beams {
+            let tot = lse(e.b, e.nb);
+            let last = e.prefix.last().copied();
+            for (c, lp) in &cands {
+                let new_from = if Some(*c) == last { e.b + lp } else { tot + lp };
+                if new_from == f64::NEG_INFINITY {
+                    continue;
+                }
+                let mut q = e.prefix.clone();
+                q.push(*c);
+                if nxt.iter().any(|x| x.prefix == q) {
+                    let mut ne = e.clone();
+                    ne.prefix = q;
+                    ne.b = f64::NEG_INFINITY;
+                    ne.nb = new_from;
+                    add(&mut nxt, ne);
+                } else if new_from + e.s + reach >= floor - 1e-9 {
+                    ext.push((
+                        BeamEntry {
+                            prefix: q,
+                            b: f64::NEG_INFINITY,
+                            nb: new_from,
+                            s: e.s,
+                            steps: e.steps.clone(),
+                            hist: e.hist,
+                        },
+                        *lp,
+                    ));
+                }
+            }
+        }
+        for (mut ne, _lp) in ext {
+            // The LM key is (old prefix tail, new token): Python packs
+            // (hk << bits) | (c + 1) where hk is the prefix BEFORE the new
+            // token. logp(BOS-padded old tail, c) == logp_keys(that key).
+            let c = *ne.prefix.last().unwrap();
+            let old = &ne.prefix[..ne.prefix.len() - 1];
+            let tail: Vec<i64> = old
+                .iter()
+                .rev()
+                .take((lm.order - 1) as usize)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let mut hist: Vec<i64> = vec![BOS; (lm.order - 1) as usize - tail.len()];
+            hist.extend_from_slice(&tail);
+            let lmp = lm.logp_lookup(&hist, c);
+            // Python evaluates this as (s + alpha*lmp) + beta — keep the
+            // grouping exact (a 1 ulp reorder can flip a tied beam score).
+            ne.s = ne.s + alpha * lmp + beta;
+            ne.steps.push(t);
+            ne.hist = ((ne.hist << bits) | (c + 1) as u64) & hmask;
+            add(&mut nxt, ne);
+        }
+        // Keep the best `beam` prefixes, ties by insertion order (stable sort).
+        let mut order: Vec<usize> = (0..nxt.len()).collect();
+        order.sort_by(|&i, &j| {
+            let si = lse(nxt[i].b, nxt[i].nb) + nxt[i].s;
+            let sj = lse(nxt[j].b, nxt[j].nb) + nxt[j].s;
+            sj.total_cmp(&si)
+        });
+        order.truncate(beam);
+        beams = order.into_iter().map(|i| nxt[i].clone()).collect();
+    }
+    // Python's max keeps the FIRST maximum; Rust's max_by would keep the last.
+    let score = |e: &BeamEntry| lse(e.b, e.nb) + e.s;
+    let mut best = 0;
+    for i in 1..beams.len() {
+        if score(&beams[i]) > score(&beams[best]) {
+            best = i;
+        }
+    }
+    let best = &beams[best];
+    (best.prefix.clone(), best.steps.clone())
 }
 
 fn sort_pairs(keys: &mut Vec<u64>, vals: &mut Vec<f64>) {

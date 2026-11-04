@@ -14,6 +14,7 @@
 //! gate compares the pure greedy reading (the reference generator disables
 //! the LM to match).
 
+use crate::l1::indra::lm::beam_search;
 use crate::l1::indra::preproc::{self, Gray, InkMap};
 use crate::l1::indra::{IndraEngine, Session};
 
@@ -34,6 +35,15 @@ pub const MIN_CONF: f32 = 0.5;
 /// A line goes to its group's recognizer only when the classifier is surer
 /// than this; unsure lines are read by base as well.
 pub const ROUTE_SURE: f32 = 0.95;
+// Language-model beam search (pipeline constants): a greedy reading whose
+// mean peak conf falls in [MIN_CONF, gate) is re-read by the CTC prefix beam;
+// meta.json "lm_params" may override a group's alpha/beta/gate.
+pub const LM_GATE: f64 = 0.9;
+pub const LM_ALPHA: f64 = 0.5;
+pub const LM_BETA: f64 = 1.5;
+pub const LM_BEAM: usize = 8;
+/// A class under this probability at a step is not tried by the beam.
+pub const LM_CAND_FLOOR: f64 = 3e-3;
 /// Width-batch limits (pipeline.width_batches defaults).
 const BATCH_MAX: usize = 64;
 const BATCH_RATIO: f64 = 1.3;
@@ -145,13 +155,20 @@ pub fn recognize_crops(
         }
         let sess = engine.rec.get(gname).unwrap();
         let vocab = &engine.meta.vocab[gname];
-        // Batch by the SOURCE crop width (recognize: width_batches over
-        // src[j].shape[1]) — the base group reads the tall crops, whose
-        // widths differ from the window-1 crops (crop width tracks window).
-        let widths: Vec<i32> = sel
-            .iter()
-            .map(|&j| (if use_tall { &tall[j] } else { &crops[j] }).w as i32)
-            .collect();
+        // The group's language model, if its recognizer has an lm.npz (the
+        // pipeline builds lms only for files that exist; rtl has none).
+        let lm_params = engine.meta.lm_params.get(gname);
+        let lm = engine.lms.get(gname);
+        // Gate/alpha/beta stay f64 end to end (Python compares the f32-derived
+        // conf as a Python float against the JSON f64 gate).
+        let (alpha, beta, gate) = match lm_params {
+            Some(p) => (p.alpha, p.beta, p.gate),
+            None => (LM_ALPHA, LM_BETA, LM_GATE),
+        };
+        // Group the batch by the window-1 crop width (recognize:
+        // width_batches over crops[j].shape[1]), then pad the SOURCE crop
+        // (tall for the base recognizer, the window-1 crop for the groups).
+        let widths: Vec<i32> = sel.iter().map(|&j| crops[j].w as i32).collect();
         for part in
             preproc::width_batches(&widths, BATCH_MAX, BATCH_RATIO, BATCH_MIN_W, BATCH_MAX_AREA)
         {
@@ -174,12 +191,18 @@ pub fn recognize_crops(
                     &widths_in,
                 )
                 .unwrap_or_else(|e| panic!("rec {gname}: {e}"));
-            // outputs: ids, conf, lengths, blank, topv, topi (P4 uses the rest).
+            // outputs: ids, conf, lengths, blank, topv, topi (the beam uses 3-5).
             let ids = o[0].as_int().expect("rec ids");
             let conf = o[1].as_float().expect("rec conf");
             let lengths = o[2].as_int().expect("rec lengths");
             let t = ids.len() / idx.len();
             let stride = wm as f64 / (t as f64).max(1.0);
+            let blank_t = o[3].as_float();
+            let topv_t = o[4].as_float();
+            let topi_t = o[5].as_int();
+            let kt = topv_t
+                .and_then(|v| (idx.len() * t != 0).then(|| v.len() / (idx.len() * t)))
+                .unwrap_or(0);
             for (k, &si) in idx.iter().enumerate() {
                 let j = sel[si];
                 let n_len = lengths[k] as usize;
@@ -203,6 +226,47 @@ pub fn recognize_crops(
                     }
                     s / kept.len() as f32
                 };
+                let conf64 = f64::from(confv);
+                let mut ids_kept: Vec<i32> = kept.iter().map(|&tt| seq[tt]).collect();
+                let mut kept_steps: Vec<usize> = kept.clone();
+                // A greedy reading under the group's gate is re-read by the
+                // CTC prefix beam (recognize: ids/steps replaced, conf kept).
+                if let Some(lm) = lm {
+                    if MIN_CONF as f64 <= conf64 && conf64 < gate {
+                        let base = k * t;
+                        let blank: Vec<f64> = blank_t
+                            .map(|v| v[base..base + n_len].iter().map(|&x| x as f64).collect())
+                            .unwrap_or_default();
+                        let topv: Vec<f64> = topv_t
+                            .map(|v| {
+                                v[base * kt..base * kt + n_len * kt]
+                                    .iter()
+                                    .map(|&x| x as f64)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let topi: Vec<i64> = topi_t
+                            .map(|v| {
+                                v[base * kt..base * kt + n_len * kt]
+                                    .iter()
+                                    .map(|&x| x as i64)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let (b_ids, b_steps) = beam_search(
+                            &blank,
+                            &topv,
+                            &topi,
+                            lm,
+                            alpha,
+                            beta,
+                            LM_BEAM,
+                            LM_CAND_FLOOR,
+                        );
+                        ids_kept = b_ids.iter().map(|&x| x as i32).collect();
+                        kept_steps = b_steps;
+                    }
+                }
                 if confv <= best_conf[j] {
                     continue;
                 }
@@ -213,7 +277,6 @@ pub fn recognize_crops(
                 let ix0 = (x0 - 0.3 * h).floor();
                 let cw = (x1 + 0.3 * h).ceil() - ix0;
                 let f = cw / (crops[j].w as f64);
-                let ids_kept: Vec<i32> = kept.iter().map(|&tt| seq[tt]).collect();
                 if confv < MIN_CONF {
                     // Low-confidence read: the product stores no text and no
                     // token positions (recognize: ("", conf, [])).
@@ -225,7 +288,7 @@ pub fn recognize_crops(
                     });
                     continue;
                 }
-                let xs: Vec<f64> = kept
+                let xs: Vec<f64> = kept_steps
                     .iter()
                     .map(|&tt| ix0 + (tt as f64 + 0.5) * stride * f)
                     .collect();
