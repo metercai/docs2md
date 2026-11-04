@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · test
+    name: clippy · test · build
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
