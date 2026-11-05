@@ -10,6 +10,7 @@
 pub mod det;
 pub mod lm;
 pub mod npz;
+pub mod order;
 pub mod preproc;
 pub mod rec;
 pub mod vocab;
