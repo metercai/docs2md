@@ -9,10 +9,12 @@
 
 pub mod det;
 pub mod lm;
+pub mod markdown;
 pub mod npz;
 pub mod order;
 pub mod preproc;
 pub mod rec;
+pub mod rtl;
 pub mod vocab;
 
 use std::collections::HashMap;

@@ -71,7 +71,7 @@ fn p2_gate_32_pages() {
     let metas: Vec<PathBuf> = std::fs::read_dir(&ref_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter(|p| p.to_string_lossy().ends_with(".meta.json"))
         .collect();
     assert_eq!(metas.len(), 32, "32 reference pages");
 

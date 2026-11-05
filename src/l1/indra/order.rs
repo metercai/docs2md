@@ -37,7 +37,7 @@ pub const GRID_CLASSES: [usize; 3] = [5, 8, 9];
 const SENTENCE_END: &[char] = &['.', '!', '?', ':', ';', '。', '！', '？', '：', '；', '．'];
 const LIST_MARKERS: &[char] = &['•', '-', '–', '▪', '◦', '*', '·', '→'];
 
-mod char_tables {
+pub(crate) mod char_tables {
     include!("char_tables.rs");
 
     /// True when codepoint `cp` lies in any run of `runs` (sorted, disjoint).
@@ -67,6 +67,17 @@ pub fn is_py_upper(c: char) -> bool {
     char_tables::in_runs(c as u32, char_tables::UPPER_RUNS)
 }
 
+/// True when the codepoint is alphabetic by Python's str.isalpha
+/// (markdown.rs join_lines hyphen-join guard).
+pub fn is_py_alpha(c: char) -> bool {
+    char_tables::in_runs(c as u32, char_tables::ALPHA_RUNS)
+}
+
+/// True when the codepoint is lowercase by Python's str.islower.
+pub fn is_py_lower(c: char) -> bool {
+    char_tables::in_runs(c as u32, char_tables::LOWER_RUNS)
+}
+
 /// Length with East Asian wide/fullwidth characters counted twice
 /// (unicodedata.east_asian_width in "WF").
 pub fn display_len(t: &str) -> usize {
@@ -76,7 +87,7 @@ pub fn display_len(t: &str) -> usize {
 }
 
 /// Python round(): round half to even (input is non-negative here).
-fn py_round(x: f64) -> i64 {
+pub(crate) fn py_round(x: f64) -> i64 {
     if x.fract() == 0.5 {
         let k = x.trunc() as i64;
         return if k % 2 == 0 { k } else { k + 1 };
@@ -86,7 +97,7 @@ fn py_round(x: f64) -> i64 {
 
 /// Median of f32 values, as float64 of the f32 result (numpy keeps the
 /// array dtype: even n -> mean of the two middle f32 values in f32).
-fn median_f32(v: &[f32]) -> f64 {
+pub(crate) fn median_f32(v: &[f32]) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(|a, b| a.total_cmp(b));
     let n = s.len();
@@ -94,6 +105,18 @@ fn median_f32(v: &[f32]) -> f64 {
         s[n / 2] as f64
     } else {
         ((s[n / 2 - 1] + s[n / 2]) / 2.0f32) as f64
+    }
+}
+
+/// Median of f64 values (numpy median of a Python list of floats: float64).
+pub(crate) fn median_f64(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
     }
 }
 
