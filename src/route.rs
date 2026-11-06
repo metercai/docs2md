@@ -96,6 +96,59 @@ pub fn route_from_layout(regions: &[LayoutRegion], page_area: f64, rc: &RouteCon
     Tier::L1
 }
 
+/// Structural signal for the S0 reroute check (plan C1): true when the page
+/// carries a table-caption region (rule a) or a COMPACT complex region
+/// (rule b). Deliberately excludes rule c (dense text): an S0 text page
+/// legitimately contains large high-conf TEXT regions, dense text is not a
+/// structural block, and OCR would be slower and less accurate than the
+/// native layer for it.
+pub fn structural_from_layout(
+    regions: &[LayoutRegion],
+    page_area: f64,
+    rc: &RouteConfig,
+) -> bool {
+    // (a) any table-caption region.
+    for r in regions {
+        if r.layout_type == LayoutType::TableCaption {
+            return true;
+        }
+    }
+    // (b) compact complex region.
+    for r in regions {
+        if matches!(
+            r.layout_type,
+            LayoutType::Table | LayoutType::Figure | LayoutType::Equation
+        ) {
+            let rw = (r.bbox.x_max - r.bbox.x_min) as f64;
+            let rh = (r.bbox.y_max - r.bbox.y_min) as f64;
+            let frac = if page_area > 0.0 {
+                (rw * rh) / page_area
+            } else {
+                1.0
+            };
+            if frac < rc.compact_frac as f64 && r.confidence > rc.compact_conf {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Run the structural check (see [`structural_from_layout`]) on a rendered
+/// PNG. `None` when no layout detector is available or detection fails.
+pub fn g1_structural(
+    layout: Option<&mut LayoutDetector>,
+    png: &[u8],
+    page_area: f64,
+    rc: &RouteConfig,
+) -> Option<bool> {
+    let ld = layout?;
+    let dyn_img = image::load_from_memory(png).ok()?;
+    let mat = rusto::image_impl::Mat::new(dyn_img);
+    let out: LayoutOutput = ld.detect(&mat).ok()?;
+    Some(structural_from_layout(&out.regions, page_area, rc))
+}
+
 /// Run G1 on a rendered PNG. `layout` is the (lazily built) detector; when it
 /// is `None` (no external layout model configured / failed to load) every
 /// OCR page defaults to L1 and G3 may still escalate to L2.

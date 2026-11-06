@@ -9,7 +9,13 @@
 //!   L2  external VLM service (a llama-server wrapper) — complex pages.
 //!
 //! Per-page routing:
-//!   * page has a usable text layer            → L0 (direct)
+//!   * page has a usable text layer            → L0 (direct), except when
+//!     the layer is only *textual* (needs_ocr = false) yet the page carries
+//!     a structural block (table caption / compact table-figure-equation,
+//!     G1 structural rules a/b): then it is rerouted to L1, whose order
+//!     model emits `<table>` structure (L2's VLM emits plain text only).
+//!     Dense text (rule c) is a normal S0 condition and stays L0.
+//!     Gated on `use_indra`: the v0.1.0 path is byte-identical.
 //!   * needs OCR → render → G1 (layout model,
 //!     external) decides L1 vs L2 → if L1, the
 //!     dual-engine G3 flow: Indra → G3 (output-level,
@@ -31,7 +37,7 @@ pub mod route;
 use config::Config;
 use l1::{build_engine, L1Engine, PpOcrEngine};
 use l2::{L2Client, PageImage};
-use route::{decide_l1_flow, g1, g3, output_chars, G3Verdict, L1Outcome, Tier};
+use route::{decide_l1_flow, g1, g1_structural, g3, output_chars, G3Verdict, L1Outcome, Tier};
 use rusto::{LayoutConfig, LayoutDetector};
 use std::path::PathBuf;
 
@@ -213,14 +219,69 @@ impl Engine {
                 }
             }
             if !p.needs_ocr {
-                out.push_str(&p.markdown);
-                out.push('\n');
-                records.push(PageRecord {
-                    page: page1,
-                    tier: "L0-native".into(),
-                    chars: p.markdown.chars().count(),
-                    note: None,
-                });
+                // S0 candidate: a usable native text layer. C1 reroute — a
+                // table page's text layer is only textual, but the page
+                // carries a structural block (table caption / compact
+                // table-figure-equation): L1's order model emits `<table>`
+                // structure, which the native layer flattens away. Check G1
+                // structural rules a/b only (dense text, rule c, is a normal
+                // S0 condition and stays L0). Gated on use_indra + an
+                // available layout model: with use_indra = false (v0.1.0) or
+                // no layout model the page keeps the native L0 output,
+                // byte-identical to before.
+                let mut reroute_png: Option<Vec<u8>> = None;
+                if self.cfg.l1.use_indra
+                    && self
+                        .cfg
+                        .l1
+                        .layout_model
+                        .as_ref()
+                        .map_or(false, |m| m.exists())
+                {
+                    if doc.is_none() {
+                        doc = Some(
+                            pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec())
+                                .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
+                        );
+                    }
+                    let d = doc.as_ref().unwrap();
+                    let (png, pbox, rot) =
+                        render::render_pdf_page(d, p.page as usize, self.cfg.l0.dpi)
+                            .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+                    let (pw, ph) = render::png_size(&png);
+                    let _ = (pbox, rot);
+                    let page_area = pw as f64 * ph as f64;
+                    let route = self.cfg.route.clone();
+                    let hit = self
+                        .ensure_layout()
+                        .and_then(|ld| g1_structural(Some(ld), &png, page_area, &route))
+                        .unwrap_or(false);
+                    if hit {
+                        reroute_png = Some(png);
+                    }
+                }
+                if let Some(png) = reroute_png {
+                    eprintln!("[p{page1}] S0 reroute: G1 structural a/b — L1");
+                    let (page_md, rec, note) = self.l1_dual(page1, &png);
+                    if self.cfg.output.page_markers {
+                        out.push_str(&format!("<!-- page:{page1} -->\n"));
+                    }
+                    if let Some(n) = &note {
+                        out.push_str(n);
+                    }
+                    out.push_str(&page_md);
+                    out.push('\n');
+                    records.push(rec);
+                } else {
+                    out.push_str(&p.markdown);
+                    out.push('\n');
+                    records.push(PageRecord {
+                        page: page1,
+                        tier: "L0-native".into(),
+                        chars: p.markdown.chars().count(),
+                        note: None,
+                    });
+                }
                 continue;
             }
 
