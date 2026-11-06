@@ -31,7 +31,7 @@ pub struct L0Config {
 }
 impl Default for L0Config {
     fn default() -> Self {
-        Self { dpi: 150 }
+        Self { dpi: 200 }
     }
 }
 

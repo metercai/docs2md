@@ -6,7 +6,7 @@
 # ── L0: native text extraction ──────────────────────────────────────────
 [l0]
 # Render DPI for needs-ocr pages (shared by G1 layout routing and the L2 send).
-dpi = 150
+dpi = 200
 
 # ── L1: embedded pure-Rust PP-OCRv6 (ONNX on rten) ─────────────────────
 [l1]

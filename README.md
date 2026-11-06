@@ -38,7 +38,7 @@ routing) and the L2 VLM are deliberately external and located by config.
 
 ```
 page has a usable text layer ──────────────── L0 (direct)
-needs OCR → render (pdf_oxide, 150 dpi)
+needs OCR → render (pdf_oxide, 200 dpi)
           → G1 layout model (external PP-DocLayout):
               table-caption / compact complex / dense-text blob ⇒ L2
               otherwise                                        ⇒ L1
