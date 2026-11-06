@@ -173,8 +173,7 @@ fn config_candidates() -> Vec<Option<PathBuf>> {
         // 3. ./docs2md-l2d.toml
         Some(PathBuf::from("docs2md-l2d.toml")),
         // 4. ~/.config/docs2md/l2d.toml
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".config/docs2md/l2d.toml")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/docs2md/l2d.toml")),
     ]
 }
 
@@ -184,16 +183,16 @@ fn load_config(explicit: &Option<PathBuf>) -> Result<(L2dConfig, PathBuf), Strin
     if let Some(p) = explicit {
         let s = std::fs::read_to_string(p)
             .map_err(|e| format!("cannot read config {}: {e}", p.display()))?;
-        let cfg: L2dConfig = toml::from_str(&s)
-            .map_err(|e| format!("invalid TOML in {}: {e}", p.display()))?;
+        let cfg: L2dConfig =
+            toml::from_str(&s).map_err(|e| format!("invalid TOML in {}: {e}", p.display()))?;
         return Ok((cfg, p.clone()));
     }
     for p in config_candidates().into_iter().flatten() {
         if p.is_file() {
             let s = std::fs::read_to_string(&p)
                 .map_err(|e| format!("cannot read config {}: {e}", p.display()))?;
-            let cfg: L2dConfig = toml::from_str(&s)
-                .map_err(|e| format!("invalid TOML in {}: {e}", p.display()))?;
+            let cfg: L2dConfig =
+                toml::from_str(&s).map_err(|e| format!("invalid TOML in {}: {e}", p.display()))?;
             eprintln!("[l2d] config: {}", p.display());
             return Ok((cfg, p));
         }
@@ -487,8 +486,11 @@ fn main() {
 
         // Wait for health; bail out immediately if the child dies early
         // (bind failure, bad model path): its exit status is the diagnosis.
-        if let Err(e) = wait_healthy(&base, Duration::from_secs(cfg.health_timeout_secs), &mut child)
-        {
+        if let Err(e) = wait_healthy(
+            &base,
+            Duration::from_secs(cfg.health_timeout_secs),
+            &mut child,
+        ) {
             eprintln!("[l2d] {e}");
             let _ = child.kill();
             let _ = child.wait();

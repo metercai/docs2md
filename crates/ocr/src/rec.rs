@@ -390,10 +390,8 @@ impl TextRecognizer {
                     .decode(preds, return_word_box, &wh_ratio_list, max_wh_ratio);
 
             if return_word_box {
-                for (local_idx, ((text, score), info)) in line_results
-                    .into_iter()
-                    .zip(batch_word_infos)
-                    .enumerate()
+                for (local_idx, ((text, score), info)) in
+                    line_results.into_iter().zip(batch_word_infos).enumerate()
                 {
                     let actual_idx = indices[beg + local_idx];
                     all_texts[actual_idx] = (text, score);

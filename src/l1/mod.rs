@@ -7,8 +7,8 @@
 //! embedded bytes are materialized to temp files once at init. `medium`/
 //! `tiny` are not embedded; selecting them requires an external `model_dir`.
 
-use std::path::PathBuf;
 use rusto::{InitializeConfig, OcrRunOptions, RustO, TextResult};
+use std::path::PathBuf;
 
 use crate::config::L1Config;
 
@@ -16,7 +16,7 @@ use crate::config::L1Config;
 #[derive(Debug, Clone)]
 pub struct OcrLine {
     pub text: String,
-    /// Per-line recognition confidence (0..1). Feeds the G2 output-level
+    /// Per-line recognition confidence (0..1). Feeds the G3 output-level
     /// gate (mean line conf).
     pub conf: f32,
     /// Bounding box: top, left, width, height (pixels).
@@ -31,14 +31,18 @@ pub struct OcrLine {
 #[derive(Debug, Clone)]
 pub struct OcrPage {
     pub lines: Vec<OcrLine>,
+    /// Engine markdown, when the engine produces it (Indra: the layout-aware
+    /// markdown, table post-filter already applied; PP-OCRv6: `None` — the
+    /// orchestrator builds markdown from the lines).
+    pub md: Option<String>,
 }
 
 impl OcrPage {
-    /// Total visible characters (G2 `min_chars` signal).
+    /// Total visible characters (the G3 `min_chars` signal).
     pub fn char_count(&self) -> usize {
         self.lines.iter().map(|l| l.text.chars().count()).sum()
     }
-    /// Mean per-line confidence (G2 conf signal). 1.0 for an empty page.
+    /// Mean per-line confidence (G3 conf signal). 1.0 for an empty page.
     pub fn mean_conf(&self) -> f32 {
         if self.lines.is_empty() {
             return 1.0;
@@ -89,7 +93,10 @@ impl L1Engine for PpOcrEngine {
                 height: r.frame.height,
             })
             .collect();
-        Ok(OcrPage { lines })
+        Ok(OcrPage {
+            lines,
+            md: None,
+        })
     }
 }
 
@@ -102,10 +109,8 @@ impl PpOcrEngine {
             // Materialize the embedded model to temp files (rusto loads by
             // path). One set per process is enough; the engine keeps them
             // for its lifetime.
-            let dir = std::env::temp_dir().join(format!(
-                "docs2md-ppocrv6-small-{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("docs2md-ppocrv6-small-{}", std::process::id()));
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let det_p = dir.join("det.onnx");
             let rec_p = dir.join("rec.onnx");
@@ -135,10 +140,12 @@ impl PpOcrEngine {
         };
 
         let cfg = InitializeConfig::ppv6(det, rec, dict);
-        let ocr = RustO::initialize(cfg).map_err(|e| {
-            format!("PP-OCRv6 '{tier}' init failed: {e}")
-        })?;
-        Ok(Self { ocr, tier: tier.to_string() })
+        let ocr =
+            RustO::initialize(cfg).map_err(|e| format!("PP-OCRv6 '{tier}' init failed: {e}"))?;
+        Ok(Self {
+            ocr,
+            tier: tier.to_string(),
+        })
     }
 }
 
@@ -149,17 +156,16 @@ const EMBEDDED_REC_SMALL: &[u8] = include_bytes!("../../assets/models/small/rec.
 const EMBEDDED_DICT_SMALL: &[u8] = include_bytes!("../../assets/models/small/dict.txt");
 
 /// The Indra engine (feature `indra`): port of the indra-ocr 1.1.2 pipeline,
-/// embedded under assets/models/indra/. P0-P2: loading and smoke inference;
-/// the full page pipeline (det -> rec -> order -> layout -> markdown) lands
-/// in P3-P6. Until then ocr_page returns a clear error so routing degrades
-/// to the configured fallback instead of silently producing nothing.
+/// embedded under assets/models/indra/. Page pipeline (P1-P6): preview ->
+/// skew -> orientation -> detect -> recognize -> reading order -> markdown,
+/// with the table post-filter applied in-engine (the engine's markdown is
+/// the post-filtered one).
 #[cfg(feature = "indra")]
 pub mod indra;
 
 #[cfg(feature = "indra")]
 pub struct IndraEngine {
-    /// Loaded models + LM tables; consumed by the page pipeline (P1+).
-    #[allow(dead_code)]
+    /// Loaded models + LM tables; drives the page pipeline.
     engine: indra::IndraEngine,
 }
 
@@ -177,13 +183,15 @@ impl L1Engine for IndraEngine {
         "indra"
     }
 
-    fn ocr_page(&mut self, _png: &[u8]) -> Result<OcrPage, String> {
-        Err("indra engine page pipeline is in progress (port P3-P6); \
-             use PP-OCRv6 (l1.use_indra = false)".into())
+    fn ocr_page(&mut self, png: &[u8]) -> Result<OcrPage, String> {
+        let gray = indra::preproc::Gray::from_png(png)?;
+        self.engine.ocr_page(&gray)
     }
 }
 
-/// Build the configured L1 engine (Indra when enabled, else PP-OCRv6).
+/// Build the configured L1 primary engine (Indra when enabled, else
+/// PP-OCRv6). A `use_indra = true` build without the `indra` feature degrades
+/// to PP-OCRv6 with a warning (the rollback build stays a working v0.1.0).
 pub fn build_engine(cfg: &L1Config) -> Result<Box<dyn L1Engine>, String> {
     if cfg.use_indra {
         #[cfg(feature = "indra")]
@@ -192,12 +200,18 @@ pub fn build_engine(cfg: &L1Config) -> Result<Box<dyn L1Engine>, String> {
         }
         #[cfg(not(feature = "indra"))]
         {
-            return Err(
-                "l1.use_indra = true but this build was compiled without the \
-                 `indra` feature"
-                    .into(),
+            eprintln!(
+                "[l1] l1.use_indra = true but this build was compiled without the \
+                 `indra` feature — using PP-OCRv6"
             );
+            return Ok(Box::new(PpOcrEngine::new(
+                &cfg.tier,
+                cfg.model_dir.as_ref(),
+            )?));
         }
     }
-    Ok(Box::new(PpOcrEngine::new(&cfg.tier, cfg.model_dir.as_ref())?))
+    Ok(Box::new(PpOcrEngine::new(
+        &cfg.tier,
+        cfg.model_dir.as_ref(),
+    )?))
 }

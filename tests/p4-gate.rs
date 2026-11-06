@@ -236,7 +236,7 @@ fn p4_gate_32_pages_with_lm() {
         let lines = if boxes.is_empty() {
             Vec::new()
         } else {
-            rec::recognize(&engine, &gray, &boxes)
+            rec::recognize(&engine, &gray, &boxes, false)
         };
 
         let mut page_match = 0usize;

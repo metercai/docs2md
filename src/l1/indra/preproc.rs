@@ -35,6 +35,19 @@ impl Gray {
     pub fn get(&self, x: usize, y: usize) -> u8 {
         self.data[y * self.w + x]
     }
+    /// Decode a rendered page image (PNG bytes) to the engine's grayscale
+    /// page. Color inputs convert with BT.601 luma, matching cv2's
+    /// IMREAD_GRAYSCALE (the product loader).
+    pub fn from_png(png: &[u8]) -> Result<Gray, String> {
+        let img =
+            image::load_from_memory(png).map_err(|e| format!("decode page image: {e}"))?;
+        let gray = img.to_luma8();
+        Ok(Gray {
+            w: gray.width() as usize,
+            h: gray.height() as usize,
+            data: gray.into_raw(),
+        })
+    }
 }
 
 /// A float32 ink map (0 = paper, 1 = ink), row-major.

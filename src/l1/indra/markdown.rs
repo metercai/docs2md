@@ -20,6 +20,7 @@ pub const HEADER: usize = 2; // Page-Header
 pub const FOOTER: usize = 3; // Page-Footer
 pub const SECTION: usize = 1; // Section-Header
 pub const LIST: usize = 4; // List-Group
+pub const CAPTION: usize = 6; // Caption (a table-caption region keeps the table)
 pub const TABLE: usize = 5; // Table
 
 /// G1 compact-region thresholds (route.rs): a compact, confident region is the

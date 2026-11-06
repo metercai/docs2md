@@ -81,7 +81,11 @@ fn val(raw: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
 
 fn parse_pages(s: &str) -> Result<Vec<u32>, String> {
     s.split(',')
-        .map(|p| p.trim().parse::<u32>().map_err(|e| format!("bad page '{p}': {e}")))
+        .map(|p| {
+            p.trim()
+                .parse::<u32>()
+                .map_err(|e| format!("bad page '{p}': {e}"))
+        })
         .collect()
 }
 
@@ -164,7 +168,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!("[done] {} → {} ({} pages)", args.input.display(), out_path, result.pages.len());
+    eprintln!(
+        "[done] {} → {} ({} pages)",
+        args.input.display(),
+        out_path,
+        result.pages.len()
+    );
     if result.pages.iter().any(|p| p.note.is_some()) {
         let flagged: Vec<String> = result
             .pages

@@ -10,8 +10,8 @@
 //! Everything else (L0 native extraction, L1 embedded PP-OCRv6-small OCR)
 //! is self-contained in the binary.
 
-use std::path::PathBuf;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -47,15 +47,14 @@ pub struct L1Config {
     pub model_dir: Option<PathBuf>,
     /// External PP-DocLayout ONNX path (the ~130MB layout model is not
     /// embedded). When absent or unreadable, G1 layout routing is skipped
-    /// and every OCR page defaults to L1 (G2 output-level can still
+    /// and every OCR page defaults to L1 (the G3 output-level gate can still
     /// escalate to L2).
     pub layout_model: Option<PathBuf>,
     /// Layout detector input size (pixels on the long edge).
     pub layout_target_size: u32,
-    /// When true, run the Indra engine (feature `indra`) instead of
-    /// PP-OCRv6. The Indra pipeline (port of indra-ocr 1.1.2) is being
-    /// ported under src/l1/indra/; until the page pipeline lands, enabling
-    /// this returns a clear error per page.
+    /// When true, run the Indra engine (feature `indra`) as the primary L1
+    /// engine, with PP-OCRv6 kept as the G3 fallback. When false, run the
+    /// PP-OCRv6-only v0.1.0 flow (the rollback path).
     pub use_indra: bool,
 }
 impl Default for L1Config {
@@ -65,7 +64,7 @@ impl Default for L1Config {
             model_dir: None,
             layout_model: None,
             layout_target_size: 800,
-            use_indra: false,
+            use_indra: true,
         }
     }
 }
@@ -116,11 +115,11 @@ impl Default for L2Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
-    /// G2 output-level fallback thresholds (calibrated on the 623-page
+    /// G3 output-level fallback thresholds (calibrated on the 623-page
     /// fixture corpus; see the indra/PP-OCRv6 fit plan). These are the
     /// "operational parameters" and are therefore configurable, not
     /// hardcoded.
-    pub g2: G2Thresholds,
+    pub g3: G3Thresholds,
     /// G1 compact-complex-region area fraction (bbox covers < this fraction
     /// of the page and conf > compact_conf ⇒ L2).
     pub compact_frac: f32,
@@ -133,7 +132,7 @@ pub struct RouteConfig {
 impl Default for RouteConfig {
     fn default() -> Self {
         Self {
-            g2: G2Thresholds::default(),
+            g3: G3Thresholds::default(),
             compact_frac: 0.5,
             compact_conf: 0.4,
             dense_frac: 0.85,
@@ -144,7 +143,7 @@ impl Default for RouteConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct G2Thresholds {
+pub struct G3Thresholds {
     /// Minimum markdown characters for a page to be considered "has output".
     pub min_chars: usize,
     /// mean line conf below this (with low char count) ⇒ hard fail.
@@ -152,7 +151,7 @@ pub struct G2Thresholds {
     /// mean line conf below this (with low char count) ⇒ medium doubt.
     pub mid_conf: f32,
 }
-impl Default for G2Thresholds {
+impl Default for G3Thresholds {
     fn default() -> Self {
         Self {
             min_chars: 60,
@@ -185,8 +184,8 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
         let cfg: Config =
             toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
         Ok(cfg)

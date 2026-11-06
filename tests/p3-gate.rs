@@ -103,7 +103,7 @@ fn p3_gate_32_pages() {
         let lines = if boxes.is_empty() {
             Vec::new()
         } else {
-            rec::recognize(&engine, &gray, &boxes)
+            rec::recognize(&engine, &gray, &boxes, false)
         };
 
         let mut page_match = 0usize;

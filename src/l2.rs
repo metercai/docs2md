@@ -126,11 +126,7 @@ impl L2Client {
         let b64 = base64_encode(img.png);
         let data_uri = format!("data:image/png;base64,{b64}");
 
-        let model = self
-            .cfg
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".into());
+        let model = self.cfg.model.clone().unwrap_or_else(|| "default".into());
 
         let body = serde_json::json!({
             "model": model,
@@ -171,8 +167,10 @@ impl L2Client {
                 return L2Result {
                     markdown: String::new(),
                     ok: false,
-                    error: Some(format!("non-JSON L2 response: {e} (body: {})",
-                        text.chars().take(200).collect::<String>())),
+                    error: Some(format!(
+                        "non-JSON L2 response: {e} (body: {})",
+                        text.chars().take(200).collect::<String>()
+                    )),
                 };
             }
         };
@@ -205,10 +203,7 @@ impl L2Client {
     }
 
     fn base(&self) -> String {
-        self.cfg
-            .base_url
-            .trim_end_matches('/')
-            .to_string()
+        self.cfg.base_url.trim_end_matches('/').to_string()
     }
 }
 
@@ -290,10 +285,7 @@ mod tests {
 
     #[test]
     fn clean_llama_output_strips_status_block() {
-        assert_eq!(
-            clean_llama_output("# Title\n\nbody\n"),
-            "# Title\n\nbody"
-        );
+        assert_eq!(clean_llama_output("# Title\n\nbody\n"), "# Title\n\nbody");
         // A leaked llama status block is truncated at its start.
         assert_eq!(
             clean_llama_output("body\n[ Prompt: OCR: ]\nExiting..."),

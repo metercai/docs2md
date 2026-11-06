@@ -213,6 +213,9 @@ pub struct IndraEngine {
     pub script: Session,
 }
 
+/// `assemble` output: (texts, confs, tidy'd boxes, reading order, markdown).
+type Assembled = (Vec<String>, Vec<f64>, Vec<[f64; 4]>, Vec<usize>, String);
+
 impl IndraEngine {
     /// Load every model from the embedded assets.
     pub fn init() -> Result<Self, String> {
@@ -245,6 +248,263 @@ impl IndraEngine {
             orient: Session::load(assets::ORIENT)?,
             script: Session::load(assets::SCRIPT)?,
         })
+    }
+
+    /// OCR one page image (product `Pipeline.__call__`, `turn=True`):
+    /// preview -> skew -> orientation -> turn -> detect -> recognize ->
+    /// assemble (gutter/split -> tidy -> reading order -> blocks -> markdown
+    /// with the table post-filter applied).
+    pub fn ocr_page(&mut self, gray: &preproc::Gray) -> Result<super::OcrPage, String> {
+        let small = preproc::preview(gray, preproc::PREVIEW_SIDE);
+        let a = preproc::estimate_skew(&small, 800);
+        // The orientation model reads the page straightened by its row angle
+        // (a tilted page could read as turned).
+        let k = if a.abs() >= preproc::DESKEW_MIN {
+            self.orientation(&preproc::rotate_page(&small, a))?
+        } else {
+            self.orientation(&small)?
+        };
+        self.read(gray, k, a, &small)
+    }
+
+    /// orient.onnx quarter-turn choice (product `orientation`): argmax over the
+    /// class probabilities, 0 when no turn is more likely than ORIENT_MIN.
+    fn orientation(&self, gray: &preproc::Gray) -> Result<i32, String> {
+        let ink = preproc::orient_input(gray, preproc::ORIENT_SIDE);
+        let outs = self
+            .orient
+            .run_f("x", &[1, 1, preproc::ORIENT_SIDE, preproc::ORIENT_SIDE], &ink.data)
+            .map_err(|e| format!("orient run: {e}"))?;
+        let p = outs[0]
+            .as_float()
+            .cloned()
+            .ok_or_else(|| "orient output is not float".to_string())?;
+        Ok(preproc::orientation_from_probs(&p))
+    }
+
+    /// Product `_read`: turn the page, detect, recognize, assemble, then map
+    /// the line boxes back onto the page as it is (deskew and vertical turn
+    /// undone).
+    fn read(
+        &mut self,
+        gray: &preproc::Gray,
+        k: i32,
+        a: f64,
+        small: &preproc::Gray,
+    ) -> Result<super::OcrPage, String> {
+        let (gray, _k, skew) = preproc::turn(gray, k, a, small);
+        let (boxes, pictures) =
+            det::detect(&self.det, &gray, self.meta.det_long_side as usize, true);
+        let vertical = k == preproc::VERTICAL;
+        let lines = rec::recognize(self, &gray, &boxes, vertical);
+
+        let (texts, confs, boxes, order, md) =
+            self.assemble(&gray, &boxes, &lines, vertical, pictures)?;
+
+        // Lines in reading order, boxes rounded to 0.1 (product Line), then
+        // mapped back onto the page as it is.
+        let mut line_boxes: Vec<[f64; 4]> = order
+            .iter()
+            .map(|&i| {
+                [
+                    (boxes[i][0] * 10.0).round() / 10.0,
+                    (boxes[i][1] * 10.0).round() / 10.0,
+                    (boxes[i][2] * 10.0).round() / 10.0,
+                    (boxes[i][3] * 10.0).round() / 10.0,
+                ]
+            })
+            .collect();
+        let wh = (gray.w, gray.h);
+        if skew != 0.0 {
+            // Boxes back on the page as turned, before the deskew.
+            for b in line_boxes.iter_mut() {
+                *b = preproc::unrotate_box(*b, skew, wh);
+            }
+        }
+        if vertical {
+            // Back on the page as it is: (x, y) -> (W - y, x).
+            let wpx = gray.h as f64;
+            for b in line_boxes.iter_mut() {
+                *b = [wpx - b[3], b[0], wpx - b[1], b[2]];
+            }
+        }
+        let olines: Vec<super::OcrLine> = order
+            .iter()
+            .enumerate()
+            .map(|(pos, &i)| {
+                let b = line_boxes[pos];
+                super::OcrLine {
+                    text: texts[i].clone(),
+                    conf: ((confs[i] as f32) * 10000.0).round() / 10000.0,
+                    top: b[1] as f32,
+                    left: b[0] as f32,
+                    width: (b[2] - b[0]) as f32,
+                    height: (b[3] - b[1]) as f32,
+                }
+            })
+            .collect();
+        Ok(super::OcrPage {
+            lines: olines,
+            md: Some(md),
+        })
+    }
+
+    /// Product `assemble`: lines -> split at wide gaps (SPLIT_GAP) -> tidy ->
+    /// reading order -> blocks -> markdown.  The table post-filter (new Rust
+    /// logic, plan §1.5) demotes full-page low-confidence tables to plain
+    /// joined text before the markdown is built.
+    fn assemble(
+        &self,
+        gray: &preproc::Gray,
+        boxes_in: &[[f64; 4]],
+        lines: &[rec::Line],
+        vertical: bool,
+        pictures: Vec<[f64; 4]>,
+    ) -> Result<Assembled, String> {
+        // A right-to-left page: reading order and markdown work on the page
+        // mirrored left to right, so the first column is the right one.
+        let mut letters = 0usize;
+        let mut n_rtl = 0usize;
+        for ln in lines {
+            for c in ln.text.chars() {
+                if order::is_py_alpha(c) {
+                    letters += 1;
+                    if rtl::is_rtl(c) {
+                        n_rtl += 1;
+                    }
+                }
+            }
+        }
+        let page_rtl = n_rtl > letters - n_rtl;
+        let width = gray.w as f64;
+        let geo = |b: [f64; 4]| -> [f64; 4] {
+            if page_rtl {
+                [width - b[2], b[1], width - b[0], b[3]]
+            } else {
+                b
+            }
+        };
+        let geo_vec = |bs: &[[f64; 4]]| -> Vec<[f64; 4]> { bs.iter().map(|b| geo(*b)).collect() };
+
+        // Text-layer labels split a line at wide gaps; do the same (SPLIT_GAP).
+        let toks: Vec<Vec<markdown::Tok>> = lines.iter().map(|l| l.toks.clone()).collect();
+        let space_id = self.space_id();
+        let vocab = &self.meta.vocab["base"];
+        let cuts = markdown::gutter_cuts(boxes_in, &toks, space_id);
+        let mut nb: Vec<[f64; 4]> = Vec::new();
+        let mut nrec: Vec<(String, f64, Vec<markdown::Tok>)> = Vec::new();
+        for (i, b) in boxes_in.iter().enumerate() {
+            for (bx, tx, tk) in markdown::split_line(
+                *b,
+                &lines[i].toks,
+                markdown::SPLIT_GAP,
+                cuts.get(i).map(|v| v.as_slice()),
+                space_id,
+                vocab,
+                page_rtl,
+            ) {
+                nb.push(bx);
+                nrec.push((tx, lines[i].conf as f64, tk));
+            }
+        }
+        let mut boxes = nb;
+        markdown::tidy_lines(&mut boxes, &mut nrec, page_rtl, space_id);
+        let texts: Vec<String> = nrec.iter().map(|r| r.0.clone()).collect();
+        let confs: Vec<f64> = nrec.iter().map(|r| r.1).collect();
+        let rec_toks: Vec<Vec<markdown::Tok>> = nrec.iter().map(|r| r.2.clone()).collect();
+
+        let ord = self.reading_order(&geo_vec(&boxes), &texts, (gray.w as f64, gray.h as f64))?;
+        let (mut order, mut cls, mut same) = match (ord.cls, ord.same) {
+            (Some(c), Some(s)) => (ord.order, c, s),
+            _ => (ord.order, Vec::new(), Vec::new()),
+        };
+        if vertical && !same.is_empty() {
+            // The order model saw no vertical pages: turned, their columns of
+            // short lines look like one table read row by row across tiers.
+            // Blocks and order come from XY-cut instead, without grid classes.
+            let f32b: Vec<[f32; 4]> = boxes
+                .iter()
+                .map(|b| [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32])
+                .collect();
+            let blocks = order::xycut_blocks(&f32b, 1.0);
+            order = blocks.iter().flatten().copied().collect();
+            let n = boxes.len();
+            same = vec![-1.0f32; n * n];
+            for b in &blocks {
+                for &i in b {
+                    for &j in b {
+                        same[j * n + i] = 1.0;
+                    }
+                }
+            }
+            for &c in &order::GRID_CLASSES {
+                for i in 0..n {
+                    cls[i * order::N_BLOCK_CLASSES + c] = -1e4;
+                }
+            }
+        }
+
+        // The table heads learned one line per cell, but the detector can join
+        // cells: with table_heads on the product re-splits table lines and
+        // re-runs the order model.  This build runs the product default
+        // (table_heads=False, no tab head), so the branch never fires.
+
+        if !same.is_empty() {
+            let gboxes = geo_vec(&boxes);
+            // Inside tables, labels split cells at smaller gaps (CELL_GAP) —
+            // every line, as the product computes cells for all of them.
+            let cells: markdown::Cells = (0..boxes.len())
+                .map(|i| {
+                    markdown::split_line(boxes[i], &rec_toks[i], markdown::CELL_GAP, None, space_id, vocab, page_rtl)
+                        .into_iter()
+                        .map(|(bx, tx, _)| (geo(bx).to_vec(), tx))
+                        .collect()
+                })
+                .collect();
+            let block_groups: Vec<Vec<usize>> = markdown::split_blocks(&order, &same);
+            let has_caption = block_groups
+                .iter()
+                .any(|b| markdown::block_class(b, &cls) == markdown::CAPTION);
+            let keep = markdown::table_postfilter(
+                &block_groups,
+                &gboxes,
+                &cls,
+                &confs.iter().map(|&c| c as f32).collect::<Vec<_>>(),
+                (gray.w * gray.h) as f64,
+                has_caption,
+            );
+            let pics: Option<Vec<[f64; 4]>> = if vertical || pictures.is_empty() {
+                None
+            } else {
+                Some(geo_vec(&pictures))
+            };
+            let md = markdown::page_markdown(
+                &gboxes,
+                &texts,
+                &order,
+                &cls,
+                &same,
+                false,
+                Some(&cells),
+                None,
+                pics.as_deref(),
+                Some(&keep),
+            );
+            Ok((texts, confs, boxes, order, md))
+        } else {
+            let md = texts.join("\n");
+            Ok((texts, confs, boxes, order, md))
+        }
+    }
+
+    /// The base vocab's space token class id (product `vocab.index.get(" ")`).
+    fn space_id(&self) -> i32 {
+        self.meta.vocab["base"]
+            .chars
+            .iter()
+            .position(|c| c == " ")
+            .map(|p| (p + 1) as i32)
+            .unwrap_or(1)
     }
 }
 

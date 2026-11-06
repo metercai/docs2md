@@ -15,6 +15,7 @@
 //! the LM to match).
 
 use crate::l1::indra::lm::beam_search;
+use crate::l1::indra::markdown::Tok;
 use crate::l1::indra::preproc::{self, Gray, InkMap};
 use crate::l1::indra::{IndraEngine, Session};
 
@@ -28,6 +29,10 @@ pub struct Line {
     pub group: String,
     /// Page x of each kept CTC step (token mapping for the order stage, P5).
     pub xs: Vec<f64>,
+    /// Token ids paired with `xs` (the P6 split/tidy/gutter/markdown stages
+    /// re-decode text from the ids, exactly as the product's
+    /// `(token id, page x)` rec tokens). Empty for a low-confidence line.
+    pub toks: Vec<Tok>,
 }
 
 /// Lines under this mean CTC peak probability come back with no text.
@@ -107,13 +112,15 @@ pub fn line_groups(
 /// Greedy recognition of pre-cropped lines (port of the pipeline.recognize
 /// core): `crops` = window-1 crops (group recognizers + the script
 /// classifier), `tall` = window-`rec_window` crops (the base recognizer),
-/// `boxes` = line boxes in page pixels (for the token x mapping). Returns one
-/// `Line` per crop.
+/// `boxes` = line boxes in page pixels (for the token x mapping). `vertical`:
+/// the page is a vertical one turned a quarter turn — every line goes to the
+/// CJK recognizer. Returns one `Line` per crop.
 pub fn recognize_crops(
     engine: &IndraEngine,
     crops: &[InkMap],
     tall: &[InkMap],
     boxes: &[[f64; 4]],
+    vertical: bool,
 ) -> Vec<Line> {
     let n = crops.len();
     let mut out: Vec<Option<Line>> = vec![None; n];
@@ -129,17 +136,23 @@ pub fn recognize_crops(
         .map(|s| s.as_str())
         .filter(|g| *g != "base")
         .collect();
-    let (names, sure) = line_groups(
-        &engine.script,
-        crops,
-        &engine.meta.script_groups,
-        &group_names,
-    );
 
-    // Grouping exactly as recognize(): base reads its own group's lines plus
-    // every line the classifier is UNSURE about (read from the tall crops);
-    // each group recognizer reads only the lines routed to it (window-1).
-    let groups: Vec<(&str, Vec<usize>, bool)> = {
+    // A vertical page's lines are CJK columns (characters on their side); the
+    // CJK recognizer reads all of them (recognize: vertical branch). Otherwise
+    // the script classifier routes each line.
+    let groups: Vec<(&str, Vec<usize>, bool)> = if vertical && group_names.contains(&"cjk") {
+        vec![("cjk", (0..n).collect(), false)]
+    } else {
+        let (names, sure) = line_groups(
+            &engine.script,
+            crops,
+            &engine.meta.script_groups,
+            &group_names,
+        );
+        // Grouping exactly as recognize(): base reads its own group's
+        // lines plus every line the classifier is UNSURE about (read from
+        // the tall crops); each group recognizer reads only the lines
+        // routed to it (window-1).
         let base_sel: Vec<usize> = (0..n).filter(|&j| names[j] == "base" || !sure[j]).collect();
         let mut g = vec![("base", base_sel, true)];
         for gn in &group_names {
@@ -285,6 +298,7 @@ pub fn recognize_crops(
                         conf: confv,
                         group: gname.to_string(),
                         xs: vec![],
+                        toks: vec![],
                     });
                     continue;
                 }
@@ -293,11 +307,36 @@ pub fn recognize_crops(
                     .map(|&tt| ix0 + (tt as f64 + 0.5) * stride * f)
                     .collect();
                 let text = vocab.decode_seq(&ids_kept);
+                // Token kind follows the product's `as_chars`: base reads token
+                // IDs (re-decoded through the base vocab by the P6 stages); a
+                // group recognizer's ids mean nothing in the base vocab, so its
+                // tokens are the group-vocab CHARACTERS (decode_tokens joins
+                // them, NFC + RTL flip).
+                let as_chars = !use_tall;
+                let toks: Vec<Tok> = ids_kept
+                    .iter()
+                    .zip(xs.iter())
+                    .map(|(&id, &x)| {
+                        if as_chars {
+                            Tok::Ch(
+                                vocab
+                                    .chars
+                                    .get((id - 1) as usize)
+                                    .and_then(|s| s.chars().next())
+                                    .unwrap_or('\0'),
+                                x,
+                            )
+                        } else {
+                            Tok::Id(id, x)
+                        }
+                    })
+                    .collect();
                 out[j] = Some(Line {
                     text,
                     conf: confv,
                     group: gname.to_string(),
                     xs,
+                    toks,
                 });
             }
         }
@@ -309,6 +348,7 @@ pub fn recognize_crops(
                 conf: 0.0,
                 group: "base".to_string(),
                 xs: vec![],
+                toks: vec![],
             })
         })
         .collect()
@@ -316,8 +356,14 @@ pub fn recognize_crops(
 
 /// Product path (port of pipeline.recognize): crop each line box from the
 /// page (window-1 for the groups, window-`rec_window` for base, dark-on-light
-/// detected once per box), then the greedy reading.
-pub fn recognize(engine: &IndraEngine, gray: &Gray, boxes: &[[f64; 4]]) -> Vec<Line> {
+/// detected once per box), then the greedy reading. `vertical`: the page is a
+/// vertical one turned a quarter turn (every line to the CJK recognizer).
+pub fn recognize(
+    engine: &IndraEngine,
+    gray: &Gray,
+    boxes: &[[f64; 4]],
+    vertical: bool,
+) -> Vec<Line> {
     let n = boxes.len();
     if n == 0 {
         return vec![];
@@ -352,7 +398,7 @@ pub fn recognize(engine: &IndraEngine, gray: &Gray, boxes: &[[f64; 4]]) -> Vec<L
     } else {
         crops.clone()
     };
-    recognize_crops(engine, &crops, &tall, boxes)
+    recognize_crops(engine, &crops, &tall, boxes, vertical)
 }
 
 #[cfg(test)]
@@ -412,7 +458,7 @@ mod tests {
         let crops = vec![paper.clone(), paper.clone()];
         let tall2 = vec![tall.clone(), tall.clone()];
         let boxes: Vec<[f64; 4]> = vec![[10.0, 10.0, 100.0, 20.0], [10.0, 40.0, 100.0, 50.0]];
-        let lines = recognize_crops(&e, &crops, &tall2, &boxes);
+        let lines = recognize_crops(&e, &crops, &tall2, &boxes, false);
         assert_eq!(lines.len(), 2);
         for l in &lines {
             assert_eq!(l.text, "", "paper line must read empty");
@@ -435,7 +481,7 @@ mod tests {
             g.data[21 * 64 + x] = 0;
         }
         let boxes = [[4.0, 16.0, 60.0, 24.0]];
-        let lines = recognize(&e, &g, &boxes);
+        let lines = recognize(&e, &g, &boxes, false);
         assert_eq!(lines.len(), 1);
     }
 }

@@ -19,13 +19,14 @@ tier = "small"
 # External PP-DocLayout ONNX (the ~130MB layout model is NOT embedded, and is
 # over GitHub's 100MB single-file limit, so it is fetched separately).
 # When unset, G1 layout routing is skipped and every OCR page defaults to
-# L1 (G2 output-level can still escalate to L2).
+# L1 (the G3 output-level gate can still escalate to L2).
 # layout_model = "/path/to/DocOCR/pp_doclayout_plus_l.onnx"
 # Layout detector input size (long edge, pixels).
 layout_target_size = 800
-# Reserved slot: use the Indra engine instead of PP-OCRv6. The Indra engine
-# is not ported to Rust yet (v1) — leave false; true returns a clear error.
-use_indra = false
+# Use the embedded Indra engine (feature `indra`) as the primary L1 engine,
+# with PP-OCRv6 kept as the G3 fallback. When false, run the PP-OCRv6-only
+# v0.1.0 flow (the rollback path).
+use_indra = true
 
 # ── L2: external VLM service (a llama-server wrapper) ───────────────────
 [l2]
@@ -49,10 +50,12 @@ health_wait_secs = 30
 
 # ── Routing thresholds (calibrated on the 623-page fixture corpus) ──────
 [route]
-# G2 output-level fallback (per the indra/PP-OCRv6 fit plan):
+# G3 output-level fallback (per the indra/PP-OCRv6 fit plan). Applied to the
+# primary (Indra) result on its markdown length, and to the PP-OCRv6
+# fallback on its line-text total:
 #   hard fail    when chars < min_chars AND mean line conf < hard_conf
 #   medium doubt when chars < min_chars AND mean line conf < mid_conf
-[route.g2]
+[route.g3]
 min_chars = 60
 hard_conf = 0.5
 mid_conf = 0.75

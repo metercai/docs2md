@@ -68,8 +68,10 @@ pub fn parse_zip(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
         if local_off + 30 > n || bytes[local_off..local_off + 4] != [0x50, 0x4b, 0x03, 0x04] {
             return Err(format!("zip: bad local header for {name}"));
         }
-        let lnname = u16::from_le_bytes(bytes[local_off + 26..local_off + 28].try_into().unwrap()) as usize;
-        let lnextra = u16::from_le_bytes(bytes[local_off + 28..local_off + 30].try_into().unwrap()) as usize;
+        let lnname =
+            u16::from_le_bytes(bytes[local_off + 26..local_off + 28].try_into().unwrap()) as usize;
+        let lnextra =
+            u16::from_le_bytes(bytes[local_off + 28..local_off + 30].try_into().unwrap()) as usize;
         let data_start = local_off + 30 + lnname + lnextra;
         let payload = &bytes[data_start..data_start + csize];
         let data = match method {
@@ -112,8 +114,8 @@ pub fn parse_npy(data: &[u8]) -> Result<NpyArray, String> {
     if hdr_end > data.len() {
         return Err("truncated npy header".into());
     }
-    let hdr = std::str::from_utf8(&data[10..hdr_end])
-        .map_err(|e| format!("bad npy header: {e}"))?;
+    let hdr =
+        std::str::from_utf8(&data[10..hdr_end]).map_err(|e| format!("bad npy header: {e}"))?;
     // Header is a Python dict repr: {'descr': '<f4', 'fortran_order': False, 'shape': (552,), }
     let (descr, shape) = (get_str(hdr, "descr"), get_str(hdr, "shape"));
     let descr = descr.unwrap_or_default();

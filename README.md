@@ -8,23 +8,26 @@ tier that can read it:
 | Tier | What it is | Where it runs | Cost |
 |---|---|---|---|
 | **L0** | native text extraction (embedded text layer) | in-process, no models | free |
-| **L1** | **embedded** pure-Rust PP-OCRv6 (ONNX on rten) | in-process, model baked in | ~1 page of CPU |
+| **L1** | **embedded** pure-Rust Indra OCR (ONNX on rten) + PP-OCRv6 G3 fallback | in-process, models baked in | ~1 page of CPU |
 | **L2** | external VLM service (a **llama-server wrapper**) | separate process, config-located | ~seconds/page |
 
-L1's PP-OCRv6-**small** model (≈31 MB) is `include_bytes!`-embedded, so the
-release is a single binary with no external runtime (no Python, no dylib).
-The layout model (G1 routing) and the L2 VLM are deliberately external and
-located by config.
+L1's embedded models (the Indra ONNX pipeline and the PP-OCRv6-small
+fallback) are `include_bytes!`-embedded, so the release is a single binary
+with no external runtime (no Python, no dylib). The layout model (G1
+routing) and the L2 VLM are deliberately external and located by config.
 
 ## Tiers, in detail
 
 - **L0 — native extraction** (`pdf-inspector`). Pages with a usable text
   layer convert directly. No rendering, no models.
-- **L1 — embedded PP-OCRv6-small** (`rusto-rs`, vendored, pure Rust). Used
-  for simple scanned-text pages. The engine is behind an `L1Engine` trait;
-  an **Indra** engine is a reserved slot (`models/indra/`, feature `indra`)
-  that will implement the same trait once its ONNX pipeline is ported to
-  Rust.
+- **L1 — embedded dual engine** (pure Rust, ONNX on rten). The primary is
+  the **Indra** OCR pipeline (`feature indra`, default on): detection,
+  recognition, reading order and markdown assembly with a table
+  post-filter. When Indra's output fails the **G3** output-level gate
+  (short output and low confidence), the page falls back to the embedded
+  **PP-OCRv6-small** once; if that output fails the gate again the page
+  escalates to L2. `[l1] use_indra = false` runs the PP-OCRv6-only flow
+  (the v0.1.0 behavior) with no fallback.
 - **L2 — external VLM service** (`llama-server` wrapper). Used for complex
   pages (tables, figures, equations). `docs2md` talks to it over the
   OpenAI-compatible `/v1/chat/completions` API, sending the rendered page as
@@ -39,12 +42,17 @@ needs OCR → render (pdf_oxide, 150 dpi)
           → G1 layout model (external PP-DocLayout):
               table-caption / compact complex / dense-text blob ⇒ L2
               otherwise                                        ⇒ L1
-          → if L1: G2 output-level gate (chars, mean line conf)
-              hard/medium ⇒ escalate to L2
+          → if L1 (use_indra, default):
+              Indra → G3 output-level gate (markdown length, mean conf)
+                  pass ⇒ L1-indra
+                  fail ⇒ PP-OCRv6 (once) → same gate
+                      pass ⇒ L1-ppv6(g3-fallback)
+                      fail ⇒ escalate to L2 (L1->L2(g3+g2:{tag}))
+          → if L1 (use_indra = false): the v0.1.0 PP-OCRv6-only flow
 ```
 
 - **G1** (layout) is skipped when no `[l1] layout_model` is configured or it
-  fails to load — then every OCR page defaults to L1 and G2 can still
+  fails to load — then every OCR page defaults to L1 and G3 can still
   escalate to L2.
 - **L2 unavailable** (no `base_url`, health probe failed, or the call
   failed): the L1 output is kept (or an empty page) and the page is marked
@@ -88,7 +96,7 @@ is marked as such.
 See [`config.example.toml`](config.example.toml). All fields are defaulted;
 unknown keys are a hard error. The config is the single place that locates
 the external pieces (layout model path, L2 `base_url`). Routing thresholds
-(`[route]`, G2 `min_chars`/`hard_conf`/`mid_conf`, G1 area/conf gates) are
+(`[route]`, G3 `min_chars`/`hard_conf`/`mid_conf`, G1 area/conf gates) are
 configurable operational parameters.
 
 ## Repository layout
@@ -97,34 +105,38 @@ configurable operational parameters.
 src/                 the docs2md binary + lib (orchestrator, L0/L1/L2, routing)
   config.rs          config model (serde, all defaulted, deny_unknown_fields)
   l0.rs              L0 native extraction (pdf-inspector)
-  l1.rs              L1 engine trait + embedded PP-OCRv6-small + Indra slot
+  l1.rs              L1 engine trait + embedded Indra + PP-OCRv6 fallback
   l2.rs              L2 client (OpenAI-compatible /v1/chat/completions)
   render.rs          pdf_oxide rendering + pixel→PDF coordinate mapping
-  route.rs           G1 layout routing + G2 output-level gate (+ tests)
+  route.rs           G1 layout routing + G3 output-level gate (+ tests)
   markdown.rs        OCR-line → markdown assembly (reading order)
   lib.rs             Engine orchestrator (per-page tier dispatch)
 crates/ocr/          vendored rusto-rs core (PP-OCRv6, pure Rust, rten)
 services/docs2md-l2d/ the L2 service wrapper (llama-server supervisor)
 assets/models/small/ embedded PP-OCRv6-small det/rec/dict (in the binary)
-models/indra/        reserved slot for a future embedded Indra engine
+assets/models/indra/ embedded Indra pipeline: det/rec/order/orient/script
+                     ONNX + LM tables (in the binary)
 scripts/             fetch-models.sh (external layout model + optional tiers)
 ```
 
 ## L1 "dual mode"
 
-`[l1] tier` selects the PP-OCRv6 model tier. **`small` is embedded** (the
-default, "one binary goes everywhere"). `medium`/`tiny` are *not* embedded;
+`[l1] tier` selects the PP-OCRv6 model tier (used by the G3 fallback and
+by the `use_indra = false` flow). **`small` is embedded** (the default,
+"one binary goes everywhere"). `medium`/`tiny` are *not* embedded;
 selecting one requires `[l1] model_dir` pointing at an external
-`PPOCR_v6_<tier>_rten/` directory (see `scripts/fetch-models.sh`). The engine
-code is identical across tiers — only the model weights differ.
+`PPOCR_v6_<tier>_rten/` directory (see `scripts/fetch-models.sh`).
 
-## The reserved Indra slot
+## The Indra engine
 
-`models/indra/` and the `indra` feature mark where the Indra engine (a
-faster ONNX OCR pipeline) will be embedded once its Python pipeline is
-ported to Rust. It is intentionally *not* implemented in v1: selecting
-`[l1] use_indra = true` returns a clear "not ported yet" error rather than
-silently degrading.
+The Indra pipeline (detection, recognition, reading order, markdown with
+table post-filter) is embedded under `assets/models/indra/` behind the
+`indra` feature (default on) and is the primary L1 engine: `[l1]
+use_indra` is `true` by default. The PP-OCRv6 engine remains as the G3
+fallback, so a page whose Indra output is short and low-confidence is
+re-read once by PP-OCRv6 before it escalates to L2. `use_indra = false`
+(or building with `--no-default-features`) returns to the PP-OCRv6-only
+flow.
 
 ## L2 service model
 

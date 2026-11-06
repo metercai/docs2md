@@ -16,11 +16,7 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 /// points, and the page number.
 type RenderedPage = (Vec<u8>, (f32, f32, f32, f32), i32);
 
-pub fn render_pdf_page(
-    doc: &PdfDocument,
-    page: usize,
-    dpi: u32,
-) -> Result<RenderedPage, String> {
+pub fn render_pdf_page(doc: &PdfDocument, page: usize, dpi: u32) -> Result<RenderedPage, String> {
     let info = doc.get_page_info(page).map_err(|e| e.to_string())?;
     let pbox = render_box(&info.media_box, info.crop_box.as_ref());
     let mut opts = RenderOptions::default();
@@ -38,7 +34,12 @@ fn render_box(
 ) -> (f32, f32, f32, f32) {
     let (mx, my, mw, mh) = (media.x, media.y, media.width, media.height);
     let (cx0, cy0, cx1, cy1) = match crop {
-        Some(c) => (c.x.max(mx), c.y.max(my), (c.x + c.width).min(mx + mw), (c.y + c.height).min(my + mh)),
+        Some(c) => (
+            c.x.max(mx),
+            c.y.max(my),
+            (c.x + c.width).min(mx + mw),
+            (c.y + c.height).min(my + mh),
+        ),
         None => (mx, my, mx + mw, my + mh),
     };
     if cx1 <= cx0 || cy1 <= cy0 {
@@ -65,11 +66,7 @@ pub fn base_matrix(
 }
 
 /// Invert the base matrix: device (pixel) → PDF user space.
-pub fn to_pdf(
-    device_x: f32,
-    device_y: f32,
-    m: (f32, f32, f32, f32, f32, f32),
-) -> (f32, f32) {
+pub fn to_pdf(device_x: f32, device_y: f32, m: (f32, f32, f32, f32, f32, f32)) -> (f32, f32) {
     let (a, b, c, d, tx, ty) = m;
     let inv = 1.0 / (a * d - b * c);
     let u = device_x - tx;
