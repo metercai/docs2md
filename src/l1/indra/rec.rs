@@ -79,16 +79,29 @@ pub fn line_groups(
         let (arr, widths_in) = preproc::pad_batch(&batch, preproc::WIDTH_MULTIPLE);
         let h = batch[0].h;
         let wm = arr.len() / (idx.len() * h);
-        let o = script
-            .run_fi(
-                "x",
-                &[idx.len(), 1, h, wm],
-                &arr,
-                "widths",
-                &[idx.len()],
-                &widths_in,
-            )
-            .expect("script run");
+        // rten rejects script-model inputs narrower than 32 px (a MaxPool
+        // layer sees W=1 and errors), where ORT runs them fine. Such narrow
+        // lines are exactly the ones the classifier can't be sure of (a 22px
+        // crop carries no script signal), and unsure lines are read by the
+        // base recognizer from the tall crops, which accept any width — the
+        // same path Python's own routing takes for them. So a failed run
+        // degrades the whole batch to base/unsure instead of panicking.
+        let o = match script.run_fi(
+            "x",
+            &[idx.len(), 1, h, wm],
+            &arr,
+            "widths",
+            &[idx.len()],
+            &widths_in,
+        ) {
+            Ok(o) => o,
+            Err(_) => {
+                for &j in &idx {
+                    sure[j] = false;
+                }
+                continue;
+            }
+        };
         let p = o[0].as_float().expect("script probs");
         for (k, &j) in idx.iter().enumerate() {
             let row = &p[k * 4..k * 4 + 4];
@@ -438,6 +451,23 @@ mod tests {
                 "unexpected group {g}"
             );
         }
+    }
+
+    #[test]
+    fn line_groups_degrades_narrow_crops_to_base_unsure() {
+        // A crop narrower than 32 px (the script model's rten minimum) must
+        // not panic: run_fi errors and the line degrades to base/unsure, which
+        // the base recognizer then reads from the tall crops (any width).
+        let e = engine();
+        let narrow = InkMap {
+            w: 24,
+            h: 32,
+            data: vec![1.0f32; 24 * 32],
+        };
+        let (names, sure) =
+            line_groups(&e.script, &[narrow], &e.meta.script_groups, &["cjk", "rtl", "world"]);
+        assert_eq!(names, ["base"]);
+        assert_eq!(sure, [false]);
     }
 
     #[test]
