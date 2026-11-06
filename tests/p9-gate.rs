@@ -2,17 +2,19 @@
 //!
 //! A. Terminal-state histogram over all 623 pages of the 8 fixture PDFs
 //!    (42+105+415+46+1+2+9+3). Classification:
-//!      S0 = L0-native            (expected 100)
-//!      S1a = L1-indra            (expected 244-k)
+//!      S0 = L0-native            (expected 75)
+//!      S1a = L1-indra            (expected 269-k)
 //!      S1b = L1-ppv6(g3-fallback)(expected exactly 3: the dark CJK scans)
 //!      S2 = everything else (L2-vlm / L1->L2(...) / L2-unavailable keeps)
 //!           (expected 276+k)
-//!    Expected values are calibrated at the current default dpi=200 (A3
-//!    623-page census, 2026-11-06; per-page 150-vs-200 diff + G1 rule
-//!    attribution archived in .hermes/qa/). The L1/L2 split is the dense-judge
-//!    routing calibration; L2 may be unavailable in the test environment,
-//!    which does not change the routing verdict (the tier string is decided
-//!    before the L2 call).
+//!    Expected values are calibrated at the current default dpi=200 and the
+//!    C1 structural reroute (A3 census 2026-11-06, per-page 150-vs-200 diff
+//!    + G1 rule attribution archived in .hermes/qa/; C1 census 2026-11-07:
+//!    25 S0 pages with an a/b structural signal reroute S0 -> L1-indra,
+//!    S0 100 -> 75, S1a 244 -> 269, S2 unchanged). The L1/L2 split is the
+//!    dense-judge routing calibration; L2 may be unavailable in the test
+//!    environment, which does not change the routing verdict (the tier
+//!    string is decided before the L2 call).
 //! B. Determinism: two consecutive full runs, byte-identical markdown
 //!    (plan line 139: temp-0 greedy CTC + deterministic beam + fixed
 //!    thread count). Run with RTEN_NUM_THREADS=1 for the strictest
@@ -169,16 +171,16 @@ fn p9_623_histogram_determinism() {
         "S1b must be exactly the three known dark-background CJK pages"
     );
 
-    // Expected totals (calibrated at dpi=200, A3 census): S0=100, S1a=244-k,
-    // S1b=3, S2=276+k. Invariants: S0=100, S1b=3, L1-routed (S1a+S1b)=247,
-    // total=623.
-    assert_eq!(c.s0, 100, "S0 = 100 text-layer pages");
+    // Expected totals (calibrated at dpi=200 + C1 reroute, C1 census):
+    // S0=75, S1a=269-k, S1b=3, S2=276+k. Invariants: S0=75, S1b=3,
+    // L1-routed (S1a+S1b)=272, total=623.
+    assert_eq!(c.s0, 75, "S0 = 75 text-layer pages (post-C1 reroute)");
     assert_eq!(c.s1b, 3, "S1b = exactly 3 dark pages");
     assert_eq!(c.s0 + c.s1a + c.s1b + c.s2, 623);
     assert_eq!(
         c.s1a + c.s1b,
-        247,
-        "L1-routed (S1a+S1b) = 247 (dpi=200 calibration, k=0 expected)"
+        272,
+        "L1-routed (S1a+S1b) = 272 (dpi=200 + C1 calibration, k=0 expected)"
     );
 
     // B: determinism — second full run, byte-identical markdown.
