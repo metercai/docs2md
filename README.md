@@ -8,7 +8,7 @@ tier that can read it:
 | Tier | What it is | Where it runs | Cost |
 |---|---|---|---|
 | **L0** | native text extraction (embedded text layer) | in-process, no models | free |
-| **L1** | **embedded** pure-Rust Indra OCR (ONNX on rten) + PP-OCRv6 G3 fallback | in-process, models baked in | ~1 page of CPU |
+| **L1** | **embedded** pure-Rust Indra OCR (ONNX on rten) + PP-OCRv6 G3 fallback | in-process, models baked in | ~0.7 s/page single-core (dense pages) |
 | **L2** | external VLM service (a **llama-server wrapper**) | separate process, config-located | ~seconds/page |
 
 L1's embedded models (the Indra ONNX pipeline and the PP-OCRv6-small
@@ -159,6 +159,25 @@ healthy L2 service (a previous l2d, or a manually started llama-server)
 it is reused and no second VLM process is started; a still-loading one
 (503) is waited on within `health_timeout_secs` and then reused; an
 occupant that never becomes healthy is a hard error with the diagnosis.
+
+## Performance and size (measured, P9)
+
+On the 623-page fixture corpus (8 PDFs), release build, this machine
+(64-core):
+
+| Metric | Reading | Result |
+|---|---|---|
+| L1 (pure `ocr_page`, 520 dense patent pages) | median, single core (`RTEN_NUM_THREADS=1`, CPU-pinned) | **0.66 s/page** (p90 1.02, max 1.55) |
+| L1 vs the Python Indra reference | same dense pages, single core vs 4-thread wall (median 0.376 s) | 1.8x — inside the 2x rten budget |
+| Full pipeline incl. PDF parse + render + G1 | 520 dense pages, 4 threads | ~2.0 s/page |
+| Terminal-state histogram | 623 pages, layout model on, L2 unconfigured | S0=100 / S1a=216 / S1b=3 / S2=304 (plan: 100/216/3/304, k=0) |
+| Determinism | two consecutive 623-page runs | byte-identical markdown |
+| Binary | x86_64 release | ~127 MB raw (Indra pipeline 72 MB + PP-OCRv6-small + code); the 44 MB LM tables are the largest single block |
+
+The binary is `include_bytes!`-embedded: no Python, no dylib, no fetched
+model needed for L0/L1. Thread count is the process env var
+`RTEN_NUM_THREADS` (default: physical core count) — lower it to trade
+throughput for determinism or to fit a cgroup quota.
 
 ## License
 
