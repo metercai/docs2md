@@ -14,7 +14,9 @@ use docs2md::l1::indra::preproc::Gray;
 use docs2md::l1::indra::IndraEngine;
 use image::ImageReader;
 
-const PAGES: &str = "/tmp/indra-ab/route/pages";
+fn pages_dir() -> String {
+    std::env::var("P9_PAGES").unwrap_or_else(|_| "/tmp/indra-ab/route/pages".into())
+}
 const DOCS: [&str; 2] = [
     "WO2024133739A1_amylin_NN_patent_oral",
     "WO2025114501A1",
@@ -25,7 +27,7 @@ fn p9_ocr_page_perf() {
     let mut engine = IndraEngine::init().expect("indra init");
     let mut ms: Vec<u128> = Vec::new();
     for doc in DOCS {
-        let dir = Path::new(PAGES);
+        let dir = Path::new(&pages_dir());
         let files: Vec<String> = std::fs::read_dir(dir)
             .expect("pages dir")
             .filter_map(|e| e.ok())
