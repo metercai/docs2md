@@ -25,9 +25,10 @@ const DOCS: [&str; 2] = [
 #[test]
 fn p9_ocr_page_perf() {
     let mut engine = IndraEngine::init().expect("indra init");
+    let pages = pages_dir();
+    let dir = Path::new(&pages);
     let mut ms: Vec<u128> = Vec::new();
     for doc in DOCS {
-        let dir = Path::new(&pages_dir());
         let files: Vec<String> = std::fs::read_dir(dir)
             .expect("pages dir")
             .filter_map(|e| e.ok())
@@ -54,6 +55,7 @@ fn p9_ocr_page_perf() {
             let _ = page.char_count();
         }
     }
+    assert_eq!(ms.len(), 520, "expected 520 pages, got {}", ms.len());
     ms.sort_unstable();
     let n = ms.len();
     let med = ms[n / 2] as f64 / 1000.0;
@@ -61,8 +63,9 @@ fn p9_ocr_page_perf() {
     let mx = ms[n - 1] as f64 / 1000.0;
     let total_s: u128 = ms.iter().sum::<u128>() / 1000;
     println!(
-        "P9 perf: n={} ocr_page median={med:.3}s p90={p90:.3}s max={mx:.3}s \
+        "P9 perf: pages_dir={} n={} ocr_page median={med:.3}s p90={p90:.3}s max={mx:.3}s \
          total={}s ({:.3}s/page)",
+        dir.display(),
         n,
         total_s,
         total_s as f64 / n as f64
