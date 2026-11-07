@@ -33,6 +33,7 @@ pub mod l2;
 pub mod markdown;
 pub mod render;
 pub mod route;
+pub mod blocks;
 
 use config::Config;
 use l1::{build_engine, L1Engine, PpOcrEngine};
@@ -54,6 +55,10 @@ pub struct PageRecord {
     /// A quality note (e.g. the "needs a higher-tier OCR model" marker), or
     /// None when the page is clean.
     pub note: Option<String>,
+    /// Structured layout blocks (label + normalized bbox + text). A new
+    /// output surface: empty for L2-vlm pages and for engines that emit no
+    /// structure; never affects the markdown bytes or tier routing.
+    pub blocks: Vec<crate::l1::Block>,
 }
 
 /// Result of converting a whole document.
@@ -280,6 +285,7 @@ impl Engine {
                         tier: "L0-native".into(),
                         chars: p.markdown.chars().count(),
                         note: None,
+                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref()),
                     });
                 }
                 continue;
@@ -419,6 +425,7 @@ impl Engine {
                                     tier: format!("L1(g2:{tag};L2-failed)"),
                                     chars: page.char_count(),
                                     note: Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
+                                    blocks: page.blocks.clone(),
                                 },
                                 Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
                             )
@@ -435,6 +442,7 @@ impl Engine {
                                 tier: format!("L1(g2:{tag})"),
                                 chars: page.char_count(),
                                 note: note.clone(),
+                                blocks: page.blocks.clone(),
                             },
                             note,
                         )
@@ -448,6 +456,7 @@ impl Engine {
                             tier: format!("L1-ppv6-{}", self.cfg.l1.tier),
                             chars: page.char_count(),
                             note: None,
+                            blocks: page.blocks.clone(),
                         },
                         None,
                     )
@@ -508,6 +517,7 @@ impl Engine {
                         tier: "L1-indra".to_string(),
                         chars,
                         note: None,
+                        blocks: page.blocks.clone(),
                     },
                     None,
                 )
@@ -521,6 +531,7 @@ impl Engine {
                         tier: "L1-ppv6(g3-fallback)".to_string(),
                         chars: page.char_count(),
                         note: None,
+                        blocks: page.blocks.clone(),
                     },
                     None,
                 )
@@ -544,6 +555,7 @@ impl Engine {
                             tier: format!("L1(g3+g2:{tag})"),
                             chars: keep.char_count(),
                             note: note.clone(),
+                            blocks: keep.blocks.clone(),
                         },
                         note,
                     )
@@ -572,6 +584,7 @@ impl Engine {
                     tier: ok_tier.to_string(),
                     chars: 0,
                     note: note.clone(),
+                    blocks: Vec::new(),
                 },
                 note,
             );
@@ -586,6 +599,7 @@ impl Engine {
                     tier: ok_tier.to_string(),
                     chars: res.markdown.chars().count(),
                     note: None,
+                    blocks: Vec::new(),
                 },
                 None,
             )
@@ -602,10 +616,63 @@ impl Engine {
                     tier: format!("{ok_tier}(failed)"),
                     chars: 0,
                     note: note.clone(),
+                    blocks: Vec::new(),
                 },
                 note,
             )
         }
+    }
+
+    /// Structured blocks for an L0-native page, from the PDF's embedded text
+    /// layer (pdf_oxide spans). E1: every block is label `text`. The spans are
+    /// clustered into reading-order line blocks and normalized to the rendered
+    /// page's `[0,1]` y-down space. Coordinate notes (verified against
+    /// pdf_oxide 0.3.78 `postprocess_spans`, document.rs:13039): for `/Rotate
+    /// 0` spans are in raw user space (y-up, render-box origin); for
+    /// `/Rotate 180` pdf_oxide already mirrors them into the displayed frame
+    /// (still y-up) — both normalize identically. For `/Rotate 90/270` pdf_oxide
+    /// maps only rotated-content spans (horizontal content stays raw), a mixed
+    /// space we do not trust, so those pages emit no blocks. A failure at any
+    /// step yields an empty vec — blocks never affect the markdown or routing.
+    fn l0_blocks(
+        &self,
+        bytes: &[u8],
+        page0: u32,
+        doc: Option<&pdf_oxide::document::PdfDocument>,
+    ) -> Vec<crate::l1::Block> {
+        let parsed = if doc.is_none() {
+            pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec()).ok()
+        } else {
+            None
+        };
+        let d = match doc.or(parsed.as_ref()) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let ((bx0, by0, bw, bh), rotation) = match render::page_geometry(d, page0 as usize) {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        if !(rotation == 0 || rotation == 180) {
+            return Vec::new();
+        }
+        let spans = match d.extract_spans(page0 as usize) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let spans: Vec<(f64, f64, f64, f64, String)> = spans
+            .iter()
+            .map(|s| {
+                (
+                    s.bbox.x as f64,
+                    s.bbox.y as f64,
+                    (s.bbox.x + s.bbox.width) as f64,
+                    (s.bbox.y + s.bbox.height) as f64,
+                    s.text.clone(),
+                )
+            })
+            .collect();
+        blocks::spans_to_text_blocks(&spans, bx0 as f64, by0 as f64, bw as f64, bh as f64, 0)
     }
 }
 

@@ -213,8 +213,10 @@ pub struct IndraEngine {
     pub script: Session,
 }
 
-/// `assemble` output: (texts, confs, tidy'd boxes, reading order, markdown).
-type Assembled = (Vec<String>, Vec<f64>, Vec<[f64; 4]>, Vec<usize>, String);
+/// `assemble` output: (texts, confs, tidy'd boxes, reading order, markdown,
+/// the same-block matrix used to group lines into blocks — `[]` when the
+/// order model ran no grid head).
+type Assembled = (Vec<String>, Vec<f64>, Vec<[f64; 4]>, Vec<usize>, String, Vec<f32>);
 
 impl IndraEngine {
     /// Load every model from the embedded assets.
@@ -298,7 +300,7 @@ impl IndraEngine {
         let vertical = k == preproc::VERTICAL;
         let lines = rec::recognize(self, &gray, &boxes, vertical);
 
-        let (texts, confs, boxes, order, md) =
+        let (texts, confs, boxes, order, md, same) =
             self.assemble(&gray, &boxes, &lines, vertical, pictures)?;
 
         // Lines in reading order, boxes rounded to 0.1 (product Line), then
@@ -343,9 +345,52 @@ impl IndraEngine {
                 }
             })
             .collect();
+        // Structured blocks (E1): one per same-block group, in reading
+        // order, in the same page space as the lines (deskew/turn already
+        // undone). Every label is `text` for now; E2 maps each group's
+        // argmax Chandra class to a structural label.
+        let pos_of: Vec<usize> = {
+            let mut v = vec![0usize; order.len()];
+            for (p, &i) in order.iter().enumerate() {
+                v[i] = p;
+            }
+            v
+        };
+        let groups: Vec<Vec<usize>> = if same.is_empty() {
+            order.iter().map(|&i| vec![i]).collect()
+        } else {
+            markdown::split_blocks(&order, &same)
+        };
+        let pw = gray.w as f64;
+        let ph = gray.h as f64;
+        let blocks: Vec<super::Block> = groups
+            .iter()
+            .map(|g| {
+                let (mut x0, mut y0, mut x1, mut y1) =
+                    (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for &i in g {
+                    let b = line_boxes[pos_of[i]];
+                    x0 = x0.min(b[0]);
+                    y0 = y0.min(b[1]);
+                    x1 = x1.max(b[2]);
+                    y1 = y1.max(b[3]);
+                }
+                let text = g
+                    .iter()
+                    .map(|&i| texts[i].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                super::Block {
+                    label: crate::blocks::TEXT,
+                    bbox: crate::blocks::normalize_bbox(x0, y0, x1, y1, pw, ph),
+                    text,
+                }
+            })
+            .collect();
         Ok(super::OcrPage {
             lines: olines,
             md: Some(md),
+            blocks,
         })
     }
 
@@ -490,10 +535,10 @@ impl IndraEngine {
                 pics.as_deref(),
                 Some(&keep),
             );
-            Ok((texts, confs, boxes, order, md))
+            Ok((texts, confs, boxes, order, md, same))
         } else {
             let md = texts.join("\n");
-            Ok((texts, confs, boxes, order, md))
+            Ok((texts, confs, boxes, order, md, same))
         }
     }
 

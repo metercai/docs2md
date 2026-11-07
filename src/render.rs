@@ -36,6 +36,19 @@ pub fn render_pdf_page(doc: &PdfDocument, page: usize, dpi: u32) -> Result<Rende
     Ok((img.data, pbox, info.rotation))
 }
 
+/// The page's geometry without rasterizing: the content box (CropBox ∩
+/// MediaBox, the box `render_pdf_page` renders) and the page's `/Rotate`.
+/// Used to map native text-layer spans into the rendered page's
+/// normalized coordinate space (blocks) without a PNG render.
+pub fn page_geometry(
+    doc: &PdfDocument,
+    page: usize,
+) -> Result<((f32, f32, f32, f32), i32), String> {
+    let info = doc.get_page_info(page).map_err(|e| e.to_string())?;
+    let pbox = render_box(&info.media_box, info.crop_box.as_ref());
+    Ok((pbox, info.rotation))
+}
+
 /// The visible page box: CropBox ∩ MediaBox.
 fn render_box(
     media: &pdf_oxide::geometry::Rect,

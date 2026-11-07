@@ -384,6 +384,7 @@ mod tests {
                 height: 0.0,
             }],
             md: Some("x".repeat(mdlen)),
+            blocks: Vec::new(),
         }
     }
     /// A PP-OCRv6-style page: `nchars` of line text, one line at `conf`.
@@ -398,6 +399,7 @@ mod tests {
                 height: 0.0,
             }],
             md: None,
+            blocks: Vec::new(),
         }
     }
 

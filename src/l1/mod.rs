@@ -26,6 +26,17 @@ pub struct OcrLine {
     pub height: f32,
 }
 
+/// One structured layout block: a labelled region with its text. `label` is
+/// one of `crate::blocks::LABELS`; `bbox` is `[x0, y0, x1, y1]` normalized to
+/// `[0, 1]` relative to the page (y-down, top-left origin) — the exact
+/// coordinate space the layout judge consumes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub label: &'static str,
+    pub bbox: [f64; 4],
+    pub text: String,
+}
+
 /// A page's OCR result (reading order is the engine's; the orchestrator
 /// re-sorts by line top for stable output).
 #[derive(Debug, Clone)]
@@ -35,6 +46,10 @@ pub struct OcrPage {
     /// markdown, table post-filter already applied; PP-OCRv6: `None` — the
     /// orchestrator builds markdown from the lines).
     pub md: Option<String>,
+    /// Structured blocks in reading order (`[]` for engines that produce no
+    /// layout structure — PP-OCRv6 today). A new output surface: it does not
+    /// affect markdown bytes or routing.
+    pub blocks: Vec<Block>,
 }
 
 impl OcrPage {
@@ -96,6 +111,7 @@ impl L1Engine for PpOcrEngine {
         Ok(OcrPage {
             lines,
             md: None,
+            blocks: Vec::new(), // PP-OCRv6 emits no layout structure
         })
     }
 }
