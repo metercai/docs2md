@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,7 +59,9 @@ jobs:
 
       - name: version from tag
         shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "VERSION=${REF#v}" >> "$GITHUB_ENV"
 
       - name: package
         shell: bash
@@ -109,7 +111,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
           gh release view "$tag" --repo "$REPO" >/dev/null 2>&1 || \
             gh release create "$tag" --repo "$REPO" --title "docs2md ${tag#v}" \
               --notes "Self-contained PDF → Markdown binary (embedded OCR). Two tiers: L0 native text, L1 PP-OCRv6; optional L2 external VLM. See README for usage."
@@ -118,4 +120,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/* --repo "$REPO" --clobber
+        run: gh release upload "${{ github.event.inputs.tag || github.ref_name }}" dist/* --repo "$REPO" --clobber
