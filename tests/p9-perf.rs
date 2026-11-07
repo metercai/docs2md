@@ -24,9 +24,15 @@ const DOCS: [&str; 2] = [
 
 #[test]
 fn p9_ocr_page_perf() {
-    let mut engine = IndraEngine::init().expect("indra init");
+    // Local-only probe: the rendered page corpus is not shipped in the repo.
+    // Skip cleanly on a runner without it (CI green); set P9_PAGES to run.
     let pages = pages_dir();
     let dir = Path::new(&pages);
+    if !dir.is_dir() {
+        eprintln!("[p9] SKIP: pages dir not present at {} (local-only probe; set P9_PAGES)", dir.display());
+        return;
+    }
+    let mut engine = IndraEngine::init().expect("indra init");
     let mut ms: Vec<u128> = Vec::new();
     for doc in DOCS {
         let files: Vec<String> = std::fs::read_dir(dir)
