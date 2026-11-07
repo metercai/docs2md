@@ -134,6 +134,73 @@ pub fn structural_from_layout(
     false
 }
 
+/// Run G1's layout detection once on a rendered PNG and return the regions
+/// (the caller applies the routing rules or the structural S0 reroute check
+/// to the SAME regions — zero extra inference). `None` when no layout
+/// detector is available or detection fails.
+pub fn g1_regions(layout: Option<&mut LayoutDetector>, png: &[u8]) -> Option<Vec<LayoutRegion>> {
+    let ld = layout?;
+    let dyn_img = image::load_from_memory(png).ok()?;
+    let mat = rusto::image_impl::Mat::new(dyn_img);
+    let out: LayoutOutput = ld.detect(&mat).ok()?;
+    Some(out.regions)
+}
+
+/// Reduce G1's layout regions to the structural L0 block relabel targets
+/// (plan E2, L0): only `Title` (→ `heading`) and `Table` (→ `table`)
+/// regions that are LOCAL structural signals, with each bbox normalized to
+/// the rendered page's `[0,1]` y-down space — the same space the L0 block
+/// bboxes live in. `page_w`/`page_h` are the rendered PNG's pixel size (the
+/// PNG renders exactly the page's render box, so this matches the block
+/// normalization denominator). Every other layout type is dropped: a block in
+/// it stays `text`.
+///
+/// Locality guard (plan E2 failure branch): a region only relabels blocks
+/// when it is both confident AND compact — `conf > compact_conf` and
+/// `area_frac < compact_frac`, the SAME thresholds [`structural_from_layout`]
+/// uses to call a region a local structural block. This is what keeps a
+/// page-spanning `Table` blob (e.g. a filled form, where PP-DocLayout emits
+/// one full-page table region with area_frac ~0.94) from relabelling every
+/// body line as `table`: that blob is a page-level routing signal, not a
+/// local block label. With no layout model, or when no region passes the
+/// guard, the caller gets an empty vec and every L0 block stays `text`.
+pub fn g1_relabel_regions(
+    regions: &[LayoutRegion],
+    page_w: f64,
+    page_h: f64,
+    rc: &RouteConfig,
+) -> Vec<(f64, f64, f64, f64, &'static str)> {
+    if page_w <= 0.0 || page_h <= 0.0 {
+        return Vec::new();
+    }
+    let page_area = page_w * page_h;
+    let mut out = Vec::new();
+    for r in regions {
+        let label = match r.layout_type {
+            LayoutType::Title => Some(crate::blocks::HEADING),
+            LayoutType::Table => Some(crate::blocks::TABLE),
+            _ => None,
+        };
+        let Some(label) = label else { continue };
+        let area_frac = ((r.bbox.x_max - r.bbox.x_min) as f64
+            * (r.bbox.y_max - r.bbox.y_min) as f64)
+            / page_area;
+        // Local structural signal only: confident AND compact (single source
+        // of truth = the G1 routing thresholds).
+        if !(r.confidence > rc.compact_conf && area_frac < rc.compact_frac as f64) {
+            continue;
+        }
+        out.push((
+            (r.bbox.x_min as f64) / page_w,
+            (r.bbox.y_min as f64) / page_h,
+            (r.bbox.x_max as f64) / page_w,
+            (r.bbox.y_max as f64) / page_h,
+            label,
+        ));
+    }
+    out
+}
+
 /// Run the structural check (see [`structural_from_layout`]) on a rendered
 /// PNG. `None` when no layout detector is available or detection fails.
 pub fn g1_structural(

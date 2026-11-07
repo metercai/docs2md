@@ -38,7 +38,10 @@ pub mod blocks;
 use config::Config;
 use l1::{build_engine, L1Engine, PpOcrEngine};
 use l2::{L2Client, PageImage};
-use route::{decide_l1_flow, g1, g1_structural, g3, output_chars, G3Verdict, L1Outcome, Tier};
+use route::{
+    decide_l1_flow, g1, g1_regions, g1_relabel_regions, g3, output_chars, structural_from_layout,
+    G3Verdict, L1Outcome, Tier,
+};
 use rusto::{LayoutConfig, LayoutDetector};
 use std::path::PathBuf;
 
@@ -235,6 +238,8 @@ impl Engine {
                 // no layout model the page keeps the native L0 output,
                 // byte-identical to before.
                 let mut reroute_png: Option<Vec<u8>> = None;
+                let mut l0_relabel_regions: Option<Vec<(f64, f64, f64, f64, &'static str)>> =
+                    None;
                 if self.cfg.l1.use_indra
                     && self
                         .cfg
@@ -257,12 +262,21 @@ impl Engine {
                     let _ = (pbox, rot);
                     let page_area = pw as f64 * ph as f64;
                     let route = self.cfg.route.clone();
-                    let hit = self
-                        .ensure_layout()
-                        .and_then(|ld| g1_structural(Some(ld), &png, page_area, &route))
+                    // G1 layout runs ONCE here: the same regions serve both the
+                    // structural S0-reroute decision and the L0 block relabel
+                    // (E2). No layout model / detection failure → no regions,
+                    // the page behaves exactly as before the blocks work.
+                    let regions = self.ensure_layout().and_then(|ld| g1_regions(Some(ld), &png));
+                    let hit = regions
+                        .as_deref()
+                        .map(|rs| structural_from_layout(rs, page_area, &route))
                         .unwrap_or(false);
                     if hit {
                         reroute_png = Some(png);
+                        l0_relabel_regions = None; // page goes to L1; no L0 blocks
+                    } else if let Some(rs) = &regions {
+                        l0_relabel_regions =
+                            Some(g1_relabel_regions(rs, pw as f64, ph as f64, &route));
                     }
                 }
                 if let Some(png) = reroute_png {
@@ -285,7 +299,7 @@ impl Engine {
                         tier: "L0-native".into(),
                         chars: p.markdown.chars().count(),
                         note: None,
-                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref()),
+                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), l0_relabel_regions.as_deref()),
                     });
                 }
                 continue;
@@ -634,11 +648,18 @@ impl Engine {
     /// maps only rotated-content spans (horizontal content stays raw), a mixed
     /// space we do not trust, so those pages emit no blocks. A failure at any
     /// step yields an empty vec — blocks never affect the markdown or routing.
+    ///
+    /// `relabel` (E2): normalized G1 layout regions already mapped to the
+    /// rendered page's `[0,1]` y-down space (`heading`/`table` only). Each
+    /// region relabels the L0 blocks whose centres it contains — the same
+    /// regions the S0 structural reroute was decided on, so a page only gets
+    /// structural labels when it was NOT rerouted to L1.
     fn l0_blocks(
         &self,
         bytes: &[u8],
         page0: u32,
         doc: Option<&pdf_oxide::document::PdfDocument>,
+        relabel: Option<&[(f64, f64, f64, f64, &'static str)]>,
     ) -> Vec<crate::l1::Block> {
         let parsed = if doc.is_none() {
             pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec()).ok()
@@ -672,7 +693,12 @@ impl Engine {
                 )
             })
             .collect();
-        blocks::spans_to_text_blocks(&spans, bx0 as f64, by0 as f64, bw as f64, bh as f64, 0)
+        let blocks =
+            blocks::spans_to_text_blocks(&spans, bx0 as f64, by0 as f64, bw as f64, bh as f64, 0);
+        match relabel {
+            Some(regions) => blocks::relabel_l0_blocks(blocks, regions),
+            None => blocks,
+        }
     }
 }
 

@@ -242,6 +242,47 @@ impl Block {
     }
 }
 
+/// E2 (L0): re-label L0 line blocks from the G1 layout regions. `regions`
+/// are `(x0, y0, x1, y1, label)` in the same normalized `[0,1]` y-down space
+/// as the block bboxes. A block takes the label of the region its CENTER
+/// point falls in (a body line hugging a region edge keeps `text`); when the
+/// center lands in several regions the smallest (most specific) wins; with no
+/// regions a block keeps its current label (E1: all `text`).
+pub fn relabel_l0_blocks(
+    blocks: Vec<Block>,
+    regions: &[(f64, f64, f64, f64, &'static str)],
+) -> Vec<Block> {
+    if regions.is_empty() {
+        return blocks;
+    }
+    blocks
+        .into_iter()
+        .map(|b| {
+            let cx = (b.bbox[0] + b.bbox[2]) / 2.0;
+            let cy = (b.bbox[1] + b.bbox[3]) / 2.0;
+            let mut best: Option<(f64, &str)> = None;
+            for &(rx0, ry0, rx1, ry1, label) in regions {
+                if cx >= rx0 && cx <= rx1 && cy >= ry0 && cy <= ry1 {
+                    let area = (rx1 - rx0) * (ry1 - ry0);
+                    match best {
+                        None => best = Some((area, label)),
+                        Some((a, _)) if area < a => best = Some((area, label)),
+                        _ => {}
+                    }
+                }
+            }
+            match best {
+                Some((_, label)) => Block {
+                    label,
+                    bbox: b.bbox,
+                    text: b.text,
+                },
+                None => b,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +404,42 @@ mod tests {
         assert!(spans_to_text_blocks(&[], 0.0, 0.0, 100.0, 200.0, 0).is_empty());
         // Degenerate page box → no blocks.
         assert!(spans_to_text_blocks(&spans, 0.0, 0.0, 0.0, 0.0, 0).is_empty());
+    }
+
+    #[test]
+    fn relabel_l0_blocks_by_region_center() {
+        // Three line blocks in the [0,1] y-down space: a title row at the
+        // top, two body rows below.
+        let mk = |y: f64, t: &str| Block {
+            label: TEXT,
+            bbox: [0.1, y, 0.9, y + 0.02],
+            text: t.to_string(),
+        };
+        let blocks = vec![mk(0.05, "title"), mk(0.30, "body1"), mk(0.60, "body2")];
+        // A title region covering the top row and a table region covering the
+        // second row (a wider, coarser table region too, to test
+        // smallest-wins).
+        let regions = [
+            (0.0, 0.0, 1.0, 0.15, HEADING),
+            (0.05, 0.2, 0.95, 0.5, TABLE),
+            (0.0, 0.25, 1.0, 0.9, TEXT), // large coarse region, same center hit
+        ];
+        let out = relabel_l0_blocks(blocks, &regions);
+        assert_eq!(out[0].label, HEADING, "title row inside the heading region");
+        // Center of body1 (0.5, 0.31) falls in BOTH the TABLE region and the
+        // coarse TEXT region → the smaller (table) wins.
+        assert_eq!(out[1].label, TABLE);
+        // body2 (center 0.71) is inside only the coarse TEXT region → stays
+        // text.
+        assert_eq!(out[2].label, TEXT);
+        // Empty regions → every block keeps its label.
+        let same = relabel_l0_blocks(
+            vec![mk(0.5, "x")],
+            &[],
+        );
+        assert_eq!(same[0].label, TEXT);
+        // Text/bbox are untouched by the relabel.
+        assert_eq!(out[0].bbox, [0.1, 0.05, 0.9, 0.07]);
+        assert_eq!(out[0].text, "title");
     }
 }

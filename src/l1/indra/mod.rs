@@ -215,8 +215,17 @@ pub struct IndraEngine {
 
 /// `assemble` output: (texts, confs, tidy'd boxes, reading order, markdown,
 /// the same-block matrix used to group lines into blocks — `[]` when the
-/// order model ran no grid head).
-type Assembled = (Vec<String>, Vec<f64>, Vec<[f64; 4]>, Vec<usize>, String, Vec<f32>);
+/// order model ran no grid head — the per-line Chandra block-class logits
+/// `cls` of shape `[n_lines, 10]`, `[]` when the order model emitted none).
+type Assembled = (
+    Vec<String>,
+    Vec<f64>,
+    Vec<[f64; 4]>,
+    Vec<usize>,
+    String,
+    Vec<f32>,
+    Vec<f32>,
+);
 
 impl IndraEngine {
     /// Load every model from the embedded assets.
@@ -300,7 +309,7 @@ impl IndraEngine {
         let vertical = k == preproc::VERTICAL;
         let lines = rec::recognize(self, &gray, &boxes, vertical);
 
-        let (texts, confs, boxes, order, md, same) =
+        let (texts, confs, boxes, order, md, same, cls) =
             self.assemble(&gray, &boxes, &lines, vertical, pictures)?;
 
         // Lines in reading order, boxes rounded to 0.1 (product Line), then
@@ -345,10 +354,11 @@ impl IndraEngine {
                 }
             })
             .collect();
-        // Structured blocks (E1): one per same-block group, in reading
-        // order, in the same page space as the lines (deskew/turn already
-        // undone). Every label is `text` for now; E2 maps each group's
-        // argmax Chandra class to a structural label.
+        // Structured blocks (E2): one per same-block group, in reading order,
+        // in the same page space as the lines (deskew/turn already undone).
+        // The label is the group's argmax Chandra class (cls summed over the
+        // group's lines, as `page_blocks` does) mapped through CHANDRA_TO_OPB;
+        // `text` when the order model emitted no class head.
         let pos_of: Vec<usize> = {
             let mut v = vec![0usize; order.len()];
             for (p, &i) in order.iter().enumerate() {
@@ -361,6 +371,7 @@ impl IndraEngine {
         } else {
             markdown::split_blocks(&order, &same)
         };
+        let has_cls = !cls.is_empty();
         let pw = gray.w as f64;
         let ph = gray.h as f64;
         let blocks: Vec<super::Block> = groups
@@ -380,8 +391,13 @@ impl IndraEngine {
                     .map(|&i| texts[i].as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
+                let label = if has_cls {
+                    crate::blocks::chandra_to_opb(markdown::block_class(g, &cls))
+                } else {
+                    crate::blocks::TEXT
+                };
                 super::Block {
-                    label: crate::blocks::TEXT,
+                    label,
                     bbox: crate::blocks::normalize_bbox(x0, y0, x1, y1, pw, ph),
                     text,
                 }
@@ -535,10 +551,10 @@ impl IndraEngine {
                 pics.as_deref(),
                 Some(&keep),
             );
-            Ok((texts, confs, boxes, order, md, same))
+            Ok((texts, confs, boxes, order, md, same, cls))
         } else {
             let md = texts.join("\n");
-            Ok((texts, confs, boxes, order, md, same))
+            Ok((texts, confs, boxes, order, md, same, cls))
         }
     }
 
