@@ -8,6 +8,7 @@
 //!   -o, --out <path>      output markdown (default: <input>.md)
 //!       --pages 1,5,9     process only these 1-based pages
 //!       --no-markers      omit the per-page <!-- page:N --> markers
+//!       --blocks <path>   also write structured layout blocks as JSON
 //!   -V, --version         print version
 //! ```
 
@@ -20,6 +21,7 @@ struct Args {
     out: Option<String>,
     pages: Option<Vec<u32>>,
     no_markers: bool,
+    blocks: Option<PathBuf>,
     input: PathBuf,
 }
 
@@ -30,6 +32,7 @@ fn parse_args() -> Result<Args, String> {
         out: None,
         pages: None,
         no_markers: false,
+        blocks: None,
         input: PathBuf::new(),
     };
     let mut i = 0;
@@ -55,6 +58,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-markers" => {
                 a.no_markers = true;
+            }
+            "--blocks" => {
+                let v = val(&raw, &mut i, "--blocks")?;
+                a.blocks = Some(PathBuf::from(v));
             }
             other => {
                 if a.input.as_os_str().is_empty() {
@@ -97,6 +104,7 @@ fn print_help() {
     println!("  -o, --out <path>      output markdown (default: <input>.md)");
     println!("      --pages 1,5,9     process only these 1-based pages");
     println!("      --no-markers      omit per-page <!-- page:N --> markers");
+    println!("      --blocks <path>   also write structured layout blocks as JSON");
     println!("  -V, --version         print version");
     println!("  -h, --help            print this help");
 }
@@ -166,6 +174,47 @@ fn main() {
     if let Err(e) = std::fs::write(&out_path, &result.markdown) {
         eprintln!("error: cannot write {out_path}: {e}");
         std::process::exit(1);
+    }
+
+    // --blocks <path>: structured layout blocks (the E1/E2 output surface),
+    // one JSON object per page. Shape: {"page": N, "tier": "...", "blocks":
+    // [{"label": "text|heading|table|...", "bbox": [x0,y0,x1,y1], "text":
+    // "..."}]} — bbox normalized to [0,1] y-down, the same coordinate space
+    // the layout judge consumes. L2-vlm pages carry an empty block list.
+    if let Some(blocks_path) = &args.blocks {
+        let pages_json: Vec<serde_json::Value> = result
+            .pages
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "page": p.page,
+                    "tier": p.tier,
+                    "blocks": p.blocks.iter().map(|b| {
+                        serde_json::json!({
+                            "label": b.label,
+                            "bbox": b.bbox,
+                            "text": b.text,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "input": args.input.display().to_string(),
+            "pages": pages_json,
+        });
+        if let Some(parent) = blocks_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        match std::fs::write(blocks_path, serde_json::to_string_pretty(&doc).unwrap()) {
+            Ok(()) => eprintln!("[blocks] {} ({} pages)", blocks_path.display(), result.pages.len()),
+            Err(e) => {
+                eprintln!("error: cannot write {}: {e}", blocks_path.display());
+                std::process::exit(1);
+            }
+        }
     }
 
     eprintln!(

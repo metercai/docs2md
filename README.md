@@ -85,11 +85,42 @@ cp config.example.toml docs2md.toml
 target/release/docs2md input.pdf out.md
 #    --pages 1,5,9   process only those pages
 #    --no-markers    omit <!-- page:N --> markers
+#    --blocks out.json  also write structured layout blocks as JSON
 ```
 
 With no config file at all: L0 pages convert natively, OCR pages run the
 embedded L1, and (since L2 is unconfigured) any page that needs a higher tier
 is marked as such.
+
+## Structured blocks (JSON)
+
+`docs2md input.pdf out.md --blocks out.json` writes the per-page structured
+layout blocks alongside the markdown — a new output surface that never
+changes the markdown bytes or tier routing:
+
+```json
+{
+  "input": "input.pdf",
+  "pages": [
+    {
+      "page": 1,
+      "tier": "L1-indra",
+      "blocks": [
+        { "label": "heading", "bbox": [0.1, 0.05, 0.9, 0.1], "text": "Title" },
+        { "label": "table",   "bbox": [0.05, 0.2, 0.95, 0.6], "text": "…" }
+      ]
+    }
+  ]
+}
+```
+
+Each block carries a `label` from an 11-label vocabulary
+(`text`, `heading`, `table`, `form`, `list`, …), a `bbox` normalized to
+`[0,1]` y-down (the same coordinate space a layout evaluator consumes), and
+the block `text`. L0 pages get text-layer line blocks (relabelled
+heading/table where the G1 layout model marks them); L1 (Indra) pages get
+reading-ordered blocks from the order model's class head; L2 pages carry an
+empty list.
 
 ## Configuration
 
