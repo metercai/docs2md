@@ -156,6 +156,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // D: an explicit --blocks also requests the optional L0 layout relabel
+    // (a no-op unless [l1].layout_model points at a model that loads).
+    if args.blocks.is_some() {
+        engine.set_blocks_requested(true);
+    }
 
     let result = match engine.convert(&bytes, args.pages.as_deref()) {
         Ok(r) => r,

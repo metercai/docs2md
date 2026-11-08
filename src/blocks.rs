@@ -283,6 +283,56 @@ pub fn relabel_l0_blocks(
         .collect()
 }
 
+/// D (optional `--blocks` relabel): map the layout detector's regions to
+/// the `relabel` input of [`relabel_l0_blocks`]. Only `Title` → `heading`
+/// and `Table` → `table` are structural block labels; every other class
+/// (text, figure, caption, …) stays `text`. A region is kept only when
+/// confident (conf > `RELABEL_MIN_CONF`) and compact (< `RELABEL_MAX_AREA_FRAC`
+/// of the page) — the guard that stops a page-wide table/figure blob from
+/// relabeling every line. Whole-page table pages never reach this point in
+/// the first place (the free `has_table` signal reroutes them to L1, whose
+/// order model emits the table structure). Bboxes come out in the rendered
+/// page's `[0,1]` y-down space, clamped.
+pub const RELABEL_MIN_CONF: f32 = 0.4;
+pub const RELABEL_MAX_AREA_FRAC: f64 = 0.5;
+
+pub fn layout_regions_to_relabel(
+    regions: &[rusto::layout::LayoutRegion],
+    page_w: f64,
+    page_h: f64,
+) -> Vec<(f64, f64, f64, f64, &'static str)> {
+    if page_w <= 0.0 || page_h <= 0.0 {
+        return Vec::new();
+    }
+    let page_area = page_w * page_h;
+    let mut out = Vec::new();
+    for r in regions {
+        let label = match r.layout_type {
+            rusto::layout::LayoutType::Title => Some(HEADING),
+            rusto::layout::LayoutType::Table => Some(TABLE),
+            _ => None,
+        };
+        let Some(label) = label else { continue };
+        if !(r.confidence > RELABEL_MIN_CONF) {
+            continue;
+        }
+        let area_frac = ((r.bbox.x_max - r.bbox.x_min) as f64
+            * (r.bbox.y_max - r.bbox.y_min) as f64)
+            / page_area;
+        if area_frac >= RELABEL_MAX_AREA_FRAC {
+            continue;
+        }
+        out.push((
+            ((r.bbox.x_min as f64) / page_w).clamp(0.0, 1.0),
+            ((r.bbox.y_min as f64) / page_h).clamp(0.0, 1.0),
+            ((r.bbox.x_max as f64) / page_w).clamp(0.0, 1.0),
+            ((r.bbox.y_max as f64) / page_h).clamp(0.0, 1.0),
+            label,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +491,41 @@ mod tests {
         // Text/bbox are untouched by the relabel.
         assert_eq!(out[0].bbox, [0.1, 0.05, 0.9, 0.07]);
         assert_eq!(out[0].text, "title");
+    }
+
+    #[test]
+    fn layout_regions_map_title_and_table_only() {
+        use rusto::layout::{BBox, LayoutRegion, LayoutType};
+        fn reg(t: LayoutType, conf: f32, x0: i32, y0: i32, x1: i32, y1: i32) -> LayoutRegion {
+            LayoutRegion {
+                bbox: BBox {
+                    x_min: x0,
+                    y_min: y0,
+                    x_max: x1,
+                    y_max: y1,
+                },
+                layout_type: t,
+                confidence: conf,
+            }
+        }
+        // 100x100 page: a title bar, a compact table, a text band, a figure,
+        // a low-confidence table, and a page-wide table blob.
+        let regions = vec![
+            reg(LayoutType::Title, 0.9, 10, 5, 90, 20),
+            reg(LayoutType::Table, 0.8, 5, 30, 95, 50),
+            reg(LayoutType::Text, 0.9, 0, 60, 100, 80),
+            reg(LayoutType::Figure, 0.9, 0, 80, 100, 99),
+            reg(LayoutType::Table, 0.3, 0, 0, 90, 90),
+            reg(LayoutType::Table, 0.9, 0, 0, 99, 99),
+        ];
+        let out = layout_regions_to_relabel(&regions, 100.0, 100.0);
+        assert_eq!(out.len(), 2, "only the confident compact title+table: {out:?}");
+        assert_eq!(out[0], (0.1, 0.05, 0.9, 0.2, HEADING));
+        assert_eq!(out[1], (0.05, 0.3, 0.95, 0.5, TABLE));
+        // Boundary: conf exactly RELABEL_MIN_CONF does not pass (`>`).
+        let edge = vec![reg(LayoutType::Title, RELABEL_MIN_CONF, 0, 0, 50, 50)];
+        assert!(layout_regions_to_relabel(&edge, 100.0, 100.0).is_empty());
+        // Degenerate page → empty.
+        assert!(layout_regions_to_relabel(&regions, 0.0, 100.0).is_empty());
     }
 }

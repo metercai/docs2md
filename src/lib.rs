@@ -37,6 +37,8 @@ use config::Config;
 use l1::{build_engine, L1Engine, OcrPage, PpOcrEngine};
 use l2::{L2Client, PageImage};
 use route::{l3_gate, output_gate};
+use rusto::layout::LayoutDetector;
+use rusto::types::LayoutConfig;
 use std::path::PathBuf;
 
 /// What produced a page's final markdown, plus any quality note.
@@ -68,8 +70,9 @@ pub struct DocResult {
 }
 
 /// The orchestrator. Holds the (lazy) L1 engine, the L2 PP-OCRv6 engine,
-/// and the L2 VLM client. Construct once per run; call `convert` on each
-/// document.
+/// the L3 VLM client, and the (lazy) layout detector for the optional
+/// `--blocks` L0 relabel (decision D). Construct once per run; call
+/// `convert` on each document.
 pub struct Engine {
     cfg: Config,
     /// The VLM client (plan §2.2's L3 end of the cascade). Reached when
@@ -84,6 +87,17 @@ pub struct Engine {
     l2_pp_failed: bool,
     /// Why L1 is unavailable (for notes), empty when available/unused.
     l1_unavailable: String,
+    /// The layout detector (decision D: the optional `--blocks` L0 relabel
+    /// only — never a routing signal). Lazily loaded on the first L0 page
+    /// when `blocks_requested` is set; `None` when the flag is off, the
+    /// model is missing, or it failed to load (the relabel is then
+    /// silently skipped, the same way it behaved when no model existed).
+    layout: Option<LayoutDetector>,
+    layout_failed: bool,
+    /// Set by the CLI when `--blocks` is passed explicitly. Off by
+    /// default: the default path never loads or runs the layout model
+    /// (plan §3 cost invariant).
+    blocks_requested: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,7 +129,97 @@ impl Engine {
             l2_pp: None,
             l2_pp_failed: false,
             l1_unavailable: String::new(),
+            layout: None,
+            layout_failed: false,
+            blocks_requested: false,
         })
+    }
+
+    /// Mark the optional L0 layout relabel as requested (the CLI sets this
+    /// when `--blocks` is passed). Default off: without it the layout model
+    /// is never loaded or run, even when configured.
+    pub fn set_blocks_requested(&mut self, on: bool) {
+        self.blocks_requested = on;
+    }
+
+    /// Ensure the layout detector is loaded (decision D: the `--blocks`
+    /// relabel only). Loaded at most once, on first request; `None` when
+    /// no model is configured, it is missing, or it failed to load — in
+    /// every case the caller silently skips the relabel (the blocks stay
+    /// at their E1 labels), the same way it behaved before the model
+    /// existed. Never reached on the default path (`blocks_requested` off).
+    fn ensure_layout(&mut self) -> Option<&mut LayoutDetector> {
+        if self.layout.is_some() {
+            return self.layout.as_mut();
+        }
+        if self.layout_failed {
+            return None;
+        }
+        match &self.cfg.l1.layout_model {
+            Some(p) if p.exists() => {
+                let mut lc = LayoutConfig::default(p.clone());
+                lc.target_size = self.cfg.l1.layout_target_size as i32;
+                match LayoutDetector::new(lc) {
+                    Ok(ld) => {
+                        eprintln!("[blocks] layout model loaded: {}", p.display());
+                        self.layout = Some(ld);
+                        self.layout.as_mut()
+                    }
+                    Err(e) => {
+                        eprintln!("[blocks] layout model failed to load: {e}; relabel skipped");
+                        self.layout_failed = true;
+                        None
+                    }
+                }
+            }
+            Some(p) => {
+                eprintln!("[blocks] layout model not found: {}; relabel skipped", p.display());
+                self.layout_failed = true;
+                None
+            }
+            None => {
+                eprintln!("[blocks] no layout_model configured; relabel skipped");
+                self.layout_failed = true;
+                None
+            }
+        }
+    }
+
+    /// D (optional `--blocks` relabel): the normalized layout regions that
+    /// [`l0_blocks`] should relabel an L0 page with, or `None` when the
+    /// relabel does not apply (flag off — default; model missing; page
+    /// unrenderable). Renders the page once and runs the layout detector;
+    /// a render or detect failure silently degrades to `None` (the blocks
+    /// keep their E1 labels — a relabel failure is never a page failure).
+    fn l0_relabel_regions(
+        &mut self,
+        bytes: &[u8],
+        page0: u32,
+        doc: Option<&pdf_oxide::document::PdfDocument>,
+    ) -> Option<Vec<(f64, f64, f64, f64, &'static str)>> {
+        if !self.blocks_requested {
+            return None;
+        }
+        // Reuse the caller's open document when it has one; otherwise open a
+        // local one (kept alive for the duration of this call).
+        let mut owned: Option<pdf_oxide::document::PdfDocument> = None;
+        let d: &pdf_oxide::document::PdfDocument = match doc {
+            Some(d) => d,
+            None => {
+                let d = pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec()).ok()?;
+                owned = Some(d);
+                owned.as_ref().unwrap()
+            }
+        };
+        let (png, _, _) = render::render_pdf_page(d, page0 as usize, self.cfg.l0.dpi).ok()?;
+        let (pw, ph) = render::png_size(&png);
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+        let img = image::load_from_memory(&png).ok()?;
+        let mat = rusto::image_impl::Mat::new(img);
+        let out = self.ensure_layout()?.detect(&mat).ok()?;
+        Some(blocks::layout_regions_to_relabel(&out.regions, pw as f64, ph as f64))
     }
 
     /// Ensure the L1 primary engine (Indra when enabled, else PP-OCRv6) is
@@ -229,12 +333,18 @@ impl Engine {
                 } else {
                     out.push_str(&p.markdown);
                     out.push('\n');
+                    // D: optional layout relabel of the L0 blocks — only
+                    // when --blocks was passed explicitly and a layout
+                    // model is configured (default path: None, no render,
+                    // no model load).
+                    let relabel =
+                        self.l0_relabel_regions(bytes, p.page, doc.as_ref());
                     records.push(PageRecord {
                         page: page1,
                         tier: "L0-native".into(),
                         chars: p.markdown.chars().count(),
                         note: None,
-                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), None),
+                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), relabel.as_deref()),
                     });
                 }
                 continue;
