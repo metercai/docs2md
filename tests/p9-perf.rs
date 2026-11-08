@@ -12,6 +12,7 @@ use std::path::Path;
 
 use docs2md::l1::indra::preproc::Gray;
 use docs2md::l1::indra::IndraEngine;
+use docs2md::l1::{L1Engine, PpOcrEngine};
 use image::ImageReader;
 
 fn pages_dir() -> String {
@@ -73,6 +74,54 @@ fn p9_ocr_page_perf() {
         "P9 perf: pages_dir={} n={} ocr_page median={med:.3}s p90={p90:.3}s max={mx:.3}s \
          total={}s ({:.3}s/page)",
         dir.display(),
+        n,
+        total_s,
+        total_s as f64 / n as f64
+    );
+}
+
+/// P9 perf probe 2: the L2 engine (PP-OCRv6-small, embedded) on the same
+/// 520-page corpus — the direct L2 per-page latency (plan QA⑤). Same
+/// PNGs, same thread budget as the Indra probe.
+#[test]
+fn p9_ppocrv6_perf() {
+    let pages = pages_dir();
+    let dir = Path::new(&pages);
+    if !dir.is_dir() {
+        eprintln!("[p9] SKIP (ppocrv6): pages dir not present at {}", dir.display());
+        return;
+    }
+    let rc = docs2md::config::RouteConfig::default();
+    let mut engine = PpOcrEngine::new("small", None).expect("ppocrv6 init");
+    let mut ms: Vec<u128> = Vec::with_capacity(520);
+    for doc in DOCS {
+        let files: Vec<String> = std::fs::read_dir(dir)
+            .expect("pages dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|f| f.starts_with(&format!("{doc}_")) && f.ends_with(".png"))
+            .collect();
+        assert!(!files.is_empty(), "no pages for {doc}");
+        for f in &files {
+            let p = dir.join(f);
+            let png = std::fs::read(&p).expect("read png");
+            let t0 = std::time::Instant::now();
+            let page = engine.ocr_page(&png, &rc).expect("ocr_page");
+            let dt = t0.elapsed();
+            ms.push(dt.as_millis());
+            let _ = page.char_count();
+        }
+    }
+    assert_eq!(ms.len(), 520, "expected 520 pages, got {}", ms.len());
+    ms.sort_unstable();
+    let n = ms.len();
+    let med = ms[n / 2] as f64 / 1000.0;
+    let p90 = ms[n * 90 / 100] as f64 / 1000.0;
+    let mx = ms[n - 1] as f64 / 1000.0;
+    let total_s: u128 = ms.iter().sum::<u128>() / 1000;
+    println!(
+        "P9 perf ppocrv6: n={} ocr_page median={med:.3}s p90={p90:.3}s max={mx:.3}s \
+         total={}s ({:.3}s/page)",
         n,
         total_s,
         total_s as f64 / n as f64
