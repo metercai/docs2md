@@ -210,7 +210,7 @@ On the 623-page fixture corpus (8 PDFs), release build, this machine
 | Full pipeline incl. PDF parse + render | 623 pages, 4 threads | **2.25 s/page** (215 of them escalated to the embedded L2) |
 | Terminal-state histogram | 623 pages, L3 unconfigured | **S0=85 / S1a=323 / S1b=215 / S2=0** (serial chain routes 215 pages to the embedded L2; none reach the VLM) |
 | Determinism | two consecutive 623-page runs | byte-identical markdown |
-| Binary | x86_64 release | ~128 MB raw (Indra pipeline 72 MB + PP-OCRv6-small + code); the 44 MB LM tables are the largest single block |
+| Binary | x86_64 release | 134.6 MB / 128.4 MiB (Indra pipeline 72 MB + PP-OCRv6-small + code); the 44 MB LM tables are the largest single block |
 
 The binary is `include_bytes!`-embedded: no Python, no dylib, no fetched
 model needed for L0/L1. Thread count is the process env var
