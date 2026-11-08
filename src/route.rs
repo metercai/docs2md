@@ -14,7 +14,7 @@
 //! `use_indra = false` rollback path, where the pipeline intermediates do
 //! not exist.
 
-use crate::config::RouteConfig;
+use crate::config::{L3Config, RouteConfig};
 use crate::l1::OcrPage;
 
 /// The script pre-pass metrics for one page (plan §2.1 [script] stage),
@@ -122,6 +122,24 @@ pub fn output_gate(chars: usize, mean_conf: f32, rc: &RouteConfig) -> Option<&'s
 /// total (PP-OCRv6).
 pub fn output_chars(page: &OcrPage) -> usize {
     page.md.as_ref().map_or_else(|| page.char_count(), |m| m.chars().count())
+}
+
+/// L2→L3 gate (plan §2.2, decision F): a weak or invalid PP-OCRv6 (L2)
+/// result escalates the page to the L3 VLM.
+///
+/// * output characters < `l3.min_chars` => `chars` — an empty page (0)
+///   hits here; this is the item that covers the mean_conf-of-empty-page
+///   = 1.0 trap (plan §1.7), so it is checked first and never depends on
+///   the conf item;
+/// * mean line conf < `l3.hard`          => `conf` (non-empty pages).
+pub fn l3_gate(chars: usize, mean_conf: f32, l3: &L3Config) -> Option<&'static str> {
+    if chars < l3.min_chars {
+        Some(TAG_CHARS)
+    } else if mean_conf < l3.hard {
+        Some(TAG_CONF)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +259,43 @@ mod tests {
         assert_eq!(output_gate(60, 0.5, &rc()), None);
         // boundaries: conf exactly 0.5 passes (criterion is `<`), chars
         // exactly 60 passes.
+    }
+
+    // --- L2→L3 gate (plan §2.2, decision F) ----------------------------
+
+    fn l3() -> L3Config {
+        L3Config::default()
+    }
+
+    #[test]
+    fn l3_short_output_escalates() {
+        // 20 chars (< 30), healthy conf => chars.
+        assert_eq!(l3_gate(20, 0.9, &l3()), Some(TAG_CHARS));
+        // an empty page (0 chars) hits here — the item that covers the
+        // mean_conf-of-empty-page = 1.0 trap (plan §1.7).
+        assert_eq!(l3_gate(0, 1.0, &l3()), Some(TAG_CHARS));
+    }
+
+    #[test]
+    fn l3_low_conf_escalates() {
+        // a non-empty page with mean conf below 0.5 => conf.
+        assert_eq!(l3_gate(5000, 0.4, &l3()), Some(TAG_CONF));
+        // boundary: conf exactly 0.5 passes (criterion is `<`).
+        assert_eq!(l3_gate(5000, 0.5, &l3()), None);
+    }
+
+    #[test]
+    fn l3_chars_wins_over_conf() {
+        // both fire: the chars item is listed first in plan §2.2 and is
+        // the empty-page cover.
+        assert_eq!(l3_gate(20, 0.3, &l3()), Some(TAG_CHARS));
+    }
+
+    #[test]
+    fn l3_healthy_passes() {
+        assert_eq!(l3_gate(300, 0.9, &l3()), None);
+        // boundary: exactly 30 chars passes.
+        assert_eq!(l3_gate(30, 0.9, &l3()), None);
     }
 
     // --- output_chars ---------------------------------------------------

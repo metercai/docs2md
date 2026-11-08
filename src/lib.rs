@@ -6,9 +6,9 @@
 //!   L2  PP-OCRv6-small (embedded, decision E): the local fallback engine,
 //!       reached ONLY through the L1→L2 serial metric chain (plan §2.1) —
 //!       never by a pre-emptive layout detector (decision B).
-//!   L3  external VLM service (a llama-server wrapper): reserved for the
-//!       L2→L3 criteria (plan §2.2, Task 4). Until then it is reached only
-//!       when L1 itself is unavailable/failed.
+//!   L3  external VLM service (a llama-server wrapper): the end of the
+//!       cascade (plan §2.2, decision F). Reached when L2 (PP-OCRv6) is
+//!       weak/invalid, or when L1 itself is unavailable/failed.
 //!
 //! Per-page routing:
 //!   * page has a usable text layer            → L0 (direct); a page whose
@@ -18,11 +18,11 @@
 //!   * needs OCR → render once → L1 (Indra). The serial metric chain is
 //!     evaluated as the Indra pipeline advances (after det / the script
 //!     pre-pass / rec / assemble); a hit stops the pipeline and escalates
-//!     the page to L2 (PP-OCRv6) on the same rendered image. PP-OCRv6
-//!     output stands when it is non-empty; otherwise the (possibly
-//!     partial) L1 output is kept with a note, or an explicit low-confidence
-//!     marker is emitted — no page comes out empty (plan §2.1 + G,
-//!     first stage; L3 lands in Task 4).
+//!     the page to L2 (PP-OCRv6) on the same rendered image. A weak or
+//!     invalid L2 result (chars < l3.min_chars or mean conf < l3.hard,
+//!     plan §2.2) escalates to L3 (the VLM). The cascade always lands on
+//!     output: L3 result, or the best local text with a note, or an
+//!     explicit low-confidence marker — no page comes out empty (G).
 
 pub mod config;
 pub mod l0;
@@ -34,9 +34,9 @@ pub mod route;
 pub mod blocks;
 
 use config::Config;
-use l1::{build_engine, L1Engine, PpOcrEngine};
+use l1::{build_engine, L1Engine, OcrPage, PpOcrEngine};
 use l2::{L2Client, PageImage};
-use route::output_gate;
+use route::{l3_gate, output_gate};
 use std::path::PathBuf;
 
 /// What produced a page's final markdown, plus any quality note.
@@ -45,9 +45,9 @@ pub struct PageRecord {
     /// 1-based page number.
     pub page: u32,
     /// Which tier produced the output, e.g. "L0-native", "L1-indra",
-    /// "L2-ppv6(chain:cjk)", "L2-ppv6(chain:conf)(keep-l1)",
-    /// "L2-ppv6(chain:det)(low-conf)", "L1->L2(l1-failed)" (VLM),
-    /// "L1-ppv6(small)" (rollback).
+    /// "L2-ppv6(chain:cjk)", "L2-ppv6(chain:conf)(l3-unavailable)",
+    /// "L2-ppv6(chain:det)(low-conf)", "L3-vlm(chain:cjk)",
+    /// "L1->L2(l1-failed)", "L1-ppv6(small)" (rollback).
     pub tier: String,
     /// Final visible character count.
     pub chars: usize,
@@ -72,8 +72,9 @@ pub struct DocResult {
 /// document.
 pub struct Engine {
     cfg: Config,
-    /// The VLM client (plan §2.2's L3; Task 4). Reached today only when L1
-    /// itself is unavailable or failed.
+    /// The VLM client (plan §2.2's L3 end of the cascade). Reached when
+    /// L2 (PP-OCRv6) is weak/invalid, or when L1 itself is unavailable
+    /// or failed.
     l2: L2Client,
     /// The L1 primary (Indra when enabled, else PP-OCRv6).
     l1: Option<Box<dyn L1Engine>>,
@@ -439,49 +440,17 @@ impl Engine {
                 None
             }
         };
-        let keep_md = primary
-            .md
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| markdown::ocr_lines_to_markdown(&primary.lines));
-        let pp_empty = pp.as_ref().map_or(true, |p| p.char_count() == 0);
-        if pp_empty {
-            // L2 read nothing: keep the (possibly partial) L1 output with a
-            // note, or emit an explicit low-confidence marker when L1
-            // bailed out before producing anything (plan G, first stage —
-            // no page comes out empty; the L3 end lands in Task 4).
-            if keep_md.trim().is_empty() {
-                let note = Some(markdown::LOW_CONF_MARKER.to_string());
-                (
-                    String::new(),
-                    PageRecord {
-                        page: page1,
-                        tier: format!("L2-ppv6(chain:{tag})(low-conf)"),
-                        chars: 0,
-                        note: note.clone(),
-                        blocks: Vec::new(),
-                    },
-                    note,
-                )
-            } else {
-                let keep_chars = keep_md.chars().count();
-                let note = Some(markdown::KEEP_L1_NOTE.to_string());
-                (
-                    keep_md,
-                    PageRecord {
-                        page: page1,
-                        tier: format!("L2-ppv6(chain:{tag})(keep-l1)"),
-                        chars: keep_chars,
-                        note: note.clone(),
-                        blocks: primary.blocks.clone(),
-                    },
-                    note,
-                )
-            }
-        } else {
+        // L2→L3 (plan §2.2, decision F): the PP-OCRv6 result stands unless
+        // it is weak/invalid — output chars < l3.min_chars (an empty page
+        // hits here; the mean_conf-of-empty-page = 1.0 trap, plan §1.7) or
+        // mean conf < l3.hard.
+        let l3_tag = pp
+            .as_ref()
+            .and_then(|p| l3_gate(p.char_count(), p.mean_conf(), &self.cfg.l3));
+        let Some(l3_tag) = l3_tag else {
             let pp = pp.unwrap();
             let md = markdown::ocr_lines_to_markdown(&pp.lines);
-            (
+            return (
                 md,
                 PageRecord {
                     page: page1,
@@ -491,12 +460,118 @@ impl Engine {
                     blocks: Vec::new(),
                 },
                 None,
-            )
-        }
+            );
+        };
+        eprintln!(
+            "[p{page1}] l3-gate:{l3_tag} (pp chars={}, conf={:.3}) — escalating to L3 (VLM)",
+            pp.as_ref().map_or(0, |p| p.char_count()),
+            pp.as_ref().map_or(1.0, |p| p.mean_conf())
+        );
+        // §2.2 hit: L3 (the VLM service) on the same rendered image.
+        let vlm = if self.l2.available() {
+            let res = self.l2.ocr_page(&PageImage { png, page1 });
+            match res {
+                r if r.ok => Some(r.markdown),
+                r => {
+                    eprintln!(
+                        "[p{page1}] L3 call failed: {} — keeping local best-effort",
+                        r.error.as_deref().unwrap_or("unknown")
+                    );
+                    None
+                }
+            }
+        } else {
+            eprintln!("[p{page1}] L3 (VLM) unavailable — keeping local best-effort");
+            None
+        };
+        let Some(vlm) = vlm else {
+            return self.l3_fallback(page1, tag, &pp, &primary);
+        };
+        (
+            vlm.clone(),
+            PageRecord {
+                page: page1,
+                tier: format!("L3-vlm(chain:{tag})"),
+                chars: vlm.chars().count(),
+                note: None,
+                blocks: Vec::new(),
+            },
+            None,
+        )
     }
 
-    /// Send a page to L2; on failure (service down / call error) fall back to
-    /// a clear "needs a higher-tier OCR model" marker with empty body.
+    /// G end of the cascade (plan §2.2 / §6): the L3 VLM was unavailable or
+    /// failed after a §2.2 hit — keep the best local text with a note, or
+    /// the explicit low-confidence marker when nothing readable exists. No
+    /// page comes out empty.
+    fn l3_fallback(
+        &self,
+        page1: u32,
+        chain_tag: &str,
+        pp: &Option<OcrPage>,
+        primary: &OcrPage,
+    ) -> (String, PageRecord, Option<String>) {
+        // L2 (PP-OCRv6) has weak-but-readable text: it stands, noted.
+        let pp_text = pp
+            .as_ref()
+            .map(|p| markdown::ocr_lines_to_markdown(&p.lines))
+            .filter(|m| !m.trim().is_empty());
+        if let Some(pp_text) = pp_text {
+            let chars = pp_text.chars().count();
+            let note = Some(markdown::L3_FALLBACK_NOTE.to_string());
+            return (
+                pp_text,
+                PageRecord {
+                    page: page1,
+                    tier: format!("L2-ppv6(chain:{chain_tag})(l3-unavailable)"),
+                    chars,
+                    note: note.clone(),
+                    blocks: Vec::new(),
+                },
+                note,
+            );
+        }
+        // PP-OCRv6 read nothing: keep the (possibly partial) L1 output.
+        let keep_md = primary
+            .md
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| markdown::ocr_lines_to_markdown(&primary.lines));
+        if !keep_md.trim().is_empty() {
+            let chars = keep_md.chars().count();
+            let note = Some(markdown::KEEP_L1_NOTE.to_string());
+            return (
+                keep_md,
+                PageRecord {
+                    page: page1,
+                    tier: format!("L2-ppv6(chain:{chain_tag})(keep-l1)"),
+                    chars,
+                    note: note.clone(),
+                    blocks: primary.blocks.clone(),
+                },
+                note,
+            );
+        }
+        // Nothing anywhere: the explicit low-confidence marker.
+        let note = Some(markdown::LOW_CONF_MARKER.to_string());
+        (
+            String::new(),
+            PageRecord {
+                page: page1,
+                tier: format!("L2-ppv6(chain:{chain_tag})(low-conf)"),
+                chars: 0,
+                note: note.clone(),
+                blocks: Vec::new(),
+            },
+            note,
+        )
+    }
+
+    /// Send a page to L3 (the VLM); on failure (service down / call error)
+    /// fall back to a clear "needs a higher-tier OCR model" marker with
+    /// empty body (the G no-empty-page invariant is enforced by the caller
+    /// or the explicit marker).
     fn l2_page(
         &mut self,
         page1: u32,
@@ -627,4 +702,76 @@ pub fn resolve_config_path(explicit: Option<&PathBuf>) -> PathBuf {
         return PathBuf::from(env);
     }
     PathBuf::from("docs2md.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use l1::{OcrLine, OcrPage};
+    use markdown::{KEEP_L1_NOTE, L3_FALLBACK_NOTE, LOW_CONF_MARKER};
+
+    fn page(lines: &[(&str, f32)]) -> OcrPage {
+        OcrPage {
+            lines: lines
+                .iter()
+                .map(|(t, c)| OcrLine {
+                    text: (*t).to_string(),
+                    conf: *c,
+                    top: 0.0,
+                    left: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                })
+                .collect(),
+            md: None,
+            blocks: Vec::new(),
+            escalate_l2: None,
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(Config::default()).expect("default engine (no L2, no L1 models loaded)")
+    }
+
+    // G (no empty page): every branch of the cascade end emits markdown or
+    // a non-empty note — the page is never silently empty.
+
+    #[test]
+    fn g_l3_fallback_weak_pp_text_stands_with_note() {
+        // PP-OCRv6 read weak-but-readable text (hit the §2.2 gate on
+        // confidence): it stands, with the L3-fallback note.
+        let pp = page(&[("some weak text", 0.3)]);
+        let primary = page(&[]);
+        let (md, rec, note) = engine().l3_fallback(7, "cjk", &Some(pp.clone()), &primary);
+        assert_eq!(md, "some weak text\n");
+        assert_eq!(rec.tier, "L2-ppv6(chain:cjk)(l3-unavailable)");
+        assert!(rec.chars > 0);
+        let note = note.expect("note present");
+        assert_eq!(note, L3_FALLBACK_NOTE);
+        assert!(!md.trim().is_empty());
+    }
+
+    #[test]
+    fn g_l3_fallback_pp_empty_keeps_l1_with_note() {
+        // PP-OCRv6 read nothing: keep the (partial) L1 output, noted.
+        let primary = page(&[("partial l1 text", 0.9)]);
+        let (md, rec, note) = engine().l3_fallback(8, "det", &None, &primary);
+        assert_eq!(md, "partial l1 text\n");
+        assert_eq!(rec.tier, "L2-ppv6(chain:det)(keep-l1)");
+        let note = note.expect("note present");
+        assert_eq!(note, KEEP_L1_NOTE);
+        assert!(!md.trim().is_empty());
+    }
+
+    #[test]
+    fn g_l3_fallback_everything_empty_emits_marker() {
+        // Nothing anywhere: the explicit low-confidence marker (non-empty).
+        let primary = page(&[]);
+        let (md, rec, note) = engine().l3_fallback(9, "conf", &None, &primary);
+        assert!(md.trim().is_empty(), "marker lives in the note, not the body");
+        assert_eq!(rec.tier, "L2-ppv6(chain:conf)(low-conf)");
+        let note = note.expect("note present");
+        assert_eq!(note, LOW_CONF_MARKER);
+        assert!(!note.trim().is_empty(), "the page itself is never empty");
+    }
 }

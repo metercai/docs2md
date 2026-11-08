@@ -37,11 +37,10 @@ pub fn ocr_lines_to_markdown(lines: &[OcrLine]) -> String {
 pub const NEEDS_HIGHER_NOTE: &str =
     "<!-- needs a higher-tier OCR model: L2 service unavailable -->\n";
 
-/// The explicit low-confidence marker emitted as a page's markdown when the
-/// local cascade produced no usable output (the L1 serial chain hit early
-/// and L2 / PP-OCRv6 read nothing): an explicit, non-empty note so the page
-/// is never silently empty (plan G; the VLM end of the cascade lands in
-/// Task 4).
+/// The explicit low-confidence marker emitted as a page's markdown when
+/// the whole cascade (L1 serial chain, L2 PP-OCRv6, L3 VLM) produced no
+/// usable output: an explicit, non-empty note so the page is never
+/// silently empty (plan G, end of the cascade).
 pub const LOW_CONF_MARKER: &str =
     "<!-- low confidence: the OCR chain escalated this page to L2 \
          (PP-OCRv6) and no usable output was produced -->\n";
@@ -53,6 +52,13 @@ pub const KEEP_L1_NOTE: &str =
     "<!-- needs a higher-tier OCR model: the serial chain escalated this \
          page to L2 (PP-OCRv6) but it read nothing — keeping the L1 \
          best-effort output -->\n";
+
+/// The note attached when the L2 (PP-OCRv6) result was weak or invalid
+/// (plan §2.2) and the L3 VLM leg was unavailable or failed: the local
+/// best-effort PP-OCRv6 text stands as the page's markdown.
+pub const L3_FALLBACK_NOTE: &str =
+    "<!-- weak PP-OCRv6 output: the L3 VLM was unavailable or failed — \
+     keeping the local best-effort text -->\n";
 
 #[cfg(test)]
 mod tests {

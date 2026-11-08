@@ -21,6 +21,7 @@ pub struct Config {
     pub l0: L0Config,
     pub l1: L1Config,
     pub l2: L2Config,
+    pub l3: L3Config,
     pub route: RouteConfig,
     pub output: OutputConfig,
 }
@@ -74,10 +75,11 @@ impl Default for L1Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct L2Config {
-    /// Base URL of the L2 service (an OpenAI-compatible llama-server,
-    /// typically launched by `docs2md-l2d`). When empty, L2 is disabled:
-    /// complex pages fall back to L1 and the output is marked as
-    /// "needs a higher-tier OCR model".
+    /// Base URL of the VLM service (an OpenAI-compatible llama-server,
+    /// typically launched by `docs2md-l2d`) — the L3 end of the cascade.
+    /// When empty, the VLM leg is off: a weak or invalid L2 (PP-OCRv6)
+    /// result keeps the local best-effort text with a note (plan G —
+    /// no empty page).
     pub base_url: String,
     /// Model name passed in the chat-completion body (llama-server often
     /// serves a single model; leave empty to let it default).
@@ -111,6 +113,25 @@ impl Default for L2Config {
             health_check: true,
             health_wait_secs: default_health_wait(),
         }
+    }
+}
+
+/// L2→L3 criteria (plan §2.2, decision F): a weak or invalid PP-OCRv6
+/// (L2) result escalates the page to the L3 VLM. Operational parameters,
+/// therefore configurable (Task 7 calibrates them on the L2 pages).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct L3Config {
+    /// PP-OCRv6 output characters below this => L3. An empty page (0)
+    /// hits here, which also covers the mean_conf-of-empty-page = 1.0
+    /// trap (plan §1.7).
+    pub min_chars: usize,
+    /// PP-OCRv6 mean line conf below this => L3 (non-empty pages).
+    pub hard: f32,
+}
+impl Default for L3Config {
+    fn default() -> Self {
+        Self { min_chars: 30, hard: 0.5 }
     }
 }
 

@@ -6,8 +6,8 @@
 //!      S1a = L1-indra (the serial chain passed)
 //!      S1b = L2-ppv6(chain:*) (the chain hit a stage and PP-OCRv6 read the
 //!            page — includes the three dark CJK scans plus the Chinese
-//!            documents, which the [script] cjk stage routes to the engine
-//!            that reads Chinese better)
+//!            documents, which the serial chain's [script] stage routes to
+//!            the engine that reads Chinese better)
 //!      S2  = everything else (L1-ppv6-* with use_indra=false, L1(g2:*)
 //!            keeps, L1->L2(l1-unavailable|l1-failed))
 //!    Structural invariants are asserted; the S1a/S1b/S2 split is printed
@@ -131,25 +131,20 @@ fn p9_623_histogram_determinism() {
     assert_eq!(pages.len(), 623, "corpus is 623 pages");
 
     // C: dead-state check — every page carries a recognized terminal tier.
-    // Pages whose escalation leg did not complete (L2 PP-OCRv6 unavailable
-    // or call failed) keep a keep/low-conf tier and must be the only ones
-    // with empty markdown (plus the explicit note or LOW_CONF_MARKER).
-    let mut empty_md = 0usize;
+    // The G no-empty-page invariant (every page has non-empty markdown or a
+    // non-empty note) is enforced by construction in `l3_fallback` /
+    // `l2_page` and unit-tested there; the low-conf / keep-l1 / l3-
+    // unavailable tiers are the only ones whose markdown is empty by
+    // design (their note is what makes the page non-empty).
     for (tag, _, tier) in &pages {
         let recognized = tier == "L0-native"
             || tier == "L1-indra"
             || tier.starts_with("L2-ppv6(chain:")
             || tier.starts_with("L1-ppv6-")
             || tier.starts_with("L1(g2:")
-            || tier.starts_with("L1->L2(");
-        assert!(recognized, "{tag}: unrecognized terminal tier {tier:?}");
-        if tier.contains("(low-conf)")
-            || tier.contains("(keep-l1)")
-            || tier.starts_with("L1(g2:")
             || tier.starts_with("L1->L2(")
-        {
-            empty_md += 1;
-        }
+            || tier.starts_with("L3-vlm(chain:");
+        assert!(recognized, "{tag}: unrecognized terminal tier {tier:?}");
     }
 
     // A: histogram.
@@ -190,7 +185,8 @@ fn p9_623_histogram_determinism() {
     // Structural invariants (calibration-independent):
     // S0 is the L0-native text-layer count (the has_table reroute,
     // unchanged by the serial chain); S1b contains the three known dark
-    // pages (the [script] cjk stage must catch them); nothing is lost.
+    // pages (the serial chain's script stage must catch them); nothing is
+    // lost.
     assert_eq!(c.s0, 85, "S0 = 85 text-layer pages (has_table reroute)");
     let dark_hit = S1B_PAGES
         .iter()
@@ -228,8 +224,7 @@ fn p9_623_histogram_determinism() {
         });
     println!(
         "P9 gate: total={total:.0}s ({}s/page both passes) \
-         S0={} S1a={} S1b={} S2={} | S2 tiers: {s2_tiers:?} \
-         empty_or_keep={empty_md}",
+         S0={} S1a={} S1b={} S2={} | S2 tiers: {s2_tiers:?}",
         total / 623.0 / 2.0,
         c.s0,
         c.s1a,

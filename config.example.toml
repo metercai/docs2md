@@ -28,7 +28,10 @@ layout_target_size = 800
 # v0.1.0 flow (the rollback path).
 use_indra = true
 
-# ── L2: external VLM service (a llama-server wrapper) ───────────────────
+# ── L2: external VLM service — the L3 end of the cascade (a llama-server
+#    wrapper, decision E/F) ───────────────────────────────────────────────
+#    [l2] holds the service connection settings; the L2→L3 criteria live
+#    under [l3] below.
 [l2]
 # Base URL of the L2 service (OpenAI-compatible; typically launched by
 # docs2md-l2d). When empty, L2 is disabled and complex pages fall back to
@@ -66,6 +69,15 @@ unsure_line_frac = 0.5
 rec_hard_conf = 0.5
 # [assemble] output characters below this => L2 (almost nothing read).
 min_chars = 60
+
+# ── L2→L3 criteria (plan §2.2, decision F): a weak/invalid PP-OCRv6
+#    (L2) result escalates the page to the L3 VLM ─────────────────────────
+[l3]
+# PP-OCRv6 output characters below this => L3. An empty page (0) hits
+# here, covering the mean_conf-of-empty-page = 1.0 trap.
+min_chars = 30
+# PP-OCRv6 mean line conf below this => L3 (non-empty pages).
+hard = 0.5
 
 # ── Output ──────────────────────────────────────────────────────────────
 [output]

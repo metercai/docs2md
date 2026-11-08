@@ -1,12 +1,16 @@
-//! L2 client: talks to an external VLM service that is a **llama-server
+//! L3 client: talks to an external VLM service that is a **llama-server
 //! wrapper** (e.g. `docs2md-l2d` supervising a `llama-server` running a
 //! PaddleOCR-VL GGUF). We speak the OpenAI-compatible
 //! `/v1/chat/completions` API, sending the page PNG as a base64 `image_url`
 //! content part.
 //!
-//! L2 is *optional*: when `base_url` is empty or the health probe fails,
-//! `available()` is false and the orchestrator falls back to L1, marking
-//! the page "needs a higher-tier OCR model".
+//! The VLM is the L3 end of the cascade (plan §2.2). It is *optional*: when
+//! `base_url` is empty or the health probe fails, `available()` is false
+//! and the orchestrator falls back to the best local text, marking the page
+//! "needs a higher-tier OCR model" (the G no-empty-page end of the
+//! cascade). The client keeps its historical `L2Client` name; its
+//! connection settings live under `[l2]` in the config, the L2→L3 criteria
+//! under `[l3]`.
 
 use crate::config::L2Config;
 
@@ -113,7 +117,7 @@ impl L2Client {
         &self.unavailable_reason
     }
 
-    /// Send one rendered page to the VLM and return its markdown.
+    /// Send one rendered page to the L3 VLM and return its markdown.
     pub fn ocr_page(&self, img: &PageImage<'_>) -> L2Result {
         if !self.available {
             return L2Result {
