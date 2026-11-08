@@ -17,6 +17,12 @@ pub struct L0Page {
     pub needs_ocr: bool,
     /// Machine reason for `needs_ocr` (e.g. "no text"), for logging only.
     pub ocr_reason: Option<String>,
+    /// pdf-inspector's free table signal (span geometry, no rendering, no
+    /// models). Used to reroute table pages to L1 (whose order model emits
+    /// `<table>` structure the native layer flattens away) without a layout
+    /// model — the zero-model replacement for the former C1 structural
+    /// reroute.
+    pub has_table: bool,
 }
 
 /// Result of the L0 pass over a whole document.
@@ -29,6 +35,7 @@ pub struct L0Result {
 pub fn extract(bytes: &[u8]) -> Result<L0Result, String> {
     let doc = extract_pages_markdown_mem(bytes, None)
         .map_err(|e| format!("L0 extraction failed: {e}"))?;
+    let tables = doc.pages_with_tables;
     let pages = doc
         .pages
         .into_iter()
@@ -37,6 +44,8 @@ pub fn extract(bytes: &[u8]) -> Result<L0Result, String> {
             markdown: p.markdown,
             needs_ocr: p.needs_ocr,
             ocr_reason: p.ocr_reason,
+            // pdf-inspector reports these 1-indexed; `page` is 0-based.
+            has_table: tables.contains(&(p.page + 1)),
         })
         .collect();
     Ok(L0Result { pages })

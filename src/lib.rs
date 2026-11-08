@@ -39,7 +39,7 @@ use config::Config;
 use l1::{build_engine, L1Engine, PpOcrEngine};
 use l2::{L2Client, PageImage};
 use route::{
-    decide_l1_flow, g1, g1_regions, g1_relabel_regions, g3, output_chars, structural_from_layout,
+    decide_l1_flow, g1, g3, output_chars,
     G3Verdict, L1Outcome, Tier,
 };
 use rusto::{LayoutConfig, LayoutDetector};
@@ -227,27 +227,18 @@ impl Engine {
                 }
             }
             if !p.needs_ocr {
-                // S0 candidate: a usable native text layer. C1 reroute — a
-                // table page's text layer is only textual, but the page
-                // carries a structural block (table caption / compact
-                // table-figure-equation): L1's order model emits `<table>`
-                // structure, which the native layer flattens away. Check G1
-                // structural rules a/b only (dense text, rule c, is a normal
-                // S0 condition and stays L0). Gated on use_indra + an
-                // available layout model: with use_indra = false (v0.1.0) or
-                // no layout model the page keeps the native L0 output,
-                // byte-identical to before.
-                let mut reroute_png: Option<Vec<u8>> = None;
-                let mut l0_relabel_regions: Option<Vec<(f64, f64, f64, f64, &'static str)>> =
-                    None;
-                if self.cfg.l1.use_indra
-                    && self
-                        .cfg
-                        .l1
-                        .layout_model
-                        .as_ref()
-                        .map_or(false, |m| m.exists())
-                {
+                // S0 candidate: a usable native text layer. Post-route
+                // reroute (zero-model): pdf-inspector's free `has_table`
+                // signal (span geometry, no rendering, no models) marks a
+                // page whose text layer is only textual while the page
+                // carries a table — L1's order model emits `<table>`
+                // structure, which the native layer flattens away. The
+                // former C1 structural reroute (render + PP-DocLayout +
+                // G1 a/b) is gone: L0 is model-free, and the layout model
+                // no longer participates in routing at all (decision C).
+                // Gated on use_indra: with use_indra = false (v0.1.0) the
+                // page keeps the native L0 output.
+                if self.cfg.l1.use_indra && p.has_table {
                     if doc.is_none() {
                         doc = Some(
                             pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec())
@@ -255,32 +246,10 @@ impl Engine {
                         );
                     }
                     let d = doc.as_ref().unwrap();
-                    let (png, pbox, rot) =
+                    let (png, _pbox, _rot) =
                         render::render_pdf_page(d, p.page as usize, self.cfg.l0.dpi)
                             .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
-                    let (pw, ph) = render::png_size(&png);
-                    let _ = (pbox, rot);
-                    let page_area = pw as f64 * ph as f64;
-                    let route = self.cfg.route.clone();
-                    // G1 layout runs ONCE here: the same regions serve both the
-                    // structural S0-reroute decision and the L0 block relabel
-                    // (E2). No layout model / detection failure → no regions,
-                    // the page behaves exactly as before the blocks work.
-                    let regions = self.ensure_layout().and_then(|ld| g1_regions(Some(ld), &png));
-                    let hit = regions
-                        .as_deref()
-                        .map(|rs| structural_from_layout(rs, page_area, &route))
-                        .unwrap_or(false);
-                    if hit {
-                        reroute_png = Some(png);
-                        l0_relabel_regions = None; // page goes to L1; no L0 blocks
-                    } else if let Some(rs) = &regions {
-                        l0_relabel_regions =
-                            Some(g1_relabel_regions(rs, pw as f64, ph as f64, &route));
-                    }
-                }
-                if let Some(png) = reroute_png {
-                    eprintln!("[p{page1}] S0 reroute: G1 structural a/b — L1");
+                    eprintln!("[p{page1}] S0 reroute: table page — L1");
                     let (page_md, rec, note) = self.l1_dual(page1, &png);
                     if self.cfg.output.page_markers {
                         out.push_str(&format!("<!-- page:{page1} -->\n"));
@@ -299,7 +268,7 @@ impl Engine {
                         tier: "L0-native".into(),
                         chars: p.markdown.chars().count(),
                         note: None,
-                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), l0_relabel_regions.as_deref()),
+                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), None),
                     });
                 }
                 continue;

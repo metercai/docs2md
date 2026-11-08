@@ -2,19 +2,21 @@
 //!
 //! A. Terminal-state histogram over all 623 pages of the 8 fixture PDFs
 //!    (42+105+415+46+1+2+9+3). Classification:
-//!      S0 = L0-native            (expected 75)
-//!      S1a = L1-indra            (expected 269-k)
+//!      S0 = L0-native            (expected 85)
+//!      S1a = L1-indra            (expected 259-k)
 //!      S1b = L1-ppv6(g3-fallback)(expected exactly 3: the dark CJK scans)
 //!      S2 = everything else (L2-vlm / L1->L2(...) / L2-unavailable keeps)
 //!           (expected 276+k)
 //!    Expected values are calibrated at the current default dpi=200 and the
-//!    C1 structural reroute (A3 census 2026-11-06, per-page 150-vs-200 diff
-//!    + G1 rule attribution archived in .hermes/qa/; C1 census 2026-11-07:
-//!    25 S0 pages with an a/b structural signal reroute S0 -> L1-indra,
-//!    S0 100 -> 75, S1a 244 -> 269, S2 unchanged). The L1/L2 split is the
-//!    dense-judge routing calibration; L2 may be unavailable in the test
-//!    environment, which does not change the routing verdict (the tier
-//!    string is decided before the L2 call).
+//!    post-route has_table reroute (pdf-inspector's free span-geometry table
+//!    signal, zero-model replacement for the former C1 structural reroute;
+//!    re-calibrated 2026-11-08: 15 S0 table pages reroute S0 -> L1-indra,
+//!    S0 100 -> 85, S1a 244 -> 259, S2 unchanged. The former C1 layout
+//!    calibration — 25 pages, S0 100 -> 75, S1a 244 -> 269 — is archived in
+//!    .hermes/qa/). The L1/L2 split is the dense-judge routing
+//!    calibration; L2 may be unavailable in the test environment, which
+//!    does not change the routing verdict (the tier string is decided
+//!    before the L2 call).
 //! B. Determinism: two consecutive full runs, byte-identical markdown
 //!    (plan line 139: temp-0 greedy CTC + deterministic beam + fixed
 //!    thread count). Run with RTEN_NUM_THREADS=1 for the strictest
@@ -103,7 +105,17 @@ fn run_pass(engine: &mut Engine) -> (String, Vec<(String, u32, String)>) {
             ));
         }
         md_all.push_str(&res.markdown);
-        eprintln!("[p9] {stem}: {expect} pages in {dt:.1}s");
+        // Per-doc class counts for calibration cross-checks.
+        let cls_counts = |want: fn(&str) -> bool| {
+            res.pages.iter().filter(|r| want(r.tier.as_str())).count()
+        };
+        eprintln!(
+            "[p9] {stem}: {expect} pages in {dt:.1}s (S0={} S1a={} S1b={} S2={})",
+            cls_counts(|t| t == "L0-native"),
+            cls_counts(|t| t == "L1-indra"),
+            cls_counts(|t| t == "L1-ppv6(g3-fallback)"),
+            cls_counts(|t| !matches!(t, "L0-native" | "L1-indra" | "L1-ppv6(g3-fallback)")),
+        );
     }
     (md_all, pages)
 }
@@ -167,6 +179,23 @@ fn p9_623_histogram_determinism() {
         s1b: hist.get("S1b").copied().unwrap_or(0),
         s2: hist.get("S2").copied().unwrap_or(0),
     };
+    // Print the observed histogram before the assertions so a calibration
+    // failure shows the actual values (the post-route reroute signal is the
+    // zero-model has_table, not the former C1 layout model — the expected
+    // totals below are re-calibrated against this).
+    let s2_tiers_pre: BTreeMap<&str, usize> = pages
+        .iter()
+        .filter(|(_, _, t)| classify(t) == "S2")
+        .map(|(_, _, t)| t.as_str())
+        .fold(BTreeMap::new(), |mut m, t| {
+            *m.entry(t).or_insert(0) += 1;
+            m
+        });
+    println!(
+        "P9 observed: S0={} S1a={} S1b={} S2={} (total={}) | S2 tiers: {s2_tiers_pre:?}",
+        c.s0, c.s1a, c.s1b, c.s2,
+        c.s0 + c.s1a + c.s1b + c.s2
+    );
 
     // S1b must be exactly the three known dark pages (plan line 136).
     let mut want: Vec<&str> = S1B_PAGES.to_vec();
@@ -178,16 +207,16 @@ fn p9_623_histogram_determinism() {
         "S1b must be exactly the three known dark-background CJK pages"
     );
 
-    // Expected totals (calibrated at dpi=200 + C1 reroute, C1 census):
-    // S0=75, S1a=269-k, S1b=3, S2=276+k. Invariants: S0=75, S1b=3,
-    // L1-routed (S1a+S1b)=272, total=623.
-    assert_eq!(c.s0, 75, "S0 = 75 text-layer pages (post-C1 reroute)");
+    // Expected totals (calibrated at dpi=200 + has_table reroute):
+    // S0=85, S1a=259-k, S1b=3, S2=276+k. Invariants: S0=85, S1b=3,
+    // L1-routed (S1a+S1b)=262, total=623.
+    assert_eq!(c.s0, 85, "S0 = 85 text-layer pages (post has_table reroute)");
     assert_eq!(c.s1b, 3, "S1b = exactly 3 dark pages");
     assert_eq!(c.s0 + c.s1a + c.s1b + c.s2, 623);
     assert_eq!(
         c.s1a + c.s1b,
-        272,
-        "L1-routed (S1a+S1b) = 272 (dpi=200 + C1 calibration, k=0 expected)"
+        262,
+        "L1-routed (S1a+S1b) = 262 (dpi=200 + has_table calibration, k=0 expected)"
     );
 
     // B: determinism — second full run, byte-identical markdown.
