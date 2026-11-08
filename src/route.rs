@@ -1,281 +1,120 @@
-//! Routing: G1 (layout-based L1/L2 split) + G3 (output-level fallback gate).
+//! Routing: the L1→L2 serial metric chain (plan §2.1).
 //!
-//! G1 runs the external PP-DocLayout model on a rendered page and applies
-//! the layout rules (validated on the 623-page fixture corpus):
-//!   * any table-caption region            => L2
-//!   * a COMPACT complex region (table /
-//!     figure / equation whose bbox covers
-//!     < compact_frac of the page and
-//!     conf > compact_conf)                => L2
-//!   * a DENSE-TEXT blob (a TEXT region
-//!     covering >= dense_frac of the page
-//!     with conf >= dense_conf)            => L2
-//!   * otherwise                           => L1
+//! The chain is evaluated as the indra pipeline advances — after det, after
+//! the script pre-pass, after rec, after assemble — and the first hit stops
+//! the pipeline and escalates the page to L2 (PP-OCRv6). Every stage reads
+//! an intermediate quantity the pipeline already computes (no extra
+//! inference); the thresholds live in `[route.chain]` (config.rs, the
+//! single source of truth).
 //!
-//! G3 is the output-level gate applied to an L1 engine's result (per the
-//! fit plan). It is the primary check on the Indra output (chars = markdown
-//! length) and the fallback check on the PP-OCRv6 output (chars = line-text
-//! total); both share the `[route.g3]` thresholds:
-//!
-//! * chars < min_chars AND mean_conf < hard_conf  => HARD fail
-//! * chars < min_chars AND mean_conf < mid_conf   => MEDIUM doubt
-//! * otherwise                                    => OK
-//!
-//! A HARD/MEDIUM page falls back to the other engine (Indra -> PP-OCRv6); if
-//! the fallback is unavailable or also fails, the page is escalated to L2 (if
-//! available); otherwise the best L1 output is kept and the page is marked
-//! "needs a higher-tier OCR model".
-
-use rusto::{LayoutDetector, LayoutOutput, LayoutRegion, LayoutType};
+//! The chain replaces the former G1 layout routing (render + PP-DocLayout)
+//! and the former G3 output-level dual-engine flow: routing no longer loads
+//! or runs any external layout model (decision B), and PP-OCRv6 is reached
+//! only through the chain (decision E) — or through [`output_gate`] on the
+//! `use_indra = false` rollback path, where the pipeline intermediates do
+//! not exist.
 
 use crate::config::RouteConfig;
-#[cfg(test)]
-use crate::l1::OcrLine;
 use crate::l1::OcrPage;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
-    L1,
-    L2,
+/// The script pre-pass metrics for one page (plan §2.1 [script] stage),
+/// computed by `rec::route_script` from the per-line script routing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptMetrics {
+    /// Total routed lines.
+    pub n: usize,
+    /// Lines whose raw classifier argmax is the cjk group (a Chinese-major
+    /// page goes to the engine that reads Chinese better: PP-OCRv6).
+    pub cjk: usize,
+    /// Lines the classifier is not sure about (double-read from the base
+    /// recognizer).
+    pub unsure: usize,
+    /// The dominant raw script group (mode; alphabetical tie-break).
+    pub dominant: Option<String>,
+    /// Whether this build loads a rec variant for the dominant group
+    /// (base always counts as loaded).
+    pub dominant_has_variant: bool,
 }
 
-/// G3 verdict for one L1 engine's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum G3Verdict {
-    /// Keep the engine output.
-    Ok,
-    /// Fall back / escalate (medium doubt — conservative).
-    Medium,
-    /// Fall back / escalate (hard fail — low char count and low conf).
-    Hard,
-}
-
-/// Apply G1 layout routing. `page_area` is the rendered page pixel area.
-pub fn route_from_layout(regions: &[LayoutRegion], page_area: f64, rc: &RouteConfig) -> Tier {
-    // (a) any table-caption region => L2 (the strongest complex signal).
-    for r in regions {
-        if r.layout_type == LayoutType::TableCaption {
-            return Tier::L2;
+impl ScriptMetrics {
+    pub fn cjk_frac(&self) -> f32 {
+        self.frac(self.cjk)
+    }
+    pub fn unsure_frac(&self) -> f32 {
+        self.frac(self.unsure)
+    }
+    fn frac(&self, k: usize) -> f32 {
+        if self.n == 0 {
+            0.0
+        } else {
+            k as f32 / self.n as f32
         }
     }
-    // (b) compact complex region => L2.
-    for r in regions {
-        if matches!(
-            r.layout_type,
-            LayoutType::Table | LayoutType::Figure | LayoutType::Equation
-        ) {
-            let rw = (r.bbox.x_max - r.bbox.x_min) as f64;
-            let rh = (r.bbox.y_max - r.bbox.y_min) as f64;
-            let frac = if page_area > 0.0 {
-                (rw * rh) / page_area
-            } else {
-                1.0
-            };
-            if frac < rc.compact_frac as f64 && r.confidence > rc.compact_conf {
-                return Tier::L2;
-            }
-        }
-    }
-    // (c) dense-text blob => L2. TEXT type only: the layout model emits a
-    // full-page high-conf table for ordinary text pages, so a full-page
-    // TABLE is a known false positive and must not count as "dense".
-    for r in regions {
-        if r.layout_type == LayoutType::Text {
-            let rw = (r.bbox.x_max - r.bbox.x_min) as f64;
-            let rh = (r.bbox.y_max - r.bbox.y_min) as f64;
-            let frac = if page_area > 0.0 {
-                (rw * rh) / page_area
-            } else {
-                1.0
-            };
-            if frac >= rc.dense_frac as f64 && r.confidence >= rc.dense_conf {
-                return Tier::L2;
-            }
-        }
-    }
-    Tier::L1
 }
 
-/// Structural signal for the S0 reroute check (plan C1): true when the page
-/// carries a table-caption region (rule a) or a COMPACT complex region
-/// (rule b). Deliberately excludes rule c (dense text): an S0 text page
-/// legitimately contains large high-conf TEXT regions, dense text is not a
-/// structural block, and OCR would be slower and less accurate than the
-/// native layer for it.
-pub fn structural_from_layout(
-    regions: &[LayoutRegion],
-    page_area: f64,
-    rc: &RouteConfig,
-) -> bool {
-    // (a) any table-caption region.
-    for r in regions {
-        if r.layout_type == LayoutType::TableCaption {
-            return true;
-        }
-    }
-    // (b) compact complex region.
-    for r in regions {
-        if matches!(
-            r.layout_type,
-            LayoutType::Table | LayoutType::Figure | LayoutType::Equation
-        ) {
-            let rw = (r.bbox.x_max - r.bbox.x_min) as f64;
-            let rh = (r.bbox.y_max - r.bbox.y_min) as f64;
-            let frac = if page_area > 0.0 {
-                (rw * rh) / page_area
-            } else {
-                1.0
-            };
-            if frac < rc.compact_frac as f64 && r.confidence > rc.compact_conf {
-                return true;
-            }
-        }
-    }
-    false
-}
+/// Chain-stage tags, in pipeline order: the value carried in
+/// `OcrPage.escalate_l2` and in the page's tier string.
+pub const TAG_DET: &str = "det";
+pub const TAG_CJK: &str = "cjk";
+pub const TAG_NOVARIANT: &str = "novariant";
+pub const TAG_UNSURE: &str = "unsure";
+pub const TAG_CONF: &str = "conf";
+pub const TAG_CHARS: &str = "chars";
 
-/// Run G1's layout detection once on a rendered PNG and return the regions
-/// (the caller applies the routing rules or the structural S0 reroute check
-/// to the SAME regions — zero extra inference). `None` when no layout
-/// detector is available or detection fails.
-pub fn g1_regions(layout: Option<&mut LayoutDetector>, png: &[u8]) -> Option<Vec<LayoutRegion>> {
-    let ld = layout?;
-    let dyn_img = image::load_from_memory(png).ok()?;
-    let mat = rusto::image_impl::Mat::new(dyn_img);
-    let out: LayoutOutput = ld.detect(&mat).ok()?;
-    Some(out.regions)
-}
-
-/// Reduce G1's layout regions to the structural L0 block relabel targets
-/// (plan E2, L0): only `Title` (→ `heading`) and `Table` (→ `table`)
-/// regions that are LOCAL structural signals, with each bbox normalized to
-/// the rendered page's `[0,1]` y-down space — the same space the L0 block
-/// bboxes live in. `page_w`/`page_h` are the rendered PNG's pixel size (the
-/// PNG renders exactly the page's render box, so this matches the block
-/// normalization denominator). Every other layout type is dropped: a block in
-/// it stays `text`.
-///
-/// Locality guard (plan E2 failure branch): a region only relabels blocks
-/// when it is both confident AND compact — `conf > compact_conf` and
-/// `area_frac < compact_frac`, the SAME thresholds [`structural_from_layout`]
-/// uses to call a region a local structural block. This is what keeps a
-/// page-spanning `Table` blob (e.g. a filled form, where PP-DocLayout emits
-/// one full-page table region with area_frac ~0.94) from relabelling every
-/// body line as `table`: that blob is a page-level routing signal, not a
-/// local block label. With no layout model, or when no region passes the
-/// guard, the caller gets an empty vec and every L0 block stays `text`.
-pub fn g1_relabel_regions(
-    regions: &[LayoutRegion],
-    page_w: f64,
-    page_h: f64,
-    rc: &RouteConfig,
-) -> Vec<(f64, f64, f64, f64, &'static str)> {
-    if page_w <= 0.0 || page_h <= 0.0 {
-        return Vec::new();
-    }
-    let page_area = page_w * page_h;
-    let mut out = Vec::new();
-    for r in regions {
-        let label = match r.layout_type {
-            LayoutType::Title => Some(crate::blocks::HEADING),
-            LayoutType::Table => Some(crate::blocks::TABLE),
-            _ => None,
-        };
-        let Some(label) = label else { continue };
-        let area_frac = ((r.bbox.x_max - r.bbox.x_min) as f64
-            * (r.bbox.y_max - r.bbox.y_min) as f64)
-            / page_area;
-        // Local structural signal only: confident AND compact (single source
-        // of truth = the G1 routing thresholds).
-        if !(r.confidence > rc.compact_conf && area_frac < rc.compact_frac as f64) {
-            continue;
-        }
-        out.push((
-            (r.bbox.x_min as f64) / page_w,
-            (r.bbox.y_min as f64) / page_h,
-            (r.bbox.x_max as f64) / page_w,
-            (r.bbox.y_max as f64) / page_h,
-            label,
-        ));
-    }
-    out
-}
-
-/// Run the structural check (see [`structural_from_layout`]) on a rendered
-/// PNG. `None` when no layout detector is available or detection fails.
-pub fn g1_structural(
-    layout: Option<&mut LayoutDetector>,
-    png: &[u8],
-    page_area: f64,
-    rc: &RouteConfig,
-) -> Option<bool> {
-    let ld = layout?;
-    let dyn_img = image::load_from_memory(png).ok()?;
-    let mat = rusto::image_impl::Mat::new(dyn_img);
-    let out: LayoutOutput = ld.detect(&mat).ok()?;
-    Some(structural_from_layout(&out.regions, page_area, rc))
-}
-
-/// Run G1 on a rendered PNG. `layout` is the (lazily built) detector; when it
-/// is `None` (no external layout model configured / failed to load) every
-/// OCR page defaults to L1 and G3 may still escalate to L2.
-pub fn g1(
-    layout: Option<&mut LayoutDetector>,
-    png: &[u8],
-    page_area: f64,
-    rc: &RouteConfig,
-) -> Option<Tier> {
-    let ld = layout?;
-    let dyn_img = image::load_from_memory(png).ok()?;
-    let mat = rusto::image_impl::Mat::new(dyn_img);
-    let out: LayoutOutput = ld.detect(&mat).ok()?;
-    Some(route_from_layout(&out.regions, page_area, rc))
-}
-
-/// Apply G3 (the output-level gate) to an L1 engine's result. `chars` is the
-/// engine's output-size signal — the Indra markdown length for the primary
-/// (G3) check, or the PP-OCRv6 line-text total for the fallback (G2) check;
-/// `mean_conf` is the mean per-line confidence. Both applications share the
-/// `[route.g3]` thresholds (only the `chars` signal differs).
-pub fn g3(chars: usize, mean_conf: f32, rc: &RouteConfig) -> G3Verdict {
-    if chars >= rc.g3.min_chars {
-        return G3Verdict::Ok;
-    }
-    if mean_conf < rc.g3.hard_conf {
-        G3Verdict::Hard
-    } else if mean_conf < rc.g3.mid_conf {
-        G3Verdict::Medium
+/// [det] stage (plan §2.1): fewer line boxes than `det_min_lines` => L2 —
+/// a near-image page, escalated before any recognition (the whole rec pass
+/// is saved).
+pub fn chain_det(boxes: usize, rc: &RouteConfig) -> Option<&'static str> {
+    if boxes < rc.chain.det_min_lines {
+        Some(TAG_DET)
     } else {
-        G3Verdict::Ok
+        None
     }
 }
 
-/// Terminal decision for one G1=L1 page in the dual-engine G3 flow (plan
-/// §集成语义, fit §7.2). Pure over engine *results* so the branches are
-/// unit-testable without models: the primary (Indra) is gated by G3 on its
-/// markdown length; a failure runs the PP-OCRv6 fallback at most once, gated
-/// by the same thresholds on its line-text total (the "G2" check); a second
-/// failure escalates to L2.
+/// [script] stage (plan §2.1), evaluated after the pre-pass and BEFORE any
+/// recognition. The first failing criterion wins, in plan order:
+/// cjk fraction / dominant group without a rec variant / unsure fraction.
+/// An empty pre-pass (no lines) never fires — the det stage has already
+/// handled a near-image page.
+pub fn chain_script(sm: &ScriptMetrics, rc: &RouteConfig) -> Option<&'static str> {
+    if sm.n == 0 {
+        return None;
+    }
+    if sm.cjk_frac() >= rc.chain.cjk_line_frac {
+        return Some(TAG_CJK);
+    }
+    if sm.dominant.is_some() && !sm.dominant_has_variant {
+        return Some(TAG_NOVARIANT);
+    }
+    if sm.unsure_frac() >= rc.chain.unsure_line_frac {
+        return Some(TAG_UNSURE);
+    }
+    None
+}
+
+/// [rec] / [assemble] output-level gate — the single source of the two
+/// output criteria (former G3 `hard_conf` / `min_chars`, new semantics:
+/// OR, no char-count precondition on the conf item):
 ///
-/// `fallback`: `None` = no PP-OCRv6 engine (not configured, or init failed,
-/// ¬A_P — escalate with the primary output kept), `Some(Err)` = the fallback
-/// ran but the page failed (same: keep the primary), `Some(Ok)` = its page
-/// result. `Escalate.keep` is the output retained when L2 is unavailable:
-/// the PP output when it produced one, otherwise the primary's.
-#[derive(Debug)]
-pub enum L1Outcome {
-    /// S1a: the primary's output is kept.
-    Primary(OcrPage),
-    /// S1b: the fallback's output is kept (the primary failed G3; PP plain
-    /// text, no Indra tables).
-    Fallback(OcrPage),
-    /// Escalate to L2. `tag` is the fallback gate's `hard`/`medium` verdict;
-    /// `keep` is the output to retain when L2 is unavailable (with a
-    /// "needs a higher-tier OCR model" note, plan line 117).
-    Escalate {
-        tag: &'static str,
-        keep: OcrPage,
-    },
+/// * mean line conf < `rec_hard_conf`        => `conf`
+/// * output characters < `min_chars`         => `chars`
+///
+/// Callers:
+/// * the chain's rec stage passes `chars = usize::MAX` (assemble has not
+///   run yet, so only the conf criterion can fire);
+/// * the chain's assemble stage passes the real markdown length (conf
+///   already passed at the rec stage, so only chars can fire);
+/// * the `use_indra = false` rollback path passes the PP-OCRv6 output's
+///   line-text total and mean conf (the "G2" check).
+pub fn output_gate(chars: usize, mean_conf: f32, rc: &RouteConfig) -> Option<&'static str> {
+    if mean_conf < rc.chain.rec_hard_conf {
+        Some(TAG_CONF)
+    } else if chars < rc.chain.min_chars {
+        Some(TAG_CHARS)
+    } else {
+        None
+    }
 }
 
 /// Output-size signal for the output-level gate: the engine markdown's
@@ -285,260 +124,142 @@ pub fn output_chars(page: &OcrPage) -> usize {
     page.md.as_ref().map_or_else(|| page.char_count(), |m| m.chars().count())
 }
 
-/// Decide the dual-engine G3 flow for one rendered page (see
-/// [`L1Outcome`]). `primary` is the (already successful) Indra result;
-/// `fallback` is the PP-OCRv6 result when it was run (at most once per
-/// page). Logs the fallback decision (page number, trigger criterion, both
-/// engines' char/conf summary) so the route is observable (fit plan §5.2).
-pub fn decide_l1_flow(
-    page1: u32,
-    primary: OcrPage,
-    fallback: Option<Result<OcrPage, String>>,
-    rc: &RouteConfig,
-) -> L1Outcome {
-    let chars = output_chars(&primary);
-    let conf = primary.mean_conf();
-    if g3(chars, conf, rc) == G3Verdict::Ok {
-        return L1Outcome::Primary(primary);
-    }
-    // G3 failed: fall back to PP-OCRv6 (at most once per page).
-    let vtag = if g3(chars, conf, rc) == G3Verdict::Hard { "hard" } else { "medium" };
-    let fb = match fallback {
-        None => {
-            // No PP-OCRv6 engine (¬A_P): escalate, keep the primary output.
-            eprintln!(
-                "[p{page1}] G3 {vtag} (md_chars={chars}, conf={conf:.3}) — no PP-OCRv6 \
-                 fallback — escalating to L2"
-            );
-            return L1Outcome::Escalate {
-                tag: vtag,
-                keep: primary,
-            };
-        }
-        Some(Err(e)) => {
-            // The fallback ran but failed: escalate, keep the primary output.
-            eprintln!(
-                "[p{page1}] G3 {vtag} (md_chars={chars}, conf={conf:.3}); PP-OCRv6 \
-                 fallback failed: {e} — escalating to L2"
-            );
-            return L1Outcome::Escalate {
-                tag: vtag,
-                keep: primary,
-            };
-        }
-        Some(Ok(pp)) => pp,
-    };
-    // G2 (same thresholds, line-text total) on the fallback output.
-    let pc = fb.char_count();
-    let pconf = fb.mean_conf();
-    match g3(pc, pconf, rc) {
-        G3Verdict::Ok => {
-            eprintln!(
-                "[p{page1}] G3 {vtag} (md_chars={chars}, conf={conf:.3}); PP-OCRv6 ok \
-                 (chars={pc}, conf={pconf:.3}) — using PP-OCRv6"
-            );
-            L1Outcome::Fallback(fb)
-        }
-        v @ (G3Verdict::Hard | G3Verdict::Medium) => {
-            let t = if v == G3Verdict::Hard { "hard" } else { "medium" };
-            eprintln!(
-                "[p{page1}] G3 {vtag} (md_chars={chars}, conf={conf:.3}); G2 {t} \
-                 (chars={pc}, conf={pconf:.3}) — escalating to L2"
-            );
-            // Plan line 117: when L2 is unavailable, the retained output is
-            // the PP result (not the primary's).
-            L1Outcome::Escalate { tag: t, keep: fb }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusto::layout::BBox;
-
-    fn region(t: LayoutType, x0: i32, y0: i32, x1: i32, y1: i32, conf: f32) -> LayoutRegion {
-        LayoutRegion {
-            bbox: BBox {
-                x_min: x0,
-                y_min: y0,
-                x_max: x1,
-                y_max: y1,
-            },
-            layout_type: t,
-            confidence: conf,
-        }
-    }
 
     fn rc() -> RouteConfig {
         RouteConfig::default()
     }
 
+    // --- [det] ----------------------------------------------------------
+
     #[test]
-    fn table_caption_always_l2() {
-        let r = region(LayoutType::TableCaption, 10, 10, 50, 60, 0.1);
-        assert_eq!(route_from_layout(&[r], 1000.0, &rc()), Tier::L2);
+    fn det_below_min_escalates() {
+        assert_eq!(chain_det(0, &rc()), Some(TAG_DET));
+        assert_eq!(chain_det(2, &rc()), Some(TAG_DET));
     }
 
     #[test]
-    fn compact_table_l2() {
-        // bbox covers 24% of a 1000x1000 page, conf 0.79
-        let r = region(LayoutType::Table, 100, 100, 500, 700, 0.79);
-        let area = 1000.0 * 1000.0;
-        assert_eq!(route_from_layout(&[r], area, &rc()), Tier::L2);
+    fn det_at_or_above_min_passes() {
+        assert_eq!(chain_det(3, &rc()), None);
+        assert_eq!(chain_det(40, &rc()), None);
     }
 
-    #[test]
-    fn full_page_table_is_not_l2_by_area_rule() {
-        // full-page high-conf table (the known layout false positive on text
-        // pages): frac ~= 1.0 (not < 0.5), so the compact rule does not fire.
-        let r = region(LayoutType::Table, 0, 0, 999, 999, 0.96);
-        let area = 1000.0 * 1000.0;
-        assert_eq!(route_from_layout(&[r], area, &rc()), Tier::L1);
-    }
+    // --- [script] -------------------------------------------------------
 
-    #[test]
-    fn dense_text_blob_l2() {
-        // a TEXT region covering >= 85% of the page with conf >= 0.3
-        let r = region(LayoutType::Text, 0, 0, 960, 900, 0.45);
-        let area = 1000.0 * 1000.0;
-        assert_eq!(route_from_layout(&[r], area, &rc()), Tier::L2);
-    }
-
-    #[test]
-    fn plain_text_page_l1() {
-        // many compact low-conf text bars (normal reading page)
-        let rs: Vec<LayoutRegion> = (0..5)
-            .map(|i| region(LayoutType::Text, 0, i * 200, 900, i * 200 + 150, 0.05))
-            .collect();
-        let area = 1000.0 * 1000.0;
-        assert_eq!(route_from_layout(&rs, area, &rc()), Tier::L1);
-    }
-
-    #[test]
-    fn g3_hard_fail() {
-        // 20 chars (< 60) and mean conf 0.3 (< 0.5) => hard
-        assert_eq!(g3(20, 0.3, &rc()), G3Verdict::Hard);
-    }
-
-    #[test]
-    fn g3_medium_doubt() {
-        // 20 chars (< 60) and mean conf 0.6 (>= 0.5, < 0.75) => medium
-        assert_eq!(g3(20, 0.6, &rc()), G3Verdict::Medium);
-    }
-
-    #[test]
-    fn g3_ok_low_conf_but_enough_chars() {
-        // 500 chars (>= 60) with low conf => ok (high-output low-conf page)
-        assert_eq!(g3(500, 0.2, &rc()), G3Verdict::Ok);
-    }
-
-    #[test]
-    fn g3_ok_enough_chars() {
-        assert_eq!(g3(300, 0.9, &rc()), G3Verdict::Ok);
-    }
-
-    // --- dual-engine G3 flow (plan §集成语义) -----------------------------
-    /// An Indra-style page: markdown of `mdlen` chars, one line at `conf`.
-    fn indra(mdlen: usize, conf: f32) -> OcrPage {
-        OcrPage {
-            lines: vec![OcrLine {
-                text: "x".to_string(),
-                conf,
-                top: 0.0,
-                left: 0.0,
-                width: 0.0,
-                height: 0.0,
-            }],
-            md: Some("x".repeat(mdlen)),
-            blocks: Vec::new(),
+    fn sm(n: usize, cjk: usize, unsure: usize) -> ScriptMetrics {
+        ScriptMetrics {
+            n,
+            cjk,
+            unsure,
+            dominant: Some(if cjk >= n - cjk {
+                "cjk".to_string()
+            } else {
+                "base".to_string()
+            }),
+            dominant_has_variant: true,
         }
     }
-    /// A PP-OCRv6-style page: `nchars` of line text, one line at `conf`.
-    fn pp(nchars: usize, conf: f32) -> OcrPage {
-        OcrPage {
-            lines: vec![OcrLine {
-                text: "y".repeat(nchars),
-                conf,
-                top: 0.0,
-                left: 0.0,
-                width: 0.0,
-                height: 0.0,
-            }],
+
+    #[test]
+    fn script_empty_never_fires() {
+        assert_eq!(chain_script(&ScriptMetrics::default(), &rc()), None);
+    }
+
+    #[test]
+    fn script_cjk_major_escalates() {
+        // 30 of 40 lines cjk (0.75 >= 0.5) => cjk.
+        assert_eq!(chain_script(&sm(40, 30, 0), &rc()), Some(TAG_CJK));
+        // exactly half (0.5 >= 0.5) still fires.
+        assert_eq!(chain_script(&sm(40, 20, 0), &rc()), Some(TAG_CJK));
+        // English-major with a Chinese paragraph (10/40 = 0.25) stays L1.
+        assert_eq!(chain_script(&sm(40, 10, 0), &rc()), None);
+    }
+
+    #[test]
+    fn script_novariant_escalates() {
+        let mut s = sm(40, 0, 0);
+        s.dominant = Some("math".to_string());
+        s.dominant_has_variant = false;
+        assert_eq!(chain_script(&s, &rc()), Some(TAG_NOVARIANT));
+    }
+
+    #[test]
+    fn script_unsure_major_escalates() {
+        // 20 of 40 unsure (0.5 >= 0.5) => unsure (cjk is low).
+        assert_eq!(chain_script(&sm(40, 0, 20), &rc()), Some(TAG_UNSURE));
+        // 19/40 stays L1.
+        assert_eq!(chain_script(&sm(40, 0, 19), &rc()), None);
+    }
+
+    #[test]
+    fn script_cjk_wins_over_unsure() {
+        // both fire: the plan order puts cjk first.
+        assert_eq!(chain_script(&sm(40, 30, 30), &rc()), Some(TAG_CJK));
+    }
+
+    // --- [rec] / [assemble] output gate ---------------------------------
+
+    #[test]
+    fn gate_low_conf_escalates() {
+        // mean conf 0.4 (< 0.5) escalates regardless of output size
+        // (former G3 required chars < min_chars first; that precondition is
+        // gone).
+        assert_eq!(output_gate(5000, 0.4, &rc()), Some(TAG_CONF));
+        // usize::MAX keeps only the conf criterion live (chain rec stage).
+        assert_eq!(
+            output_gate(usize::MAX, 0.4, &rc()),
+            Some(TAG_CONF)
+        );
+    }
+
+    #[test]
+    fn gate_low_conf_but_long_output_escalates() {
+        // high-output low-conf page: the former G3 said Ok, the chain says
+        // conf (plan §2.1: mean_conf < 0.5 with no char precondition).
+        assert_eq!(output_gate(5000, 0.3, &rc()), Some(TAG_CONF));
+    }
+
+    #[test]
+    fn gate_short_output_escalates() {
+        // 20 chars (< 60), healthy conf => chars.
+        assert_eq!(output_gate(20, 0.9, &rc()), Some(TAG_CHARS));
+        assert_eq!(output_gate(0, 0.9, &rc()), Some(TAG_CHARS));
+    }
+
+    #[test]
+    fn gate_conf_wins_over_chars() {
+        // both fire: the gate checks conf first (the chain evaluates the
+        // conf criterion at the earlier rec stage).
+        assert_eq!(output_gate(20, 0.3, &rc()), Some(TAG_CONF));
+    }
+
+    #[test]
+    fn gate_healthy_passes() {
+        assert_eq!(output_gate(300, 0.9, &rc()), None);
+        assert_eq!(output_gate(60, 0.5, &rc()), None);
+        // boundaries: conf exactly 0.5 passes (criterion is `<`), chars
+        // exactly 60 passes.
+    }
+
+    // --- output_chars ---------------------------------------------------
+
+    #[test]
+    fn output_chars_prefers_markdown() {
+        let p = OcrPage {
+            lines: vec![],
+            md: Some("abcd".to_string()),
+            blocks: Vec::new(),
+            escalate_l2: None,
+        };
+        assert_eq!(output_chars(&p), 4);
+        let q = OcrPage {
+            lines: vec![],
             md: None,
             blocks: Vec::new(),
-        }
-    }
-
-    // S1a: G3 passes on the primary markdown → keep the Indra output.
-    #[test]
-    fn flow_s1a_primary_passes() {
-        let out = decide_l1_flow(1, indra(500, 0.9), None, &rc());
-        assert!(matches!(out, L1Outcome::Primary(_)));
-    }
-
-    // S1b: G3 fails on a short/low-conf primary, PP passes → PP output kept.
-    #[test]
-    fn flow_s1b_fallback() {
-        let out =
-            decide_l1_flow(1, indra(20, 0.3), Some(Ok(pp(200, 0.9))), &rc());
-        match out {
-            L1Outcome::Fallback(p) => assert_eq!(p.char_count(), 200),
-            other => panic!("expected Fallback, got {other:?}"),
-        }
-    }
-
-    // ¬A_P: G3 fails and there is no PP engine → escalate, keep the primary.
-    #[test]
-    fn flow_no_fallback_escalates_keep_primary() {
-        let out = decide_l1_flow(1, indra(20, 0.3), None, &rc());
-        match out {
-            L1Outcome::Escalate { tag, keep } => {
-                assert_eq!(tag, "hard");
-                assert_eq!(keep.md.as_deref(), Some("x".repeat(20).as_str()));
-            }
-            other => panic!("expected Escalate, got {other:?}"),
-        }
-    }
-
-    // G2 re-fail: PP ran but its output also fails → escalate, keep the PP.
-    #[test]
-    fn flow_g2_refail_escalates_keep_pp() {
-        let out =
-            decide_l1_flow(1, indra(20, 0.3), Some(Ok(pp(10, 0.2))), &rc());
-        match out {
-            L1Outcome::Escalate { tag, keep } => {
-                assert_eq!(tag, "hard");
-                // keep is the PP output (plan line 117), not the primary.
-                assert_eq!(keep.char_count(), 10);
-                assert!(keep.md.is_none());
-            }
-            other => panic!("expected Escalate, got {other:?}"),
-        }
-    }
-
-    // PP ran but errored → escalate, keep the primary.
-    #[test]
-    fn flow_fallback_error_escalates_keep_primary() {
-        let out = decide_l1_flow(
-            1,
-            indra(20, 0.6),
-            Some(Err("boom".to_string())),
-            &rc(),
-        );
-        match out {
-            L1Outcome::Escalate { tag, keep } => {
-                assert_eq!(tag, "medium");
-                assert_eq!(keep.md.as_deref(), Some("x".repeat(20).as_str()));
-            }
-            other => panic!("expected Escalate, got {other:?}"),
-        }
-    }
-
-    // output_chars: the engine markdown length wins over the line-text total.
-    #[test]
-    fn output_chars_prefers_md() {
-        assert_eq!(output_chars(&indra(123, 0.9)), 123);
-        assert_eq!(output_chars(&pp(77, 0.9)), 77);
+            escalate_l2: None,
+        };
+        assert_eq!(output_chars(&q), 0);
     }
 }

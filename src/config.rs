@@ -4,11 +4,13 @@
 //!
 //! The config is the single source that locates the external pieces:
 //!
-//! * L1 layout model (external ONNX, not embedded)
-//! * L2 VLM service (a llama-server wrapper, e.g. `docs2md-l2d`)
+//! * the layout model (external ONNX, not embedded — the optional
+//!   `--blocks` relabeling only; it takes part in no routing decision)
+//! * the VLM service (an OpenAI-compatible llama-server, e.g. `docs2md-l2d`
+//!   — the end of the cascade)
 //!
-//! Everything else (L0 native extraction, L1 embedded PP-OCRv6-small OCR)
-//! is self-contained in the binary.
+//! Everything else (L0 native extraction, L1 Indra, L2 embedded
+//! PP-OCRv6-small) is self-contained in the binary.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -112,51 +114,52 @@ impl Default for L2Config {
     }
 }
 
+/// L1→L2 serial metric chain thresholds (plan §2.1, calibrated on the
+/// 623-page fixture corpus; operational parameters, therefore configurable
+/// and not hardcoded). The chain is evaluated as the indra pipeline
+/// advances — after det, after the script pre-pass, after rec, after
+/// assemble — and the first hit stops the pipeline and escalates the page
+/// to L2 (PP-OCRv6).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
-    /// G3 output-level fallback thresholds (calibrated on the 623-page
-    /// fixture corpus; see the indra/PP-OCRv6 fit plan). These are the
-    /// "operational parameters" and are therefore configurable, not
-    /// hardcoded.
-    pub g3: G3Thresholds,
-    /// G1 compact-complex-region area fraction (bbox covers < this fraction
-    /// of the page and conf > compact_conf ⇒ L2).
-    pub compact_frac: f32,
-    pub compact_conf: f32,
-    /// G1 dense-text-blob thresholds (a TEXT region covering >= dense_frac
-    /// of the page with conf >= dense_conf ⇒ L2).
-    pub dense_frac: f32,
-    pub dense_conf: f32,
+    pub chain: ChainConfig,
 }
 impl Default for RouteConfig {
     fn default() -> Self {
         Self {
-            g3: G3Thresholds::default(),
-            compact_frac: 0.5,
-            compact_conf: 0.4,
-            dense_frac: 0.85,
-            dense_conf: 0.3,
+            chain: ChainConfig::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct G3Thresholds {
-    /// Minimum markdown characters for a page to be considered "has output".
+pub struct ChainConfig {
+    /// [det] fewer line boxes than this => L2 (a near-image page; saves the
+    /// whole recognition pass).
+    pub det_min_lines: usize,
+    /// [script] cjk line fraction >= this => L2 (a Chinese-major page goes
+    /// to the engine that reads Chinese better: PP-OCRv6).
+    pub cjk_line_frac: f32,
+    /// [script] unsure (double-read) line fraction >= this => L2 (the
+    /// recognizer itself is uncertain on half the lines).
+    pub unsure_line_frac: f32,
+    /// [rec] mean line conf below this => L2 (unreliable reading; the former
+    /// G3 `hard_conf`, now without the char-count precondition).
+    pub rec_hard_conf: f32,
+    /// [assemble] output characters below this => L2 (almost nothing read;
+    /// the former G3 `min_chars`).
     pub min_chars: usize,
-    /// mean line conf below this (with low char count) ⇒ hard fail.
-    pub hard_conf: f32,
-    /// mean line conf below this (with low char count) ⇒ medium doubt.
-    pub mid_conf: f32,
 }
-impl Default for G3Thresholds {
+impl Default for ChainConfig {
     fn default() -> Self {
         Self {
+            det_min_lines: 3,
+            cjk_line_frac: 0.5,
+            unsure_line_frac: 0.5,
+            rec_hard_conf: 0.5,
             min_chars: 60,
-            hard_conf: 0.5,
-            mid_conf: 0.75,
         }
     }
 }

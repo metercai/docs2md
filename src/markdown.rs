@@ -37,6 +37,23 @@ pub fn ocr_lines_to_markdown(lines: &[OcrLine]) -> String {
 pub const NEEDS_HIGHER_NOTE: &str =
     "<!-- needs a higher-tier OCR model: L2 service unavailable -->\n";
 
+/// The explicit low-confidence marker emitted as a page's markdown when the
+/// local cascade produced no usable output (the L1 serial chain hit early
+/// and L2 / PP-OCRv6 read nothing): an explicit, non-empty note so the page
+/// is never silently empty (plan G; the VLM end of the cascade lands in
+/// Task 4).
+pub const LOW_CONF_MARKER: &str =
+    "<!-- low confidence: the OCR chain escalated this page to L2 \
+         (PP-OCRv6) and no usable output was produced -->\n";
+
+/// The note attached to a chain-escalated page whose L2 (PP-OCRv6) read
+/// nothing, so the (possibly partial) L1 output stands as the page's
+/// best-effort markdown.
+pub const KEEP_L1_NOTE: &str =
+    "<!-- needs a higher-tier OCR model: the serial chain escalated this \
+         page to L2 (PP-OCRv6) but it read nothing — keeping the L1 \
+         best-effort output -->\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;

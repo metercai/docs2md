@@ -33,7 +33,8 @@ fn p9_ocr_page_perf() {
         return;
     }
     let mut engine = IndraEngine::init().expect("indra init");
-    let mut ms: Vec<u128> = Vec::new();
+    let rc = docs2md::config::RouteConfig::default();
+    let mut ms: Vec<u128> = Vec::with_capacity(520);
     for doc in DOCS {
         let files: Vec<String> = std::fs::read_dir(dir)
             .expect("pages dir")
@@ -55,7 +56,7 @@ fn p9_ocr_page_perf() {
                 data: img.as_raw().to_vec(),
             };
             let t0 = std::time::Instant::now();
-            let page = engine.ocr_page(&gray).expect("ocr_page");
+            let page = engine.ocr_page(&gray, &rc).expect("ocr_page");
             let dt = t0.elapsed();
             ms.push(dt.as_millis());
             let _ = page.char_count();

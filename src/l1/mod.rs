@@ -50,10 +50,25 @@ pub struct OcrPage {
     /// layout structure — PP-OCRv6 today). A new output surface: it does not
     /// affect markdown bytes or routing.
     pub blocks: Vec<Block>,
+    /// The serial metric chain hit during this page's pipeline run
+    /// (plan §2.1): `None` = the chain passed, the L1 output stands;
+    /// `Some(tag)` = the chain stopped at stage `tag`
+    /// ("det" | "cjk" | "novariant" | "unsure" | "conf" | "chars") and the
+    /// orchestrator escalates the page to L2 (PP-OCRv6). The `lines`/`md`
+    /// carried with it are the (possibly partial) L1 output kept as the
+    /// low-confidence fallback (the G no-empty-page guarantee).
+    pub escalate_l2: Option<&'static str>,
 }
 
 impl OcrPage {
-    /// Total visible characters (the G3 `min_chars` signal).
+    /// Tag the page with the chain stage that stopped it (plan §2.1). The
+    /// orchestrator reads this to escalate the page to L2 (PP-OCRv6).
+    pub fn with_escalate(mut self, tag: Option<&'static str>) -> Self {
+        self.escalate_l2 = tag;
+        self
+    }
+
+    /// Total visible characters (the chain's chars signal).
     pub fn char_count(&self) -> usize {
         self.lines.iter().map(|l| l.text.chars().count()).sum()
     }
@@ -73,8 +88,14 @@ impl OcrPage {
 pub trait L1Engine: Send {
     /// Name for logs / provenance.
     fn name(&self) -> &str;
-    /// Recognize one rendered page (PNG bytes, pixel y-down).
-    fn ocr_page(&mut self, png: &[u8]) -> Result<OcrPage, String>;
+    /// Recognize one rendered page (PNG bytes, pixel y-down). `rc` carries
+    /// the routing thresholds — the Indra engine evaluates the L1→L2 serial
+    /// metric chain (plan §2.1) against it; PP-OCRv6 ignores it.
+    fn ocr_page(
+        &mut self,
+        png: &[u8],
+        rc: &crate::config::RouteConfig,
+    ) -> Result<OcrPage, String>;
 }
 
 /// PP-OCRv6 engine (embedded `small` by default).
@@ -88,7 +109,11 @@ impl L1Engine for PpOcrEngine {
         &self.tier
     }
 
-    fn ocr_page(&mut self, png: &[u8]) -> Result<OcrPage, String> {
+    fn ocr_page(
+        &mut self,
+        png: &[u8],
+        _rc: &crate::config::RouteConfig,
+    ) -> Result<OcrPage, String> {
         use rusto::{DetectTextResult, ImageSource};
         let det = self
             .ocr
@@ -112,6 +137,7 @@ impl L1Engine for PpOcrEngine {
             lines,
             md: None,
             blocks: Vec::new(), // PP-OCRv6 emits no layout structure
+            escalate_l2: None,
         })
     }
 }
@@ -199,9 +225,13 @@ impl L1Engine for IndraEngine {
         "indra"
     }
 
-    fn ocr_page(&mut self, png: &[u8]) -> Result<OcrPage, String> {
+    fn ocr_page(
+        &mut self,
+        png: &[u8],
+        rc: &crate::config::RouteConfig,
+    ) -> Result<OcrPage, String> {
         let gray = indra::preproc::Gray::from_png(png)?;
-        self.engine.ocr_page(&gray)
+        self.engine.ocr_page(&gray, rc)
     }
 }
 

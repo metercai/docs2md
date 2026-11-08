@@ -1,19 +1,22 @@
-//! P8 gate: dual-engine G3 integration smoke on the 32-page stratified
-//! sample (plan §P8; the 623-page histogram + determinism + performance
-//! live in P9).
+//! P8 gate: serial-chain integration smoke on the 32-page stratified
+//! sample (the 623-page histogram + determinism + performance live in P9).
 //!
 //! A. 32/32 pages: the full `ocr_page` pipeline (preview -> skew -> orient
-//!    -> detect -> recognize -> assemble -> markdown + table post-filter)
-//!    runs without error and yields one terminal verdict per page (no dead
-//!    state).
+//!    -> detect -> [det] chain stage -> script pre-pass -> [script] chain
+//!    stage -> recognize -> [rec] conf stage -> assemble -> [assemble]
+//!    chars stage -> markdown + table post-filter) runs without error and
+//!    yields one terminal outcome per page (no dead state): either the chain
+//!    passed, or it stopped at a stage and tagged the page `escalate_l2`.
 //! B. md cross-check: per-page 2-gram Dice vs the Python reference markdown
 //!    (tests/p1/ref/*.md.json). The table post-filter is new logic (Python
 //!    has none; unit-tested in the lib), and the reference md is pre-filter —
 //!    a page whose whole-form pseudo-table the post-filter demotes is a
 //!    structural divergence. So: non-demoted pages must hit Dice >= 0.95;
-//!    demoted pages are reported, not failed.
+//!    demoted pages are reported, not failed. Chain-escalated pages carry
+//!    the (possibly partial) L1 output — reported, not failed.
 //! C. S1b reachability: the three dark-background CJK pages (29/30/31) must
-//!    fail G3 (the known fallback samples, plan §全状态覆盖验收).
+//!    be escalated by the serial chain (the known fallback samples,
+//!    plan §全状态覆盖验收).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,7 +26,6 @@ use image::ImageReader;
 use docs2md::l1::indra::preproc::Gray;
 use docs2md::l1::indra::IndraEngine;
 use docs2md::l1::OcrPage;
-use docs2md::route::{g3, output_chars, G3Verdict};
 
 const REF_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/p1");
 const GATE_DICE: f64 = 0.95;
@@ -84,8 +86,10 @@ fn p8_gate_32_pages() {
     let sample_paths = samples();
     assert_eq!(sample_paths.len(), 32, "32 stratified sample pages");
 
-    // A: one full pipeline run; every page must terminate (no dead state).
+    // A: one full pipeline run; every page must terminate (no dead state) —
+    // chain-passed or tagged at a chain stage, never neither.
     let mut engine = IndraEngine::init().expect("indra init");
+    let rc = docs2md::config::RouteConfig::default();
     let mut pages: Vec<(String, OcrPage)> = Vec::with_capacity(sample_paths.len());
     for sp in &sample_paths {
         let tag = tag_of(sp);
@@ -100,40 +104,47 @@ fn p8_gate_32_pages() {
             data: upright.as_raw().to_vec(),
         };
         let page = engine
-            .ocr_page(&gray)
+            .ocr_page(&gray, &rc)
             .unwrap_or_else(|e| panic!("{tag}: ocr_page failed: {e}"));
         pages.push((tag.to_string(), page));
     }
-    assert_eq!(pages.len(), 32, "all 32 pages must produce a terminal verdict");
+    assert_eq!(pages.len(), 32, "all 32 pages must produce a terminal outcome");
+    let escalated: Vec<&String> = pages
+        .iter()
+        .filter(|(_, p)| p.escalate_l2.is_some())
+        .map(|(t, _)| t)
+        .collect();
+    eprintln!("P8 chain escalations: {escalated:?}");
 
     // B: md cross-check vs the Python reference (all 32 have a reference).
-    // Non-demoted pages: dice must hit GATE_DICE. Demoted pages (reference
-    // keeps the <table> html, Rust demotes it to plain text): reported only.
+    // Non-demoted, non-escalated pages: dice must hit GATE_DICE. Demoted
+    // pages (reference keeps the <table> html, Rust demotes it to plain
+    // text): reported only. Chain-escalated pages carry the (possibly
+    // partial) L1 output: reported only.
     let mut dice_sum = 0.0f64;
     let mut non_demoted_worst = (1.0f64, String::new());
-    let mut below_gate_non_demoted: Vec<String> = Vec::new();
-    let mut demoted_recs: Vec<String> = Vec::new();
+    let mut below_gate: Vec<String> = Vec::new();
+    let mut reported: Vec<String> = Vec::new();
     for (tag, page) in &pages {
         let want = ref_md(tag).expect("reference md.json for every sample");
         let got = page.md.as_deref().unwrap_or("");
         let d = dice2(got, &want);
         dice_sum += d;
         let demoted = !got.contains("<table") && want.contains("<table");
-        if demoted {
-            demoted_recs.push(format!(
-                "{tag} dice {d:.4} (md_chars={} ref_chars={})",
+        if demoted || page.escalate_l2.is_some() {
+            reported.push(format!(
+                "{tag} dice {d:.4} (md_chars={} ref_chars={} escalate={:?})",
                 got.chars().count(),
-                want.chars().count()
+                want.chars().count(),
+                page.escalate_l2
             ));
-        }
-        if demoted {
             continue;
         }
         if d < non_demoted_worst.0 {
             non_demoted_worst = (d, tag.clone());
         }
         if d < GATE_DICE {
-            below_gate_non_demoted.push(format!(
+            below_gate.push(format!(
                 "{tag} dice {d:.4} (md_chars={} ref_chars={})",
                 got.chars().count(),
                 want.chars().count()
@@ -141,35 +152,37 @@ fn p8_gate_32_pages() {
         }
     }
     assert!(
-        below_gate_non_demoted.is_empty(),
-        "non-demoted pages below {GATE_DICE}: {below_gate_non_demoted:?}"
+        below_gate.is_empty(),
+        "pages below {GATE_DICE}: {below_gate:?}"
     );
 
-    // C: the three dark-background CJK pages must fail G3 (S1b reachable).
+    // C: the three dark-background CJK pages must be escalated by the
+    // serial chain (S1b reachable).
     let dark = [
         "29_扫描文件_2025050_p0",
         "30_扫描文件_2025050_p1",
         "31_扫描文件_2025050_p2",
     ];
-    let rc = docs2md::config::RouteConfig::default();
     for (tag, page) in &pages {
         if !dark.contains(&tag.as_str()) {
             continue;
         }
-        let chars = output_chars(page);
+        let chars = page.char_count();
         let conf = page.mean_conf();
-        let v = g3(chars, conf, &rc);
         assert!(
-            v != G3Verdict::Ok,
-            "{tag}: expected G3 to fail (S1b known sample), got Ok \
-             (md_chars={chars}, conf={conf:.3}) — fallback unreachable"
+            page.escalate_l2.is_some(),
+            "{tag}: expected the serial chain to escalate (S1b known sample), \
+             got chain-passed (md_chars={chars}, conf={conf:.3}) — fallback unreachable"
         );
-        eprintln!("{tag}: G3 {v:?} (md_chars={chars}, conf={conf:.3}) — S1b reachable");
+        eprintln!(
+            "{tag}: chain:{:?} (md_chars={chars}, conf={conf:.3}) — S1b reachable",
+            page.escalate_l2
+        );
     }
 
     println!(
         "P8 gate: pages_ok=32/32 md_compared=32 mean_dice={:.4} \
-         non_demoted_worst={} ({:.4}) demoted={demoted_recs:?}",
+         non_demoted_worst={} ({:.4}) reported={reported:?} escalated={escalated:?}",
         dice_sum / 32.0,
         non_demoted_worst.1,
         non_demoted_worst.0

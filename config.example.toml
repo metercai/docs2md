@@ -48,25 +48,24 @@ health_check = true
 # Seconds to keep probing /health through the 503 "Loading model" window.
 health_wait_secs = 30
 
-# ── Routing thresholds (calibrated on the 623-page fixture corpus) ──────
-[route]
-# G3 output-level fallback (per the indra/PP-OCRv6 fit plan). Applied to the
-# primary (Indra) result on its markdown length, and to the PP-OCRv6
-# fallback on its line-text total:
-#   hard fail    when chars < min_chars AND mean line conf < hard_conf
-#   medium doubt when chars < min_chars AND mean line conf < mid_conf
-[route.g3]
+# ── L1→L2 serial metric chain (plan §2.1, calibrated on the 623-page
+#    fixture corpus) ─────────────────────────────────────────────────────
+# The chain is evaluated as the Indra pipeline advances and the first hit
+# escalates the page to L2 (PP-OCRv6) on the same rendered image.
+[route.chain]
+# [det] fewer line boxes than this => L2 (a near-image page; saves the
+# whole recognition pass).
+det_min_lines = 3
+# [script] cjk line fraction >= this => L2 (a Chinese-major page goes to
+# the engine that reads Chinese better: PP-OCRv6).
+cjk_line_frac = 0.5
+# [script] unsure (double-read) line fraction >= this => L2 (the
+# recognizer itself is uncertain on half the lines).
+unsure_line_frac = 0.5
+# [rec] mean line conf below this => L2 (unreliable reading).
+rec_hard_conf = 0.5
+# [assemble] output characters below this => L2 (almost nothing read).
 min_chars = 60
-hard_conf = 0.5
-mid_conf = 0.75
-# G1 compact-complex-region: a table/figure/equation whose bbox covers
-# < compact_frac of the page and conf > compact_conf => L2.
-compact_frac = 0.5
-compact_conf = 0.4
-# G1 dense-text-blob: a TEXT region covering >= dense_frac of the page with
-# conf >= dense_conf => L2.
-dense_frac = 0.85
-dense_conf = 0.3
 
 # ── Output ──────────────────────────────────────────────────────────────
 [output]

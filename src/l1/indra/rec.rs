@@ -56,20 +56,23 @@ const BATCH_MIN_W: i32 = 64;
 const BATCH_MAX_AREA: i32 = 64 * 640;
 
 /// Per-line script-group routing (port of pipeline.line_groups): the group
-/// whose recognizer reads the line and whether the classifier is sure of it
-/// (max probability over `ROUTE_SURE`). `names` follows `crops` order. A group
-/// without its recognizer is read by base.
+/// whose recognizer reads the line, whether the classifier is sure of it
+/// (max probability over `ROUTE_SURE`), and the raw classifier argmax (the
+/// script class BEFORE the "no rec variant for it" fallback to base).
+/// `names` follows `crops` order. A group without its recognizer is read by
+/// base.
 pub fn line_groups(
     script: &Session,
     crops: &[InkMap],
     script_groups: &[String],
     group_names: &[&str],
-) -> (Vec<String>, Vec<bool>) {
+) -> (Vec<String>, Vec<bool>, Vec<String>) {
     let n = crops.len();
     let mut out = vec!["base".to_string(); n];
     let mut sure = vec![true; n];
+    let mut raw = vec!["base".to_string(); n];
     if n == 0 {
-        return (out, sure);
+        return (out, sure, raw);
     }
     let widths: Vec<i32> = crops.iter().map(|c| c.w as i32).collect();
     for part in preproc::width_batches(&widths, BATCH_MAX, BATCH_RATIO, BATCH_MIN_W, BATCH_MAX_AREA)
@@ -111,6 +114,7 @@ pub fn line_groups(
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap();
             let g = script_groups.get(ai).map(|s| s.as_str()).unwrap_or("base");
+            raw[j] = g.to_string();
             out[j] = if group_names.contains(&g) {
                 g.to_string()
             } else {
@@ -119,61 +123,188 @@ pub fn line_groups(
             sure[j] = *pk > ROUTE_SURE;
         }
     }
-    (out, sure)
+    (out, sure, raw)
 }
 
-/// Greedy recognition of pre-cropped lines (port of the pipeline.recognize
-/// core): `crops` = window-1 crops (group recognizers + the script
-/// classifier), `tall` = window-`rec_window` crops (the base recognizer),
-/// `boxes` = line boxes in page pixels (for the token x mapping). `vertical`:
-/// the page is a vertical one turned a quarter turn — every line goes to the
-/// CJK recognizer. Returns one `Line` per crop.
-pub fn recognize_crops(
+/// The script pre-pass (plan §2.1): the line crops (window-1 for the group
+/// recognizers + the script classifier, window-`rec_window` for the base
+/// recognizer) plus the per-line script routing, computed ONCE per page. It
+/// is the pre-pass `recognize_crops` used to run internally; lifting it out
+/// lets the L1→L2 chain evaluate the script-stage criteria (cjk / unsure /
+/// no-rec-variant line fractions) BEFORE any recognition, so a page that
+/// escalates at the script stage saves the whole recognition pass.
+pub struct RouteScript {
+    /// Window-1 crops (group recognizers + the script classifier).
+    pub crops: Vec<InkMap>,
+    /// Window-`rec_window` crops (the base recognizer); the window-1 crops
+    /// when `rec_window == 1`.
+    pub tall: Vec<InkMap>,
+    /// The page is a vertical one turned a quarter turn (every line is CJK).
+    pub vertical: bool,
+    /// Per-line routed group (base fallback already applied; the vertical
+    /// page is all "cjk").
+    pub names: Vec<String>,
+    /// Per-line classifier-sure flag (vertical page: all sure).
+    pub sure: Vec<bool>,
+    /// Per-line raw classifier argmax (before the base fallback): the
+    /// "no rec variant" chain criterion reads this.
+    pub raw: Vec<String>,
+}
+
+impl RouteScript {
+    /// The chain's [script]-stage metrics (plan §2.1), per-line counts over
+    /// the RAW classifier argmax (before the base fallback — the chain asks
+    /// "what script does this page have", not "which recognizer runs").
+    /// `loaded`: the script groups this build has a rec variant for
+    /// (`engine.rec.keys()`); base always counts as loaded.
+    pub fn metrics(&self, loaded: &[&str]) -> crate::route::ScriptMetrics {
+        let n = self.raw.len();
+        let cjk = self.raw.iter().filter(|g| g.as_str() == "cjk").count();
+        let unsure = self.sure.iter().filter(|&s| !s).count();
+        // dominant: mode of the raw argmax (BTreeMap key order gives a
+        // deterministic alphabetical tie-break).
+        let mut dominant: Option<String> = None;
+        if n > 0 {
+            let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for g in &self.raw {
+                *counts.entry(g.as_str()).or_insert(0) += 1;
+            }
+            dominant = counts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                .map(|(g, _)| g.to_string());
+        }
+        let dominant_has_variant = dominant
+            .as_deref()
+            .map(|d| d == "base" || loaded.contains(&d))
+            .unwrap_or(true);
+        crate::route::ScriptMetrics {
+            n,
+            cjk,
+            unsure,
+            dominant,
+            dominant_has_variant,
+        }
+    }
+}
+
+/// Run the script pre-pass for one page (crop + route). See [`RouteScript`].
+pub fn route_script(
     engine: &IndraEngine,
-    crops: &[InkMap],
-    tall: &[InkMap],
+    gray: &Gray,
     boxes: &[[f64; 4]],
     vertical: bool,
-) -> Vec<Line> {
+) -> RouteScript {
+    let n = boxes.len();
+    let height = engine.meta.rec_height as usize;
+    let window = engine.meta.rec_window.max(1) as usize;
+    let dark: Vec<Option<bool>> = boxes
+        .iter()
+        .map(|b| Some(preproc::is_dark_line(gray, *b)))
+        .collect();
+    let crop = |win: usize| -> Vec<InkMap> {
+        boxes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                preproc::crop_line(
+                    gray,
+                    *b,
+                    height,
+                    preproc::PAD_Y,
+                    preproc::PAD_X,
+                    4096,
+                    win,
+                    dark[i],
+                )
+            })
+            .collect()
+    };
+    let crops = crop(1);
+    let tall = if window > 1 { crop(window) } else { crops.clone() };
+    let group_names: Vec<&str> = engine
+        .meta
+        .script_groups
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|g| *g != "base" && engine.rec.contains_key(*g))
+        .collect();
+    let (names, sure, raw) = if n == 0 {
+        (vec![], vec![], vec![])
+    } else if vertical && group_names.contains(&"cjk") {
+        // A vertical page's lines are CJK columns (characters on their
+        // side): the CJK recognizer reads all of them. The chain sees this
+        // as a 100 % cjk page (plan §2.1 vertical boundary).
+        (
+            vec!["cjk".to_string(); n],
+            vec![true; n],
+            vec!["cjk".to_string(); n],
+        )
+    } else {
+        line_groups(
+            &engine.script,
+            &crops,
+            &engine.meta.script_groups,
+            &group_names,
+        )
+    };
+    RouteScript {
+        crops,
+        tall,
+        vertical,
+        names,
+        sure,
+        raw,
+    }
+}
+
+/// Greedy recognition of a page's pre-routed lines (port of the
+/// pipeline.recognize core): `rs` is the [`route_script`] pre-pass output,
+/// `boxes` the line boxes in page pixels (for the token x mapping). Returns
+/// one `Line` per crop.
+pub fn recognize_groups(engine: &IndraEngine, rs: &RouteScript, boxes: &[[f64; 4]]) -> Vec<Line> {
+    let crops = &rs.crops;
+    let tall = &rs.tall;
     let n = crops.len();
     let mut out: Vec<Option<Line>> = vec![None; n];
     let mut best_conf = vec![-1.0f32; n];
     if n == 0 {
         return vec![];
     }
-    // The group recognizers (everything but base), in script class order.
-    let group_names: Vec<&str> = engine
-        .meta
-        .script_groups
+    // The group recognizers (everything but base, and only the ones this
+    // build actually has loaded — a group without its recognizer must not be
+    // scheduled, its lines are already base-routed).
+    let group_names: Vec<&str> = rs
+        .names
         .iter()
-        .map(|s| s.as_str())
-        .filter(|g| *g != "base")
-        .collect();
+        .filter(|g| g.as_str() != "base" && engine.rec.contains_key(g.as_str()))
+        .fold(Vec::new(), |mut v, g| {
+            if !v.contains(&g.as_str()) {
+                v.push(g.as_str());
+            }
+            v
+        });
 
     // A vertical page's lines are CJK columns (characters on their side); the
     // CJK recognizer reads all of them (recognize: vertical branch). Otherwise
-    // the script classifier routes each line.
-    let groups: Vec<(&str, Vec<usize>, bool)> = if vertical && group_names.contains(&"cjk") {
-        vec![("cjk", (0..n).collect(), false)]
-    } else {
-        let (names, sure) = line_groups(
-            &engine.script,
-            crops,
-            &engine.meta.script_groups,
-            &group_names,
-        );
-        // Grouping exactly as recognize(): base reads its own group's
-        // lines plus every line the classifier is UNSURE about (read from
-        // the tall crops); each group recognizer reads only the lines
-        // routed to it (window-1).
-        let base_sel: Vec<usize> = (0..n).filter(|&j| names[j] == "base" || !sure[j]).collect();
-        let mut g = vec![("base", base_sel, true)];
-        for gn in &group_names {
-            let sel: Vec<usize> = (0..n).filter(|&j| names[j] == *gn).collect();
-            g.push((gn, sel, false));
-        }
-        g
-    };
+    // the script pre-pass routes each line.
+    let groups: Vec<(&str, Vec<usize>, bool)> =
+        if rs.vertical && group_names.contains(&"cjk") {
+            vec![("cjk", (0..n).collect(), false)]
+        } else {
+            // Grouping exactly as recognize(): base reads its own group's
+            // lines plus every line the pre-pass marked UNSURE (read from
+            // the tall crops); each group recognizer reads only the lines
+            // routed to it (window-1).
+            let base_sel: Vec<usize> =
+                (0..n).filter(|&j| rs.names[j] == "base" || !rs.sure[j]).collect();
+            let mut g = vec![("base", base_sel, true)];
+            for gn in &group_names {
+                let sel: Vec<usize> = (0..n).filter(|&j| rs.names[j] == *gn).collect();
+                g.push((gn, sel, false));
+            }
+            g
+        };
 
     for (gname, sel, use_tall) in groups {
         if sel.is_empty() {
@@ -367,51 +498,23 @@ pub fn recognize_crops(
         .collect()
 }
 
-/// Product path (port of pipeline.recognize): crop each line box from the
-/// page (window-1 for the groups, window-`rec_window` for base, dark-on-light
-/// detected once per box), then the greedy reading. `vertical`: the page is a
-/// vertical one turned a quarter turn (every line to the CJK recognizer).
+/// Product path (port of pipeline.recognize): the script pre-pass
+/// ([`route_script`]: crop each line box from the page — window-1 for the
+/// groups, window-`rec_window` for base, dark-on-light detected once per box
+/// — plus the per-line script routing), then the greedy reading.
+/// `vertical`: the page is a vertical one turned a quarter turn (every line
+/// to the CJK recognizer).
 pub fn recognize(
     engine: &IndraEngine,
     gray: &Gray,
     boxes: &[[f64; 4]],
     vertical: bool,
 ) -> Vec<Line> {
-    let n = boxes.len();
-    if n == 0 {
+    if boxes.is_empty() {
         return vec![];
     }
-    let height = engine.meta.rec_height as usize;
-    let window = engine.meta.rec_window.max(1) as usize;
-    let dark: Vec<Option<bool>> = boxes
-        .iter()
-        .map(|b| Some(preproc::is_dark_line(gray, *b)))
-        .collect();
-    let crop = |win: usize| -> Vec<InkMap> {
-        boxes
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                preproc::crop_line(
-                    gray,
-                    *b,
-                    height,
-                    preproc::PAD_Y,
-                    preproc::PAD_X,
-                    4096,
-                    win,
-                    dark[i],
-                )
-            })
-            .collect()
-    };
-    let crops = crop(1);
-    let tall = if window > 1 {
-        crop(window)
-    } else {
-        crops.clone()
-    };
-    recognize_crops(engine, &crops, &tall, boxes, vertical)
+    let rs = route_script(engine, gray, boxes, vertical);
+    recognize_groups(engine, &rs, boxes)
 }
 
 #[cfg(test)]
@@ -437,7 +540,7 @@ mod tests {
             h: 32,
             data: vec![0.0f32; 2048],
         };
-        let (names, sure) = line_groups(
+        let (names, sure, raw) = line_groups(
             &e.script,
             &[ink, paper],
             &e.meta.script_groups,
@@ -445,6 +548,7 @@ mod tests {
         );
         assert_eq!(names.len(), 2);
         assert_eq!(sure.len(), 2);
+        assert_eq!(raw.len(), 2);
         for g in &names {
             assert!(
                 g == "base" || g == "cjk" || g == "rtl" || g == "world",
@@ -464,14 +568,14 @@ mod tests {
             h: 32,
             data: vec![1.0f32; 24 * 32],
         };
-        let (names, sure) =
+        let (names, sure, _raw) =
             line_groups(&e.script, &[narrow], &e.meta.script_groups, &["cjk", "rtl", "world"]);
         assert_eq!(names, ["base"]);
         assert_eq!(sure, [false]);
     }
 
     #[test]
-    fn recognize_crops_gives_one_line_per_crop() {
+    fn recognize_groups_gives_one_line_per_crop() {
         let e = engine();
         // Two 32x64 paper lines: the recognizer reads nothing of confidence, so
         // both lines come back empty (conf < MIN_CONF) but present.
@@ -485,10 +589,16 @@ mod tests {
             h: 96,
             data: vec![0.0f32; 6144],
         };
-        let crops = vec![paper.clone(), paper.clone()];
-        let tall2 = vec![tall.clone(), tall.clone()];
+        let rs = RouteScript {
+            crops: vec![paper.clone(), paper.clone()],
+            tall: vec![tall.clone(), tall.clone()],
+            vertical: false,
+            names: vec!["base".to_string(), "base".to_string()],
+            sure: vec![true, true],
+            raw: vec!["base".to_string(), "base".to_string()],
+        };
         let boxes: Vec<[f64; 4]> = vec![[10.0, 10.0, 100.0, 20.0], [10.0, 40.0, 100.0, 50.0]];
-        let lines = recognize_crops(&e, &crops, &tall2, &boxes, false);
+        let lines = recognize_groups(&e, &rs, &boxes);
         assert_eq!(lines.len(), 2);
         for l in &lines {
             assert_eq!(l.text, "", "paper line must read empty");

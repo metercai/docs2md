@@ -265,7 +265,11 @@ impl IndraEngine {
     /// preview -> skew -> orientation -> turn -> detect -> recognize ->
     /// assemble (gutter/split -> tidy -> reading order -> blocks -> markdown
     /// with the table post-filter applied).
-    pub fn ocr_page(&mut self, gray: &preproc::Gray) -> Result<super::OcrPage, String> {
+    pub fn ocr_page(
+        &mut self,
+        gray: &preproc::Gray,
+        rc: &crate::config::RouteConfig,
+    ) -> Result<super::OcrPage, String> {
         let small = preproc::preview(gray, preproc::PREVIEW_SIDE);
         let a = preproc::estimate_skew(&small, 800);
         // The orientation model reads the page straightened by its row angle
@@ -275,7 +279,7 @@ impl IndraEngine {
         } else {
             self.orientation(&small)?
         };
-        self.read(gray, k, a, &small)
+        self.read(gray, k, a, &small, rc)
     }
 
     /// orient.onnx quarter-turn choice (product `orientation`): argmax over the
@@ -295,23 +299,151 @@ impl IndraEngine {
 
     /// Product `_read`: turn the page, detect, recognize, assemble, then map
     /// the line boxes back onto the page as it is (deskew and vertical turn
-    /// undone).
+    /// undone). The L1→L2 serial metric chain (plan §2.1) is evaluated as
+    /// the pipeline advances — after det, after the script pre-pass, after
+    /// rec, after assemble — and the first hit stops the pipeline (saving
+    /// the later stages) and tags the (possibly partial) output
+    /// `escalate_l2` for the orchestrator.
     fn read(
         &mut self,
         gray: &preproc::Gray,
         k: i32,
         a: f64,
         small: &preproc::Gray,
+        rc: &crate::config::RouteConfig,
     ) -> Result<super::OcrPage, String> {
         let (gray, _k, skew) = preproc::turn(gray, k, a, small);
         let (boxes, pictures) =
             det::detect(&self.det, &gray, self.meta.det_long_side as usize, true);
         let vertical = k == preproc::VERTICAL;
-        let lines = rec::recognize(self, &gray, &boxes, vertical);
+
+        // [det] stage: a near-image page (fewer line boxes than
+        // det_min_lines) escalates before any recognition — the whole rec
+        // pass is saved.
+        if let Some(tag) = crate::route::chain_det(boxes.len(), rc) {
+            return Ok(super::OcrPage {
+                lines: Vec::new(),
+                md: Some(String::new()),
+                blocks: Vec::new(),
+                escalate_l2: Some(tag),
+            });
+        }
+
+        // Script pre-pass (crops + per-line script routing), computed ONCE:
+        // the chain reads its metrics before any recognition, and
+        // recognize_groups reuses the same crops (no second pass).
+        let rs = rec::route_script(self, &gray, &boxes, vertical);
+        let loaded: Vec<String> = self.rec.keys().cloned().collect();
+        let loaded: Vec<&str> = loaded.iter().map(|s| s.as_str()).collect();
+        if let Some(tag) = crate::route::chain_script(&rs.metrics(&loaded), rc) {
+            return Ok(super::OcrPage {
+                lines: Vec::new(),
+                md: Some(String::new()),
+                blocks: Vec::new(),
+                escalate_l2: Some(tag),
+            });
+        }
+
+        let lines = rec::recognize_groups(self, &rs, &boxes);
+        if lines.is_empty() {
+            // Boxes were detected but nothing could be read: the conf
+            // criterion is undefined (mean conf of zero lines), treat the
+            // page as the chars criterion firing.
+            return Ok(super::OcrPage {
+                lines: Vec::new(),
+                md: Some(String::new()),
+                blocks: Vec::new(),
+                escalate_l2: Some(crate::route::TAG_CHARS),
+            });
+        }
+
+        // [rec] stage: mean line conf below rec_hard_conf escalates before
+        // the order model and markdown assembly (the former G3 conf
+        // criterion, now without the char-count precondition). The partial
+        // L1 output is kept as the low-confidence fallback.
+        let mean_conf: f32 = lines.iter().map(|l| l.conf).sum::<f32>() / lines.len() as f32;
+        if let Some(tag) = crate::route::output_gate(usize::MAX, mean_conf, rc) {
+            let page = self.partial_page(&gray, &boxes, &lines, vertical, skew);
+            return Ok(page.with_escalate(Some(tag)));
+        }
 
         let (texts, confs, boxes, order, md, same, cls) =
             self.assemble(&gray, &boxes, &lines, vertical, pictures)?;
 
+        // [assemble] stage: the output-level char gate (former G3
+        // min_chars) on the assembled markdown.
+        if let Some(tag) = crate::route::output_gate(md.chars().count(), mean_conf, rc) {
+            let page = self.full_page(
+                &gray, &boxes, &texts, &confs, &order, &md, &same, &cls, vertical, skew,
+            );
+            return Ok(page.with_escalate(Some(tag)));
+        }
+
+        Ok(self.full_page(
+            &gray, &boxes, &texts, &confs, &order, &md, &same, &cls, vertical, skew,
+        ))
+    }
+
+    /// The chain's early-exit page (rec stage): the recognized lines mapped
+    /// back onto the page as it is, WITHOUT the order model, blocks, or
+    /// markdown (they would cost as much as the stages the chain just
+    /// saved).
+    fn partial_page(
+        &self,
+        gray: &preproc::Gray,
+        boxes: &[[f64; 4]],
+        lines: &[rec::Line],
+        vertical: bool,
+        skew: f64,
+    ) -> super::OcrPage {
+        let n = boxes.len();
+        let wh = (gray.w, gray.h);
+        let olines: Vec<super::OcrLine> = (0..n)
+            .map(|i| {
+                let mut b = boxes[i];
+                if skew != 0.0 {
+                    b = preproc::unrotate_box(b, skew, wh);
+                }
+                let b = if vertical {
+                    let wpx = gray.h as f64;
+                    [wpx - b[3], b[0], wpx - b[1], b[2]]
+                } else {
+                    b
+                };
+                super::OcrLine {
+                    text: lines[i].text.clone(),
+                    conf: ((lines[i].conf as f32) * 10000.0).round() / 10000.0,
+                    top: b[1] as f32,
+                    left: b[0] as f32,
+                    width: (b[2] - b[0]) as f32,
+                    height: (b[3] - b[1]) as f32,
+                }
+            })
+            .collect();
+        super::OcrPage {
+            lines: olines,
+            md: Some(String::new()),
+            blocks: Vec::new(),
+            escalate_l2: None,
+        }
+    }
+
+    /// A fully assembled page (reading order, blocks, markdown) with the
+    /// line boxes mapped back onto the page as it is (deskew and vertical
+    /// turn undone).
+    fn full_page(
+        &self,
+        gray: &preproc::Gray,
+        boxes: &[[f64; 4]],
+        texts: &[String],
+        confs: &[f64],
+        order: &[usize],
+        md: &str,
+        same: &[f32],
+        cls: &[f32],
+        vertical: bool,
+        skew: f64,
+    ) -> super::OcrPage {
         // Lines in reading order, boxes rounded to 0.1 (product Line), then
         // mapped back onto the page as it is.
         let mut line_boxes: Vec<[f64; 4]> = order
@@ -403,11 +535,12 @@ impl IndraEngine {
                 }
             })
             .collect();
-        Ok(super::OcrPage {
+        super::OcrPage {
             lines: olines,
-            md: Some(md),
+            md: Some(md.to_string()),
             blocks,
-        })
+            escalate_l2: None,
+        }
     }
 
     /// Product `assemble`: lines -> split at wide gaps (SPLIT_GAP) -> tidy ->

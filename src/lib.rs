@@ -1,30 +1,28 @@
 //! docs2md — three-tier PDF → Markdown.
 //!
 //!   L0  native text extraction (pdf-inspector) — no rendering, no models.
-//!   L1  embedded pure-Rust OCR (ONNX on rten) — simple scanned text.
-//!       Two engines (dual-engine G3 flow):
-//!         * Indra (feature `indra`, default): indra-ocr 1.1.2 port,
-//!           layout-aware markdown output.
-//!         * PP-OCRv6-small: the v0.1.0 engine; the G3 fallback engine.
-//!   L2  external VLM service (a llama-server wrapper) — complex pages.
+//!   L1  Indra (feature `indra`, default): indra-ocr 1.1.2 port,
+//!       layout-aware markdown output.
+//!   L2  PP-OCRv6-small (embedded, decision E): the local fallback engine,
+//!       reached ONLY through the L1→L2 serial metric chain (plan §2.1) —
+//!       never by a pre-emptive layout detector (decision B).
+//!   L3  external VLM service (a llama-server wrapper): reserved for the
+//!       L2→L3 criteria (plan §2.2, Task 4). Until then it is reached only
+//!       when L1 itself is unavailable/failed.
 //!
 //! Per-page routing:
-//!   * page has a usable text layer            → L0 (direct), except when
-//!     the layer is only *textual* (needs_ocr = false) yet the page carries
-//!     a structural block (table caption / compact table-figure-equation,
-//!     G1 structural rules a/b): then it is rerouted to L1, whose order
-//!     model emits `<table>` structure (L2's VLM emits plain text only).
-//!     Dense text (rule c) is a normal S0 condition and stays L0.
-//!     Gated on `use_indra`: the v0.1.0 path is byte-identical.
-//!   * needs OCR → render → G1 (layout model,
-//!     external) decides L1 vs L2 → if L1, the
-//!     dual-engine G3 flow: Indra → G3 (output-level,
-//!     chars = markdown length) → PP-OCRv6
-//!     fallback → G2 check (line-text total) → L2.
-//!   * L2 unavailable (no config / health
-//!     probe failed / call failed) → the L1
-//!     output is kept and the page is marked
-//!     "needs a higher-tier OCR model".
+//!   * page has a usable text layer            → L0 (direct); a page whose
+//!     text layer is only textual yet carries a table (pdf-inspector's
+//!     free `has_table` signal) is rerouted to L1, whose order model emits
+//!     `<table>` structure (decision C).
+//!   * needs OCR → render once → L1 (Indra). The serial metric chain is
+//!     evaluated as the Indra pipeline advances (after det / the script
+//!     pre-pass / rec / assemble); a hit stops the pipeline and escalates
+//!     the page to L2 (PP-OCRv6) on the same rendered image. PP-OCRv6
+//!     output stands when it is non-empty; otherwise the (possibly
+//!     partial) L1 output is kept with a note, or an explicit low-confidence
+//!     marker is emitted — no page comes out empty (plan §2.1 + G,
+//!     first stage; L3 lands in Task 4).
 
 pub mod config;
 pub mod l0;
@@ -38,11 +36,7 @@ pub mod blocks;
 use config::Config;
 use l1::{build_engine, L1Engine, PpOcrEngine};
 use l2::{L2Client, PageImage};
-use route::{
-    decide_l1_flow, g1, g3, output_chars,
-    G3Verdict, L1Outcome, Tier,
-};
-use rusto::{LayoutConfig, LayoutDetector};
+use route::output_gate;
 use std::path::PathBuf;
 
 /// What produced a page's final markdown, plus any quality note.
@@ -51,7 +45,9 @@ pub struct PageRecord {
     /// 1-based page number.
     pub page: u32,
     /// Which tier produced the output, e.g. "L0-native", "L1-indra",
-    /// "L1-ppv6(g3-fallback)", "L2-vlm", "L1->L2(g3+g2:hard)".
+    /// "L2-ppv6(chain:cjk)", "L2-ppv6(chain:conf)(keep-l1)",
+    /// "L2-ppv6(chain:det)(low-conf)", "L1->L2(l1-failed)" (VLM),
+    /// "L1-ppv6(small)" (rollback).
     pub tier: String,
     /// Final visible character count.
     pub chars: usize,
@@ -71,18 +67,20 @@ pub struct DocResult {
     pub pages: Vec<PageRecord>,
 }
 
-/// The orchestrator. Holds the (lazy) L1 engines, layout detector, and L2
-/// client. Construct once per run; call `convert` on each document.
+/// The orchestrator. Holds the (lazy) L1 engine, the L2 PP-OCRv6 engine,
+/// and the L2 VLM client. Construct once per run; call `convert` on each
+/// document.
 pub struct Engine {
     cfg: Config,
+    /// The VLM client (plan §2.2's L3; Task 4). Reached today only when L1
+    /// itself is unavailable or failed.
     l2: L2Client,
-    /// The G3 primary (Indra when enabled, else PP-OCRv6).
+    /// The L1 primary (Indra when enabled, else PP-OCRv6).
     l1: Option<Box<dyn L1Engine>>,
     l1_failed: bool,
-    /// The PP-OCRv6 G3-fallback engine (lazily built on first fallback).
-    l1_fb: Option<Box<dyn L1Engine>>,
-    l1_fb_failed: bool,
-    layout: Option<LayoutDetector>,
+    /// The L2 PP-OCRv6 engine (lazily built on the first chain hit).
+    l2_pp: Option<Box<dyn L1Engine>>,
+    l2_pp_failed: bool,
     /// Why L1 is unavailable (for notes), empty when available/unused.
     l1_unavailable: String,
 }
@@ -113,9 +111,8 @@ impl Engine {
             l2,
             l1: None,
             l1_failed: false,
-            l1_fb: None,
-            l1_fb_failed: false,
-            layout: None,
+            l2_pp: None,
+            l2_pp_failed: false,
             l1_unavailable: String::new(),
         })
     }
@@ -145,62 +142,30 @@ impl Engine {
         }
     }
 
-    /// Ensure the PP-OCRv6 G3-fallback engine is built. Returns `None` when
-    /// it is unavailable (init failed) or when the primary already IS the
-    /// PP-OCRv6 engine (nothing to fall back to).
-    fn ensure_l1_fallback(&mut self) -> Option<&mut dyn L1Engine> {
+    /// Ensure the L2 PP-OCRv6 engine is built (decision E). Returns `None`
+    /// when it is unavailable (init failed) or when the primary already IS
+    /// the PP-OCRv6 engine (the `use_indra = false` rollback path: nothing
+    /// to escalate to).
+    fn ensure_l2_pp(&mut self) -> Option<&mut dyn L1Engine> {
         if !self.cfg.l1.use_indra {
             return None;
         }
-        if self.l1_fb_failed {
+        if self.l2_pp_failed {
             return None;
         }
-        if self.l1_fb.is_none() {
+        if self.l2_pp.is_none() {
             match PpOcrEngine::new(&self.cfg.l1.tier, self.cfg.l1.model_dir.as_ref()) {
                 Ok(e) => {
-                    self.l1_fb = Some(Box::new(e));
+                    self.l2_pp = Some(Box::new(e));
                 }
                 Err(msg) => {
-                    eprintln!("[l1] PP-OCRv6 fallback unavailable: {msg}");
-                    self.l1_fb_failed = true;
+                    eprintln!("[l2] PP-OCRv6 unavailable: {msg}");
+                    self.l2_pp_failed = true;
                     return None;
                 }
             }
         }
-        Some(self.l1_fb.as_mut()?.as_mut())
-    }
-
-    /// Ensure the layout detector is built (G1). `None` when no external
-    /// layout model is configured or it failed to load — in that case G1 is
-    /// skipped and OCR pages default to L1 (G3 can still escalate to L2).
-    fn ensure_layout(&mut self) -> Option<&mut LayoutDetector> {
-        if self.layout.is_none() {
-            match &self.cfg.l1.layout_model {
-                Some(p) if p.exists() => {
-                    let mut lc = LayoutConfig::default(p.clone());
-                    lc.target_size = self.cfg.l1.layout_target_size as i32;
-                    match LayoutDetector::new(lc) {
-                        Ok(ld) => {
-                            eprintln!("[route] layout model loaded: {}", p.display());
-                            self.layout = Some(ld);
-                        }
-                        Err(e) => eprintln!(
-                            "[route] layout model failed to load: {e}; \
-                                             G1 skipped (OCR pages default to L1)"
-                        ),
-                    }
-                }
-                Some(p) => eprintln!(
-                    "[route] layout model not found: {}; G1 skipped",
-                    p.display()
-                ),
-                None => eprintln!(
-                    "[route] no [l1] layout_model configured; G1 skipped \
-                                   (OCR pages default to L1)"
-                ),
-            }
-        }
-        self.layout.as_mut()
+        Some(self.l2_pp.as_mut()?.as_mut())
     }
 
     /// Convert a PDF (bytes) to markdown via the three tiers. `pages` limits
@@ -285,35 +250,24 @@ impl Engine {
             let (png, pbox, rot) = render::render_pdf_page(d, p.page as usize, self.cfg.l0.dpi)
                 .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
             let (pw, ph) = render::png_size(&png);
-            let page_area = pw as f64 * ph as f64;
             let _ = (pbox, rot); // coordinate mapping available for span work
 
-            // G1 (layout) decides L1 vs L2; without a layout model, default L1.
-            // Clone the route config first (the closure must not hold an
-            // immutable borrow of self while ensure_layout mutably borrows it).
-            let route = self.cfg.route.clone();
-            let tier = match self
-                .ensure_layout()
-                .and_then(|ld| g1(Some(ld), &png, page_area, &route))
-            {
-                Some(t) => t,
-                None => {
-                    eprintln!("[p{page1}] no layout route — defaulting to L1");
-                    Tier::L1
-                }
+            // needs_ocr → render once, then L1. The L1→L2 serial metric
+            // chain (plan §2.1) runs inside the Indra pipeline; a hit
+            // escalates the page to L2 (PP-OCRv6) on this same rendered
+            // image — no layout detector anywhere in routing (decision B).
+            let (page_md, rec, note) = if self.cfg.l1.use_indra {
+                self.l1_dual(page1, &png)
+            } else {
+                self.l1_pp_only(page1, &png)
             };
             eprintln!(
-                "[p{page1}] needs_ocr ({}), rendered {}x{}, G1 => {}",
+                "[p{page1}] needs_ocr ({}) rendered {}x{} => {}",
                 p.ocr_reason.as_deref().unwrap_or("?"),
                 pw,
                 ph,
-                match tier {
-                    Tier::L1 => "L1",
-                    Tier::L2 => "L2",
-                }
+                rec.tier
             );
-
-            let (page_md, rec, note) = self.process_tier(page1, &png, tier);
             if self.cfg.output.page_markers {
                 out.push_str(&format!("<!-- page:{page1} -->\n"));
             }
@@ -331,108 +285,41 @@ impl Engine {
         })
     }
 
-    /// Produce one page's markdown given its G1 verdict, applying the
-    /// dual-engine G3 flow (or the legacy PP-OCRv6-only flow when
-    /// `use_indra = false` — the v0.1.0 behavior) and the L2-unavailable
-    /// fallback note where required.
-    fn process_tier(
-        &mut self,
-        page1: u32,
-        png: &[u8],
-        tier: Tier,
-    ) -> (String, PageRecord, Option<String>) {
-        match tier {
-            Tier::L2 => self.l2_page(page1, png, "L2-vlm", None),
-            Tier::L1 => {
-                if self.cfg.l1.use_indra {
-                    self.l1_dual(page1, png)
-                } else {
-                    self.l1_pp_only(page1, png)
-                }
-            }
-        }
-    }
-
-    /// L1 with `use_indra = false`: the v0.1.0 PP-OCRv6-only flow. Behavior
-    /// and tier strings are byte-identical to the released build.
+    /// L1 with `use_indra = false`: the v0.1.0 PP-OCRv6-only flow. The
+    /// output-level gate (former G2/G3, now `route::output_gate`) escalates
+    /// a weak page to the VLM; the tier strings keep the `g2:<tag>` shape
+    /// with the chain's `conf`/`chars` tags (plan §5.1 rollback path).
     fn l1_pp_only(
         &mut self,
         page1: u32,
         png: &[u8],
     ) -> (String, PageRecord, Option<String>) {
-        let l1_md = match self.ensure_l1() {
+        let rc = self.cfg.route.clone();
+        match self.ensure_l1() {
             None => {
                 // L1 unavailable → try L2, else a clear note.
-                return self.l2_page(
+                self.l2_page(
                     page1,
                     png,
                     "L1->L2(l1-unavailable)",
                     Some(self.l1_unavailable.clone()),
-                );
+                )
             }
             Some(engine) => {
-                let page = match engine.ocr_page(png) {
+                let page = match engine.ocr_page(png, &rc) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("[p{page1}] L1 failed: {e}");
                         return self.l2_page(page1, png, "L1->L2(l1-failed)", Some(e));
                     }
                 };
-                // G2: output-level gate on the L1 result.
-                let verdict = g3(page.char_count(), page.mean_conf(), &self.cfg.route);
-                if verdict != G3Verdict::Ok {
-                    let tag = match verdict {
-                        G3Verdict::Hard => "hard",
-                        G3Verdict::Medium => "medium",
-                        _ => unreachable!(),
-                    };
-                    eprintln!(
-                        "[p{page1}] G2 {} (chars={}, conf={:.3}) — escalating to L2",
-                        tag,
-                        page.char_count(),
-                        page.mean_conf()
-                    );
-                    // Escalate to L2 if available; otherwise keep the
-                    // L1 output and mark the page.
-                    if self.l2.available() {
-                        let (md, rec, note) =
-                            self.l2_page(page1, png, &format!("L1->L2(g2:{tag})"), None);
-                        if rec.tier.contains("unavailable") {
-                            // L2 was available but the call failed →
-                            // fall back to the L1 output with a note.
-                            let md = markdown::ocr_lines_to_markdown(&page.lines);
-                            (
-                                md,
-                                PageRecord {
-                                    page: page1,
-                                    tier: format!("L1(g2:{tag};L2-failed)"),
-                                    chars: page.char_count(),
-                                    note: Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
-                                    blocks: page.blocks.clone(),
-                                },
-                                Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
-                            )
-                        } else {
-                            (md, rec, note)
-                        }
-                    } else {
-                        let md = markdown::ocr_lines_to_markdown(&page.lines);
-                        let note = Some(markdown::NEEDS_HIGHER_NOTE.to_string());
-                        (
-                            md,
-                            PageRecord {
-                                page: page1,
-                                tier: format!("L1(g2:{tag})"),
-                                chars: page.char_count(),
-                                note: note.clone(),
-                                blocks: page.blocks.clone(),
-                            },
-                            note,
-                        )
-                    }
-                } else {
-                    let md = markdown::ocr_lines_to_markdown(&page.lines);
-                    (
+                // G2: the output-level gate on the L1 result — the chain's
+                // two output criteria (conf OR chars, single source in
+                // route.rs) with no pipeline intermediates to read.
+                let md = markdown::ocr_lines_to_markdown(&page.lines);
+                let gate = output_gate(page.char_count(), page.mean_conf(), &rc);
+                let Some(tag) = gate else {
+                    return (
                         md,
                         PageRecord {
                             page: page1,
@@ -442,24 +329,65 @@ impl Engine {
                             blocks: page.blocks.clone(),
                         },
                         None,
+                    );
+                };
+                eprintln!(
+                    "[p{page1}] G2 {tag} (chars={}, conf={:.3}) — escalating to L2",
+                    page.char_count(),
+                    page.mean_conf()
+                );
+                // Escalate to L2 (VLM) if available; otherwise keep the L1
+                // output and mark the page.
+                if self.l2.available() {
+                    let (md, rec, note) =
+                        self.l2_page(page1, png, &format!("L1->L2(g2:{tag})"), None);
+                    if rec.tier.contains("failed") {
+                        // L2 was available but the call failed → fall back
+                        // to the L1 output with a note.
+                        (
+                            md,
+                            PageRecord {
+                                page: page1,
+                                tier: format!("L1(g2:{tag};L2-failed)"),
+                                chars: page.char_count(),
+                                note: Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
+                                blocks: page.blocks.clone(),
+                            },
+                            Some(markdown::NEEDS_HIGHER_NOTE.to_string()),
+                        )
+                    } else {
+                        (md, rec, note)
+                    }
+                } else {
+                    let note = Some(markdown::NEEDS_HIGHER_NOTE.to_string());
+                    (
+                        md,
+                        PageRecord {
+                            page: page1,
+                            tier: format!("L1(g2:{tag})"),
+                            chars: page.char_count(),
+                            note: note.clone(),
+                            blocks: page.blocks.clone(),
+                        },
+                        note,
                     )
                 }
             }
-        };
-        l1_md
+        }
     }
 
-    /// L1 with `use_indra = true`: the dual-engine G3 flow (fit plan §7.2).
-    /// Indra (primary) → G3 (chars = markdown length) → PP-OCRv6 (fallback,
-    /// gated on its line-text total) → L2. At most one fallback per page.
+    /// L1 with `use_indra = true` (plan §2.1): the serial metric chain runs
+    /// inside the Indra pipeline; a hit escalates the page to L2
+    /// (PP-OCRv6) on the same rendered image — no second render, no layout
+    /// model (decisions B + E). A chain-passed page stands as L1.
     fn l1_dual(
         &mut self,
         page1: u32,
         png: &[u8],
     ) -> (String, PageRecord, Option<String>) {
-        // ¬A_I / O_I = Err: the existing L1-unavailable path (plan line
-        // 113-114) — escalate to L2 with the v0.1.0 tier strings, no PP
-        // fallback.
+        // L1 unavailable / O_I = Err: the existing L1-unavailable path —
+        // escalate to the VLM with the v0.1.0 tier strings.
+        let rc = self.cfg.route.clone();
         let primary = match self.ensure_l1() {
             None => {
                 return self.l2_page(
@@ -469,7 +397,7 @@ impl Engine {
                     Some(self.l1_unavailable.clone()),
                 );
             }
-            Some(engine) => match engine.ocr_page(png) {
+            Some(engine) => match engine.ocr_page(png, &rc) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("[p{page1}] Indra failed: {e}");
@@ -477,73 +405,93 @@ impl Engine {
                 }
             },
         };
-        // Phase 2: the PP-OCRv6 fallback, run only when the primary's
-        // markdown is short enough that G3 could fail (at most once per page).
-        let short = output_chars(&primary) < self.cfg.route.g3.min_chars;
-        let fallback = if short {
-            let fb = self.ensure_l1_fallback();
-            fb.map(|engine| engine.ocr_page(png))
-        } else {
-            None
+        let Some(tag) = primary.escalate_l2 else {
+            // Chain passed: the L1 output stands.
+            let chars = primary.char_count();
+            let md = primary
+                .md
+                .unwrap_or_else(|| markdown::ocr_lines_to_markdown(&primary.lines));
+            return (
+                md,
+                PageRecord {
+                    page: page1,
+                    tier: "L1-indra".to_string(),
+                    chars,
+                    note: None,
+                    blocks: primary.blocks.clone(),
+                },
+                None,
+            );
         };
-        // Phase 3: the pure decision (unit-tested in route.rs).
-        let route = self.cfg.route.clone();
-        let outcome = decide_l1_flow(page1, primary, fallback, &route);
-        match outcome {
-            L1Outcome::Primary(page) => {
-                let chars = page.char_count();
-                let md = page.md.unwrap_or_else(|| markdown::ocr_lines_to_markdown(&page.lines));
-                (
-                    md,
-                    PageRecord {
-                        page: page1,
-                        tier: "L1-indra".to_string(),
-                        chars,
-                        note: None,
-                        blocks: page.blocks.clone(),
-                    },
-                    None,
-                )
-            }
-            L1Outcome::Fallback(page) => {
-                let md = markdown::ocr_lines_to_markdown(&page.lines);
-                (
-                    md,
-                    PageRecord {
-                        page: page1,
-                        tier: "L1-ppv6(g3-fallback)".to_string(),
-                        chars: page.char_count(),
-                        note: None,
-                        blocks: page.blocks.clone(),
-                    },
-                    None,
-                )
-            }
-            L1Outcome::Escalate { tag, keep } => {
-                let tier = format!("L1->L2(g3+g2:{tag})");
-                // Escalate to L2 if available (existing logic); otherwise keep
-                // the output and mark the page (plan line 117).
-                if self.l2.available() {
-                    self.l2_page(page1, png, &tier, None)
-                } else {
-                    let md = keep
-                        .md
-                        .clone()
-                        .unwrap_or_else(|| markdown::ocr_lines_to_markdown(&keep.lines));
-                    let note = Some(markdown::NEEDS_HIGHER_NOTE.to_string());
-                    (
-                        md,
-                        PageRecord {
-                            page: page1,
-                            tier: format!("L1(g3+g2:{tag})"),
-                            chars: keep.char_count(),
-                            note: note.clone(),
-                            blocks: keep.blocks.clone(),
-                        },
-                        note,
-                    )
+        // Chain hit: read the page with L2 (PP-OCRv6) on the same rendered
+        // image. At most one L2 read per page.
+        eprintln!("[p{page1}] chain:{tag} — escalating to L2 (PP-OCRv6)");
+        let pp = match self.ensure_l2_pp() {
+            Some(engine) => match engine.ocr_page(png, &rc) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[p{page1}] L2 (PP-OCRv6) failed: {e} — keeping L1 output");
+                    None
                 }
+            },
+            None => {
+                eprintln!("[p{page1}] L2 (PP-OCRv6) unavailable — keeping L1 output");
+                None
             }
+        };
+        let keep_md = primary
+            .md
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| markdown::ocr_lines_to_markdown(&primary.lines));
+        let pp_empty = pp.as_ref().map_or(true, |p| p.char_count() == 0);
+        if pp_empty {
+            // L2 read nothing: keep the (possibly partial) L1 output with a
+            // note, or emit an explicit low-confidence marker when L1
+            // bailed out before producing anything (plan G, first stage —
+            // no page comes out empty; the L3 end lands in Task 4).
+            if keep_md.trim().is_empty() {
+                let note = Some(markdown::LOW_CONF_MARKER.to_string());
+                (
+                    String::new(),
+                    PageRecord {
+                        page: page1,
+                        tier: format!("L2-ppv6(chain:{tag})(low-conf)"),
+                        chars: 0,
+                        note: note.clone(),
+                        blocks: Vec::new(),
+                    },
+                    note,
+                )
+            } else {
+                let keep_chars = keep_md.chars().count();
+                let note = Some(markdown::KEEP_L1_NOTE.to_string());
+                (
+                    keep_md,
+                    PageRecord {
+                        page: page1,
+                        tier: format!("L2-ppv6(chain:{tag})(keep-l1)"),
+                        chars: keep_chars,
+                        note: note.clone(),
+                        blocks: primary.blocks.clone(),
+                    },
+                    note,
+                )
+            }
+        } else {
+            let pp = pp.unwrap();
+            let md = markdown::ocr_lines_to_markdown(&pp.lines);
+            (
+                md,
+                PageRecord {
+                    page: page1,
+                    tier: format!("L2-ppv6(chain:{tag})"),
+                    chars: pp.char_count(),
+                    note: None,
+                    blocks: Vec::new(),
+                },
+                None,
+            )
         }
     }
 
@@ -618,11 +566,10 @@ impl Engine {
     /// space we do not trust, so those pages emit no blocks. A failure at any
     /// step yields an empty vec — blocks never affect the markdown or routing.
     ///
-    /// `relabel` (E2): normalized G1 layout regions already mapped to the
-    /// rendered page's `[0,1]` y-down space (`heading`/`table` only). Each
-    /// region relabels the L0 blocks whose centres it contains — the same
-    /// regions the S0 structural reroute was decided on, so a page only gets
-    /// structural labels when it was NOT rerouted to L1.
+    /// `relabel` (decision D): normalized layout regions already mapped to
+    /// the rendered page's `[0,1]` y-down space (`heading`/`table` only).
+    /// Each region relabels the L0 blocks whose centres it contains. Wired
+    /// up by the `--blocks` optional relabel (Task 5); always `None` today.
     fn l0_blocks(
         &self,
         bytes: &[u8],
