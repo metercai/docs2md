@@ -16,8 +16,9 @@ use crate::config::L1Config;
 #[derive(Debug, Clone)]
 pub struct OcrLine {
     pub text: String,
-    /// Per-line recognition confidence (0..1). Feeds the G3 output-level
-    /// gate (mean line conf).
+    /// Per-line recognition confidence (0..1). Feeds the chain's rec-stage
+    /// conf criterion, the output-level gate, and the L2→L3 criteria
+    /// (mean line conf).
     pub conf: f32,
     /// Bounding box: top, left, width, height (pixels).
     pub top: f32,
@@ -72,7 +73,8 @@ impl OcrPage {
     pub fn char_count(&self) -> usize {
         self.lines.iter().map(|l| l.text.chars().count()).sum()
     }
-    /// Mean per-line confidence (G3 conf signal). 1.0 for an empty page.
+    /// Mean per-line confidence (the chain rec-stage / output-gate / L3
+    /// conf signal). 1.0 for an empty page.
     pub fn mean_conf(&self) -> f32 {
         if self.lines.is_empty() {
             return 1.0;

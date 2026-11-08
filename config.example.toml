@@ -5,7 +5,8 @@
 
 # ── L0: native text extraction ──────────────────────────────────────────
 [l0]
-# Render DPI for needs-ocr pages (shared by G1 layout routing and the L2 send).
+# Render DPI for needs-ocr pages (shared by the L2 send and the optional
+# --blocks layout relabel).
 dpi = 200
 
 # ── L1: embedded pure-Rust PP-OCRv6 (ONNX on rten) ─────────────────────
@@ -18,14 +19,13 @@ tier = "small"
 # model_dir = "/path/to/rusto-models"
 # External PP-DocLayout ONNX (the ~130MB layout model is NOT embedded, and is
 # over GitHub's 100MB single-file limit, so it is fetched separately).
-# When unset, G1 layout routing is skipped and every OCR page defaults to
-# L1 (the G3 output-level gate can still escalate to L2).
+# Used ONLY by the optional `--blocks` L0 relabel (decision D): it never
+# participates in tier routing. When unset, the relabel is skipped.
 # layout_model = "/path/to/DocOCR/pp_doclayout_plus_l.onnx"
 # Layout detector input size (long edge, pixels).
 layout_target_size = 800
-# Use the embedded Indra engine (feature `indra`) as the primary L1 engine,
-# with PP-OCRv6 kept as the G3 fallback. When false, run the PP-OCRv6-only
-# v0.1.0 flow (the rollback path).
+# Use the embedded Indra engine (feature `indra`) as the primary L1 engine.
+# When false, run the PP-OCRv6-only v0.1.0 flow (the rollback path).
 use_indra = true
 
 # ── L2: external VLM service — the L3 end of the cascade (a llama-server

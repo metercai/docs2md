@@ -4,8 +4,8 @@
 # The L1 PP-OCRv6-small det/rec/dict are EMBEDDED in the binary (not fetched
 # here). This script fetches only the pieces that are deliberately external:
 #
-#   1. the PP-DocLayout model (G1 routing; ~130MB, over GitHub's 100MB
-#      single-file limit, so it is not in the repo)
+#   1. the PP-DocLayout model (optional --blocks relabel; ~130MB, over
+#      GitHub's 100MB single-file limit, so it is not in the repo)
 #   2. optional larger PP-OCRv6 tiers (medium/tiny) for [l1] model_dir
 #   3. optional L2 VLM GGUF (PaddleOCR-VL) for the llama-server wrapper
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 DEST="${DOCS2MD_MODELS_DIR:-models}"
 mkdir -p "$DEST/DocOCR" "$DEST"
 
-echo "== [1/3] PP-DocLayout (G1 routing) =="
+echo "== [1/3] PP-DocLayout (optional --blocks relabel) =="
 LAYOUT="$DEST/DocOCR/pp_doclayout_plus_l.onnx"
 if [ -f "$LAYOUT" ]; then
   echo "  already present: $LAYOUT"

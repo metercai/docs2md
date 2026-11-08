@@ -3,7 +3,7 @@
 //! `tidy_lines`) and the table post-filter (new logic, plan §1.5: a Table
 //! block keeps its `<table>` only when its bbox covers less than half the
 //! page and its lines read with mean confidence above 0.4, or when a
-//! table-caption region exists — the same compact-region rule G1 routes on).
+//! table-caption region exists).
 //!
 //! Numpy dtype discipline (as in order.rs): the model's boxes/logits are f32,
 //! so every array computation runs in f32 and widens to f64 exactly where the
@@ -23,8 +23,8 @@ pub const LIST: usize = 4; // List-Group
 pub const CAPTION: usize = 6; // Caption (a table-caption region keeps the table)
 pub const TABLE: usize = 5; // Table
 
-/// G1 compact-region thresholds (route.rs): a compact, confident region is the
-/// condition under which a table is trusted.
+/// Compact-region thresholds: a compact, confident region is the condition
+/// under which a table is trusted (kept as `<table>` in the post-filter).
 pub const TABLE_COMPACT_FRAC: f64 = 0.5;
 pub const TABLE_COMPACT_CONF: f64 = 0.4;
 

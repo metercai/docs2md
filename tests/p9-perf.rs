@@ -1,5 +1,5 @@
 //! P9 performance probe: pure `ocr_page` wall time (the Indra pipeline only —
-//! no PDF parse, no rendering, no G1 layout) on the two dense patent docs
+//! no PDF parse, no rendering, no layout) on the two dense patent docs
 //! (520 pages). This isolates the engine cost for the plan §P9 gate
 //! ("single-core reading, median <= 1.0s/page; rten allowed <= 2x the Python
 //! reference"). Compare per-page against the Python reference

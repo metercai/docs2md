@@ -132,7 +132,7 @@ pub fn pdf_box_to_norm(
 /// ≥ 50 % of the smaller height) merge into one block regardless of column —
 /// a two-column row stays one block; blocks come out top to bottom. The
 /// block label is always `TEXT` (E1); E2 re-labels structural rows from the
-/// G1 regions.
+/// layout regions (the optional `--blocks` relabel, decision D).
 pub fn spans_to_text_blocks(
     spans: &[(f64, f64, f64, f64, String)],
     box_x0: f64,
@@ -242,7 +242,8 @@ impl Block {
     }
 }
 
-/// E2 (L0): re-label L0 line blocks from the G1 layout regions. `regions`
+/// E2 (L0): re-label L0 line blocks from the layout regions (decision D's
+/// optional `--blocks` relabel). `regions`
 /// are `(x0, y0, x1, y1, label)` in the same normalized `[0,1]` y-down space
 /// as the block bboxes. A block takes the label of the region its CENTER
 /// point falls in (a body line hugging a region edge keeps `text`); when the

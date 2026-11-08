@@ -29,7 +29,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct L0Config {
-    /// Render DPI for needs-ocr pages (shared by L1 routing and L2 send).
+    /// Render DPI for needs-ocr pages (shared by the L2 send and the
+    /// optional `--blocks` layout relabel).
     pub dpi: u32,
 }
 impl Default for L0Config {
@@ -49,15 +50,16 @@ pub struct L1Config {
     /// build only carries small). Ignored for `small`.
     pub model_dir: Option<PathBuf>,
     /// External PP-DocLayout ONNX path (the ~130MB layout model is not
-    /// embedded). When absent or unreadable, G1 layout routing is skipped
-    /// and every OCR page defaults to L1 (the G3 output-level gate can still
-    /// escalate to L2).
+    /// embedded). Used ONLY by the optional `--blocks` L0 relabel (decision
+    /// D) — it never participates in tier routing. When absent or
+    /// unreadable, the relabel is skipped.
     pub layout_model: Option<PathBuf>,
     /// Layout detector input size (pixels on the long edge).
     pub layout_target_size: u32,
     /// When true, run the Indra engine (feature `indra`) as the primary L1
-    /// engine, with PP-OCRv6 kept as the G3 fallback. When false, run the
-    /// PP-OCRv6-only v0.1.0 flow (the rollback path).
+    /// engine, with PP-OCRv6 as the L2 fallback engine (reached through the
+    /// serial metric chain). When false, run the PP-OCRv6-only v0.1.0 flow
+    /// (the rollback path).
     pub use_indra: bool,
 }
 impl Default for L1Config {
