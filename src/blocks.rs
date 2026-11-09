@@ -83,7 +83,7 @@ pub fn normalize_bbox(x0: f64, y0: f64, x1: f64, y1: f64, page_w: f64, page_h: f
 
 /// Map a PDF user-space box (y-UP, points) to the rendered page's
 /// normalized `[0,1]` y-DOWN box, for the page's `/Rotate`. The render box
-/// (CropBox ∩ MediaBox, the box `render::render_pdf_page` renders) is
+/// (CropBox ∩ MediaBox, the box `render::render_pdf_bytes` renders) is
 /// `(box_x0, box_y0, box_w, box_h)` in the same user space. Mirrors
 /// pdf_oxide's `page_base_transform` (rendering/mod.rs:188) inverted — the
 /// origin translation uses the render box, and the rotation cases are its

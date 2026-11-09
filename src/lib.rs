@@ -195,23 +195,11 @@ impl Engine {
         &mut self,
         bytes: &[u8],
         page0: u32,
-        doc: Option<&pdf_oxide::document::PdfDocument>,
     ) -> Option<Vec<(f64, f64, f64, f64, &'static str)>> {
         if !self.blocks_requested {
             return None;
         }
-        // Reuse the caller's open document when it has one; otherwise open a
-        // local one (kept alive for the duration of this call).
-        let mut owned: Option<pdf_oxide::document::PdfDocument> = None;
-        let d: &pdf_oxide::document::PdfDocument = match doc {
-            Some(d) => d,
-            None => {
-                let d = pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec()).ok()?;
-                owned = Some(d);
-                owned.as_ref().unwrap()
-            }
-        };
-        let (png, _, _) = render::render_pdf_page(d, page0 as usize, self.cfg.l0.dpi).ok()?;
+        let (png, _, _) = render::render_pdf_bytes(bytes, page0 as usize, self.cfg.l0.dpi).ok()?;
         let (pw, ph) = render::png_size(&png);
         if pw == 0 || ph == 0 {
             return None;
@@ -315,9 +303,8 @@ impl Engine {
                                 .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
                         );
                     }
-                    let d = doc.as_ref().unwrap();
                     let (png, _pbox, _rot) =
-                        render::render_pdf_page(d, p.page as usize, self.cfg.l0.dpi)
+                        render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                             .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
                     eprintln!("[p{page1}] S0 reroute: table page — L1");
                     let (page_md, rec, note) = self.l1_dual(page1, &png);
@@ -337,8 +324,7 @@ impl Engine {
                     // when --blocks was passed explicitly and a layout
                     // model is configured (default path: None, no render,
                     // no model load).
-                    let relabel =
-                        self.l0_relabel_regions(bytes, p.page, doc.as_ref());
+                    let relabel = self.l0_relabel_regions(bytes, p.page);
                     records.push(PageRecord {
                         page: page1,
                         tier: "L0-native".into(),
@@ -357,11 +343,10 @@ impl Engine {
                         .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
                 );
             }
-            let d = doc.as_ref().unwrap();
-            let (png, pbox, rot) = render::render_pdf_page(d, p.page as usize, self.cfg.l0.dpi)
-                .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+            let (png, _pbox, _rot) =
+                render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
+                    .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
             let (pw, ph) = render::png_size(&png);
-            let _ = (pbox, rot); // coordinate mapping available for span work
 
             // needs_ocr → render once, then L1. The L1→L2 serial metric
             // chain (plan §2.1) runs inside the Indra pipeline; a hit

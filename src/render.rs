@@ -1,43 +1,78 @@
-//! Page rendering + coordinate mapping (pdf_oxide, pure-Rust tiny-skia).
+//! Page rendering (PDFium via firecrawl-pdfium) + coordinate mapping.
 //!
 //! Rendered only for `needs_ocr` pages (L0-native pages skip rendering
-//! entirely). The pixel→PDF user-space mapping mirrors pdf_oxide's
-//! `page_render_box` / `page_base_transform` so OCR boxes (pixel, y-down)
-//! can be mapped back to PDF points (y-up) for provenance and any future
-//! span-level merging.
+//! entirely). PDFium is a runtime-loaded shared library: the discovery
+//! chain is `$PDFIUM_LIB_PATH` → next to the executable → `./target/pdfium`
+//! → the system loader (firecrawl-pdfium library.rs). The offline package
+//! ships `libpdfium.so` next to the binary, so the package runs with no
+//! network access and no host-font dependency (PDFium carries its own
+//! base-14 font outlines).
+//!
+//! `page_geometry` (still pdf_oxide in this step) feeds the L0 block
+//! normalization; the pixel→PDF coordinate mapping reads the same
+//! PDFium-visible box via `page_box`.
 
+use firecrawl_pdfium::{Pdfium, RenderConfig};
+use image::codecs::png::PngEncoder;
+use image::ImageEncoder;
 use pdf_oxide::document::PdfDocument;
-use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 
-/// Page render raster budget in pixels. A page whose render at the configured
-/// dpi would exceed this renders at a lower effective dpi (posters, plans).
-/// Matches indra's `MAX_PAGE_PIXELS` (document.py:35): pdf_oxide reduces the
-/// scale to fit this budget, which is the same formula as indra's
-/// `page_scale` = min(k, sqrt(MAX_PAGE_PIXELS / (w*h))). Note pdf_oxide's own
-/// default is 16 MP — raising it to 100 MP is what aligns us with indra.
+/// Page render raster budget in pixels. A page whose render at the
+/// configured dpi would exceed this renders at a lower effective dpi
+/// (posters, plans). Matches indra's `MAX_PAGE_PIXELS`
+/// (document.py:35): scale = min(k, sqrt(MAX_PAGE_PIXELS / (w*h))).
 const MAX_PAGE_PIXELS: u64 = 100_000_000;
 
-/// Render one page to PNG. Returns (png_bytes, render_box, rotation).
-/// `render_box` is CropBox ∩ MediaBox — the visible page box, identical to
-/// pdf_oxide's `page_render_box` (so the coordinate mapping matches).
-/// One rendered page: PNG bytes, the content box (x0, y0, x1, y1) in PDF
-/// points, and the page number.
+/// One rendered page: PNG bytes, the content box (x0, y0, w, h) in PDF
+/// points, and the page's `/Rotate` in degrees.
 type RenderedPage = (Vec<u8>, (f32, f32, f32, f32), i32);
 
-pub fn render_pdf_page(doc: &PdfDocument, page: usize, dpi: u32) -> Result<RenderedPage, String> {
-    let info = doc.get_page_info(page).map_err(|e| e.to_string())?;
-    let pbox = render_box(&info.media_box, info.crop_box.as_ref());
-    let mut opts = RenderOptions::default();
-    opts.dpi = dpi;
-    opts.max_output_pixels = MAX_PAGE_PIXELS;
-    opts.format = ImageFormat::Png;
-    opts.render_annotations = false;
-    let img = render_page(doc, page, &opts).map_err(|e| e.to_string())?;
-    Ok((img.data, pbox, info.rotation))
+/// Render one page of the raw PDF bytes to an RGBA PNG (the pipeline
+/// converts to grayscale itself — see `preproc::Gray::from_png`).
+///
+/// `dpi` is the requested resolution; the effective scale is lowered to
+/// fit `MAX_PAGE_PIXELS` (see [`effective_dpi`]). The content box is
+/// CropBox ∩ MediaBox — identical to what the PDFium viewport renders, so
+/// the pixel→PDF coordinate mapping lines up.
+pub fn render_pdf_bytes(bytes: &[u8], page: usize, dpi: u32) -> Result<RenderedPage, String> {
+    let pdfium = Pdfium::load().map_err(|e| format!("load pdfium: {e}"))?;
+    let doc = pdfium
+        .load_document(bytes, None)
+        .map_err(|e| format!("load document: {e}"))?;
+    // Form-field appearances only draw once the form-fill env is active —
+    // call it before opening pages, matching pypdfium2's may_draw_forms=True.
+    doc.enable_form_rendering()
+        .map_err(|e| format!("enable forms: {e}"))?;
+    let page = doc
+        .page(page)
+        .map_err(|e| format!("open page {page}: {e}"))?;
+    let page_no = page.index();
+    let (w, h) = (page.width(), page.height());
+    let scale = effective_dpi(dpi as f32, w, h) / 72.0;
+    let cfg = RenderConfig::new()
+        .scale(scale)
+        // RGB, like the pypdfium2 reference: the pipeline's to_luma8() (Rec.709)
+        // is the single luma conversion. A Gray8 render would apply PDFium's own
+        // Rec.601 luma and drift a few greys from the reference path.
+        .pixel_format(firecrawl_pdfium::PixelFormat::Rgba8)
+        .annotations(false)
+        .form_fields(true);
+    let rendered = page
+        .render(&cfg)
+        .map_err(|e| format!("render page {page_no}: {e}"))?;
+    let (pw, ph) = (rendered.width(), rendered.height());
+    let px = rendered.into_pixels();
+    let mut png: Vec<u8> = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(&px, pw, ph, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("encode png: {e}"))?;
+    let pbox = page_box(&page).map_err(|e| format!("page box: {e}"))?;
+    let rotation = rotation_degrees(page.rotation());
+    Ok((png, pbox, rotation))
 }
 
 /// The page's geometry without rasterizing: the content box (CropBox ∩
-/// MediaBox, the box `render_pdf_page` renders) and the page's `/Rotate`.
+/// MediaBox, the box this module renders) and the page's `/Rotate`.
 /// Used to map native text-layer spans into the rendered page's
 /// normalized coordinate space (blocks) without a PNG render.
 pub fn page_geometry(
@@ -71,29 +106,35 @@ fn render_box(
     }
 }
 
-/// pdf_oxide's `page_base_transform` as (a,b,c,d,tx,ty):
-/// device_x = a*px + b*py + tx; device_y = c*px + d*py + ty.
-pub fn base_matrix(
-    pbox: (f32, f32, f32, f32),
-    rotation: i32,
-    scale: f32,
-) -> (f32, f32, f32, f32, f32, f32) {
-    let (x0, y0, w, h) = pbox;
-    match rotation.rem_euclid(360) {
-        90 => (0.0, scale, scale, 0.0, -x0, -y0),
-        180 => (-scale, 0.0, 0.0, scale, x0 - w * scale, y0),
-        270 => (0.0, -scale, -scale, 0.0, x0 + h * scale, y0 + w * scale),
-        _ => (scale, 0.0, 0.0, -scale, x0, y0 + h * scale),
+/// The content box from PDFium's page handle: `FPDF_GetPageBoundingBox`
+/// (CropBox ∩ MediaBox), post-`/Rotate`.
+fn page_box(page: &firecrawl_pdfium::PdfPage<'_>) -> Result<(f32, f32, f32, f32), String> {
+    let r = page.bounding_box().map_err(|e| e.to_string())?;
+    Ok((
+        r.left as f32,
+        r.bottom as f32,
+        r.width() as f32,
+        r.height() as f32,
+    ))
+}
+
+/// `/Rotate` (clockwise 90° increments) as degrees.
+fn rotation_degrees(rot: firecrawl_pdfium::Rotation) -> i32 {
+    match rot {
+        firecrawl_pdfium::Rotation::None => 0,
+        firecrawl_pdfium::Rotation::Clockwise90 => 90,
+        firecrawl_pdfium::Rotation::Rotate180 => 180,
+        firecrawl_pdfium::Rotation::Clockwise270 => 270,
     }
 }
 
-/// Invert the base matrix: device (pixel) → PDF user space.
-pub fn to_pdf(device_x: f32, device_y: f32, m: (f32, f32, f32, f32, f32, f32)) -> (f32, f32) {
-    let (a, b, c, d, tx, ty) = m;
-    let inv = 1.0 / (a * d - b * c);
-    let u = device_x - tx;
-    let v = device_y - ty;
-    ((d * u - b * v) * inv, (-c * u + a * v) * inv)
+/// The effective dpi after fitting the render into `MAX_PAGE_PIXELS`:
+/// `min(dpi, 72 * sqrt(budget / (w*h)))` (same formula as indra's
+/// `page_scale`).
+fn effective_dpi(dpi: f32, w: f32, h: f32) -> f32 {
+    let area = (w * h).max(1.0);
+    let fit = 72.0 * (((MAX_PAGE_PIXELS as f32) / area).sqrt());
+    dpi.min(fit)
 }
 
 /// Minimal PNG IHDR size reader (avoids pulling the image crate for a header).
@@ -109,46 +150,82 @@ pub fn png_size(png: &[u8]) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{png_size, render_pdf_page};
+    use super::{effective_dpi, png_size, render_pdf_bytes};
+    use std::io::Read;
+
+    /// Local fixture corpus (not shipped in the repo, CI skips cleanly).
+    const FIXTURE: &str = "/home/ubuntu/pdf2md.fixtures/Q-Pharm-Pty-Ltd-Invoice-Report.pdf";
+
+    /// PDFium is a runtime-loaded shared library and is strict about PDF
+    /// structure (hand-built minimal PDFs fail validation); these tests
+    /// need both the .so (PDFIUM_LIB_PATH or next to the binary) and a
+    /// real fixture.
+    fn setup() -> Option<std::fs::File> {
+        if !firecrawl_pdfium::Pdfium::load().is_ok() {
+            eprintln!("SKIP: libpdfium not loadable");
+            return None;
+        }
+        match std::fs::File::open(FIXTURE) {
+            Ok(f) => Some(f),
+            Err(_) => {
+                eprintln!("SKIP: fixture not present at {FIXTURE}");
+                None
+            }
+        }
+    }
 
     #[test]
-    fn normal_page_unchanged() {
-        // A4 at 200 dpi: ~4.9 MP, far under the 100 MP budget — pdf_oxide
-        // renders at the requested dpi (1654x2338 for 595.2x841.9 pt, ±1 px).
-        let pdf = "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
-                   2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
-                   3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595.2 841.9] /Contents 4 0 R >> endobj\n\
-                   4 0 obj << /Length 0 >> stream\n\nendstream endobj\n";
-        let doc = pdf_oxide::document::PdfDocument::open_from_bytes(pdf.as_bytes().to_vec()).expect("load");
-        let (png, _, _) = render_pdf_page(&doc, 0, 200).expect("render");
+    fn real_page_renders_at_the_requested_dpi() {
+        let Some(mut f) = setup() else { return };
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).expect("read fixture");
+        let (png, pbox, rot) = render_pdf_bytes(&bytes, 0, 200).expect("render");
         let (w, h) = png_size(&png);
+        assert!(w > 0 && h > 0, "empty render");
+        // Internal consistency: the content box at the requested scale must
+        // match the rendered bitmap (the invariant coordinate mapping
+        // relies on). Not an absolute-size check — fixtures vary.
+        let scale = 200.0 / 72.0;
         assert!(
-            (w as i32 - 1653).abs() <= 2 && (h as i32 - 2337).abs() <= 2,
-            "scaled: {w}x{h}"
+            ((pbox.2 * scale) as f64 - w as f64).abs() <= 2.0,
+            "box width {pbox:?} vs {w}px"
         );
+        assert!(
+            ((pbox.3 * scale) as f64 - h as f64).abs() <= 2.0,
+            "box height {pbox:?} vs {h}px"
+        );
+        // No budget engagement for a normal page: full 200 dpi, well under
+        // the 100 MP ceiling.
+        assert!(
+            (w as u64) * (h as u64) < 100_000_000,
+            "unexpectedly capped: {w}x{h}"
+        );
+        assert_eq!(rot % 360, 0, "rot: {rot}");
     }
 
     #[test]
     fn huge_page_renders_under_the_cap() {
-        // A 4000x4000 pt page at 200 dpi would be ~11111 px (123 MP) without
-        // the budget; with MAX_PAGE_PIXELS = 100 MP pdf_oxide reduces the scale
-        // to fit, so the render lands at ~10000 px (100 MP), far below the
-        // uncapped size and without failing.
-        let pdf = "%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
-                   2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
-                   3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 4000 4000] /Contents 4 0 R >> endobj\n\
-                   4 0 obj << /Length 0 >> stream\n\nendstream endobj\n";
-        let doc = pdf_oxide::document::PdfDocument::open_from_bytes(pdf.as_bytes().to_vec()).expect("load");
-        let (png, _, _) = render_pdf_page(&doc, 0, 200).expect("render");
-        let (w, h) = png_size(&png);
-        assert!(w > 0 && h > 0, "empty render");
+        // Pure-math budget: a 4000x4000 pt page at 200 dpi would be ~11111
+        // px (123 MP) without the cap; effective_dpi lowers it to 180 dpi,
+        // landing at exactly 10000 px (100 MP) instead of failing. No PDF
+        // needed: the capping is in effective_dpi.
+        let d = effective_dpi(200.0, 4000.0, 4000.0);
+        let side = (4000.0 * d / 72.0) as u64;
+        assert!(d < 200.0, "budget did not engage: {d}");
         assert!(
-            w as u64 * h as u64 <= 100_000_000,
-            "budget exceeded: {w}x{h}"
+            side * side <= 100_000_000 + 4000,
+            "budget exceeded: {side}px"
         );
-        // The budget is what did the capping (not pdf_oxide's 16 MP default,
-        // which would give ~4000 px): the side must be well above the 16 MP
-        // result and below the uncapped 11111 px.
-        assert!(w >= 9000 && w < 11111, "unexpected scale: {w}");
+        assert!((9000..11111).contains(&side), "unexpected scale: {side}px");
+    }
+
+    #[test]
+    fn effective_dpi_fits_the_budget() {
+        // A4 at 200 dpi is well under the budget — unchanged.
+        assert!((effective_dpi(200.0, 595.2, 841.9) - 200.0_f32).abs() < 1e-3);
+        // 4000x4000 pt at 200 dpi = 123 MP > 100 MP — scaled down to ~182.6.
+        let d = effective_dpi(200.0, 4000.0, 4000.0);
+        let expect = 72.0_f32 * ((100_000_000.0_f32 / (4000.0_f32 * 4000.0_f32)).sqrt());
+        assert!((d - expect).abs() < 1e-2, "d={d} expect={expect}");
     }
 }
