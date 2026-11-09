@@ -44,7 +44,7 @@ config.
 
 ```
 page has a usable text layer ──────────────── L0 (direct)
-needs OCR → render (pdf_oxide, 200 dpi)
+needs OCR → render (PDFium, 200 dpi)
           → L1 (embedded engine; `indra` default, PP-OCRv6-only when
             [l1].use_indra = false):
             det → script pre-pass → rec → order → markdown assembly
@@ -145,7 +145,7 @@ src/                 the docs2md binary + lib (orchestrator, L0/L1/L2/L3, routin
   l0.rs              L0 native extraction (pdf-inspector)
   l1.rs              L1 engine trait + embedded Indra + embedded PP-OCRv6
   l2.rs              L3 VLM client (OpenAI-compatible /v1/chat/completions)
-  render.rs          pdf_oxide rendering + pixel→PDF coordinate mapping
+  render.rs          PDFium (firecrawl) rendering + pixel→PDF coordinate mapping
   route.rs           the L1→L2 serial metric chain + L2→L3 criteria (+ tests)
   markdown.rs        OCR-line → markdown assembly (reading order)
   lib.rs             Engine orchestrator (per-page tier dispatch)
