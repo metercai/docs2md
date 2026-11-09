@@ -12,6 +12,13 @@ jobs:
   check:
     name: clippy · test · build
     runs-on: ubuntu-22.04
+    env:
+      # Render uses firecrawl-pdfium (pure libloading, no build.rs / auto-download),
+      # so the PDFium runtime must be supplied out-of-band. firecrawl 0.1.0 pins a
+      # specific PDFium (see its pdfium.lock.json) — pin the same build here. The
+      # step below drops the .so at this path; the var is job-level so build/test/
+      # smoke all see it.
+      PDFIUM_LIB_PATH: ${{ github.workspace }}/target/pdfium/linux-x64/lib/libpdfium.so
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +27,23 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      # Supply the PDFium runtime .so (render path). firecrawl-pdfium 0.1.0 pins
+      # PDFium build `chromium/7988` (bblanchon/pdfium-binaries, upstream source);
+      # its pdfium.lock.json records the exact asset sha256. Verify before use so a
+      # pin drift fails the build instead of silently re-rendering.
+      - name: fetch libpdfium.so (firecrawl-pinned build)
+        run: |
+          set -euo pipefail
+          v=chromium/7988
+          sha=7358c15e26a746cd67854887ea11b3b807c436056788eee9294fb972b8f8e0be
+          out=target/pdfium/linux-x64
+          mkdir -p "$out"
+          curl -fsSL -o /tmp/pdfium.tgz \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${v}/pdfium-linux-x64.tgz"
+          echo "${sha}  /tmp/pdfium.tgz" | sha256sum -c -
+          tar -xzf /tmp/pdfium.tgz -C "$out"
+          test -f "$out/lib/libpdfium.so"
 
       # rustfmt is deliberately not a gate yet: the tree is not formatted (6 files,
       # 24 hunks) and re-flowing the author's code is not CI's call. Run `cargo fmt -p

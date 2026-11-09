@@ -152,6 +152,13 @@ fn t7_pages() -> Vec<(String, String, String, String)> {
 /// no FONTCONFIG_FILE is needed. Writes {pid}.png to P1B_RENDER_OUT.
 #[test]
 fn p1_render_pages() {
+    // Local QA corpus (t7 run dir + /tmp/opb66_pdf.json) is not in the repo;
+    // skip cleanly where it is absent (CI) — mirrors render.rs's fixture guard.
+    if !std::path::Path::new("/tmp/opb66_pdf.json").is_file() || !std::path::Path::new(T7).is_dir()
+    {
+        eprintln!("SKIP: local corpus absent (/tmp/opb66_pdf.json or {T7})");
+        return;
+    }
     let out = std::env::var("P1B_RENDER_OUT").unwrap_or_else(|_| "/tmp/opb_p1_renders".to_string());
     std::fs::create_dir_all(&out).unwrap();
     let dpi = 200u32; // product default (render.rs / config.rs L0Config::default)
@@ -172,6 +179,13 @@ fn p1_render_pages() {
 /// pypdfium2 set), writing a full 48-page run dir for the QA scorer.
 #[test]
 fn p1_verify_renders() {
+    // Local QA corpus (t7 run dir + /tmp/opb66_pdf.json) is not in the repo;
+    // skip cleanly where it is absent (CI) — mirrors render.rs's fixture guard.
+    if !std::path::Path::new("/tmp/opb66_pdf.json").is_file() || !std::path::Path::new(T7).is_dir()
+    {
+        eprintln!("SKIP: local corpus absent (/tmp/opb66_pdf.json or {T7})");
+        return;
+    }
     let cfg = Config::default(); // dpi=200, use_indra, tier=small, no VLM - same as t7
     let rc: RouteConfig = cfg.route.clone();
     let l3: L3Config = cfg.l3.clone();
