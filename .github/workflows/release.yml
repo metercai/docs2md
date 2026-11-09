@@ -25,10 +25,10 @@ jobs:
           # glibc, not musl: the embedded OCR walks deep stacks and musl's 128 KiB
           # default thread stack segfaults on it (verified locally, rc=139).
           # 22.04 keeps the floor at glibc 2.35 instead of 24.04's 2.39.
-          - { os: linux,   arch: amd64, runner: ubuntu-22.04,  target: x86_64-unknown-linux-gnu,  archive: tar.gz }
-          - { os: linux,   arch: arm64, runner: ubuntu-22.04,  target: aarch64-unknown-linux-gnu, archive: tar.gz, apt: gcc-aarch64-linux-gnu }
-          - { os: macos,   arch: arm64, runner: macos-latest,  target: aarch64-apple-darwin,      archive: tar.gz }
-          - { os: windows, arch: amd64, runner: windows-2022,  target: x86_64-pc-windows-msvc,    archive: zip }
+          - { os: linux,   arch: amd64, runner: ubuntu-22.04,  target: x86_64-unknown-linux-gnu,  archive: tar.gz, pdfium_asset: pdfium-linux-x64.tgz, pdfium_lib: libpdfium.so, pdfium_sha: 7358c15e26a746cd67854887ea11b3b807c436056788eee9294fb972b8f8e0be }
+          - { os: linux,   arch: arm64, runner: ubuntu-22.04,  target: aarch64-unknown-linux-gnu, archive: tar.gz, pdfium_asset: pdfium-linux-arm64.tgz, pdfium_lib: libpdfium.so, pdfium_sha: a2926203456881efa8feca7e0e409de78a4471b9b72e62a74c820faebb3e4551, apt: gcc-aarch64-linux-gnu }
+          - { os: macos,   arch: arm64, runner: macos-latest,  target: aarch64-apple-darwin,      archive: tar.gz, pdfium_asset: pdfium-mac-arm64.tgz, pdfium_lib: libpdfium.dylib, pdfium_sha: 2229b8a6ffa0fb1634aa78886ed5425a10a8a0bd01762f7f0c9244081d86a921 }
+          - { os: windows, arch: amd64, runner: windows-2022,  target: x86_64-pc-windows-msvc,    archive: zip, pdfium_asset: pdfium-win-x64.tgz, pdfium_lib: pdfium.dll, pdfium_sha: 654daf488d9357d2787cec439d0dbdb93d7e180e2cb28e5f1d41c66d2645daec }
 
     runs-on: ${{ matrix.runner }}
     steps:
@@ -49,6 +49,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: fetch pdfium (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7988"
+          mkdir -p target/pdfium
+          curl -fsSL -o /tmp/pdfium.tgz "$base/${{ matrix.pdfium_asset }}"
+          echo "${{ matrix.pdfium_sha }}  /tmp/pdfium.tgz" | sha256sum -c -
+          tar -xzf /tmp/pdfium.tgz -C target/pdfium
+          lib=$(find target/pdfium -name "${{ matrix.pdfium_lib }}" | head -1)
+          test -n "$lib"
+          cp "$lib" "target/pdfium/${{ matrix.pdfium_lib }}"
+          echo "PDFIUM_LIB_PATH=$PWD/target/pdfium/${{ matrix.pdfium_lib }}" >> "$GITHUB_ENV"
 
       - name: build
         shell: bash
@@ -71,12 +85,15 @@ jobs:
           [ "${{ matrix.os }}" = "windows" ] && src="${src}.exe"
           name="docs2md-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p dist
+          lib="target/pdfium/${{ matrix.pdfium_lib }}"
+          test -f "$lib"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a -tzip "dist/${name}.zip" "$src" >/dev/null
+            7z a -tzip "dist/${name}.zip" "$src" "$lib" >/dev/null
           else
             cp "$src" docs2md
-            tar -czf "dist/${name}.tar.gz" docs2md
-            rm -f docs2md
+            cp "$lib" "${{ matrix.pdfium_lib }}"
+            tar -czf "dist/${name}.tar.gz" docs2md "${{ matrix.pdfium_lib }}"
+            rm -f docs2md "${{ matrix.pdfium_lib }}"
           fi
           cd dist
           if command -v sha256sum >/dev/null; then sha256sum * > "${name}.sha256"; else shasum -a 256 * > "${name}.sha256"; fi
