@@ -25,16 +25,8 @@ fn minimal_pdf() -> Vec<u8> {
         out.extend_from_slice(b"\nendobj\n");
     };
 
-    obj(
-        &mut out,
-        1,
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-    );
-    obj(
-        &mut out,
-        2,
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    );
+    obj(&mut out, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    obj(&mut out, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     obj(
         &mut out,
         3,
@@ -113,20 +105,29 @@ fn blocks_json_surface() {
 
     let raw = std::fs::read_to_string(&blocks).expect("blocks json written");
     let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-    let pages = doc.get("pages").and_then(|p| p.as_array()).expect("pages array");
+    let pages = doc
+        .get("pages")
+        .and_then(|p| p.as_array())
+        .expect("pages array");
     assert_eq!(pages.len(), 1, "one page in");
 
     let page = &pages[0];
     assert_eq!(page.get("page").and_then(|v| v.as_u64()), Some(1));
     assert!(page.get("tier").and_then(|v| v.as_str()).is_some());
-    let blocks = page.get("blocks").and_then(|b| b.as_array()).expect("blocks array");
+    let blocks = page
+        .get("blocks")
+        .and_then(|b| b.as_array())
+        .expect("blocks array");
     // A text-layer page yields L0 line blocks: two text lines.
     assert!(!blocks.is_empty(), "L0 text-layer page must emit blocks");
     let total_text: String = blocks
         .iter()
         .map(|b| b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
         .collect();
-    assert!(total_text.contains("First line"), "text preserved: {total_text:?}");
+    assert!(
+        total_text.contains("First line"),
+        "text preserved: {total_text:?}"
+    );
 
     for b in blocks {
         let label = b.get("label").and_then(|v| v.as_str()).expect("label");
@@ -134,7 +135,10 @@ fn blocks_json_surface() {
             docs2md::blocks::LABELS.contains(&label),
             "label {label} not in the 11-label vocabulary"
         );
-        let bbox = b.get("bbox").and_then(|v| v.as_array()).expect("bbox array");
+        let bbox = b
+            .get("bbox")
+            .and_then(|v| v.as_array())
+            .expect("bbox array");
         assert_eq!(bbox.len(), 4, "bbox [x0,y0,x1,y1]");
         for c in bbox {
             let v = c.as_f64().expect("numeric bbox");

@@ -93,11 +93,7 @@ pub trait L1Engine: Send {
     /// Recognize one rendered page (PNG bytes, pixel y-down). `rc` carries
     /// the routing thresholds — the Indra engine evaluates the L1→L2 serial
     /// metric chain (plan §2.1) against it; PP-OCRv6 ignores it.
-    fn ocr_page(
-        &mut self,
-        png: &[u8],
-        rc: &crate::config::RouteConfig,
-    ) -> Result<OcrPage, String>;
+    fn ocr_page(&mut self, png: &[u8], rc: &crate::config::RouteConfig) -> Result<OcrPage, String>;
 }
 
 /// PP-OCRv6 engine (embedded `small` by default).
@@ -227,11 +223,7 @@ impl L1Engine for IndraEngine {
         "indra"
     }
 
-    fn ocr_page(
-        &mut self,
-        png: &[u8],
-        rc: &crate::config::RouteConfig,
-    ) -> Result<OcrPage, String> {
+    fn ocr_page(&mut self, png: &[u8], rc: &crate::config::RouteConfig) -> Result<OcrPage, String> {
         let gray = indra::preproc::Gray::from_png(png)?;
         self.engine.ocr_page(&gray, rc)
     }

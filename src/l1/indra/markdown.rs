@@ -167,9 +167,7 @@ pub fn join_lines(texts: &[String]) -> String {
         {
             out.pop(); // drop the '-'
             out.push_str(t);
-        } else if out.is_empty()
-            || (cjk(oc[oc.len() - 1]) && cjk(tc[0]))
-        {
+        } else if out.is_empty() || (cjk(oc[oc.len() - 1]) && cjk(tc[0])) {
             out.push_str(t);
         } else {
             out.push(' ');
@@ -199,8 +197,14 @@ pub fn split_blocks(order: &[usize], same: &[f32]) -> Vec<Vec<usize>> {
 /// Group cell lines into rows by vertical centre, top to bottom, left to right.
 fn rows(boxes: &[[f32; 4]]) -> Vec<Vec<usize>> {
     let n = boxes.len();
-    let cy: Vec<f32> = (0..n).map(|i| (boxes[i][1] + boxes[i][3]) / 2.0f32).collect();
-    let h = median_f32(&(0..n).map(|i| boxes[i][3] - boxes[i][1]).collect::<Vec<_>>());
+    let cy: Vec<f32> = (0..n)
+        .map(|i| (boxes[i][1] + boxes[i][3]) / 2.0f32)
+        .collect();
+    let h = median_f32(
+        &(0..n)
+            .map(|i| boxes[i][3] - boxes[i][1])
+            .collect::<Vec<_>>(),
+    );
     let mut rows: Vec<Vec<usize>> = Vec::new();
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&i, &j| cy[i].total_cmp(&cy[j]).then_with(|| i.cmp(&j)));
@@ -225,14 +229,21 @@ fn merge_wrapped(rows: &[Vec<usize>], boxes: &[[f32; 4]]) -> Vec<Vec<usize>> {
     if rows.len() < 3 {
         return rows.to_vec();
     }
-    let h = median_f32(&(0..boxes.len()).map(|i| boxes[i][3] - boxes[i][1]).collect::<Vec<_>>());
+    let h = median_f32(
+        &(0..boxes.len())
+            .map(|i| boxes[i][3] - boxes[i][1])
+            .collect::<Vec<_>>(),
+    );
     let gaps: Vec<f64> = (0..rows.len() - 1)
         .map(|r| {
             let y_min_next = rows[r + 1]
                 .iter()
                 .map(|&k| boxes[k][1])
                 .fold(f32::INFINITY, |a, b| a.min(b));
-            let y_max_cur = rows[r].iter().map(|&k| boxes[k][3]).fold(0.0f32, |a, b| a.max(b));
+            let y_max_cur = rows[r]
+                .iter()
+                .map(|&k| boxes[k][3])
+                .fold(0.0f32, |a, b| a.max(b));
             (y_min_next - y_max_cur) as f64
         })
         .collect();
@@ -277,7 +288,10 @@ pub fn table_html(boxes: &[[f32; 4]], texts: &[String]) -> String {
         .iter()
         .map(|b| b[2])
         .fold(f32::NEG_INFINITY, |a, b| a.max(b))
-        - boxes.iter().map(|b| b[0]).fold(f32::INFINITY, |a, b| a.min(b));
+        - boxes
+            .iter()
+            .map(|b| b[0])
+            .fold(f32::INFINITY, |a, b| a.min(b));
     if rows_.len() > 2
         && rows_[0].len() == 1
         && rows_.iter().map(|r| r.len()).max().unwrap() > 1
@@ -313,7 +327,11 @@ pub fn table_html(boxes: &[[f32; 4]], texts: &[String]) -> String {
     };
     let mut out = vec!["<table>".to_string()];
     for (ri, r) in rows_.iter().enumerate() {
-        let tag = if ri == 0 && rows_.len() > 1 { "th" } else { "td" };
+        let tag = if ri == 0 && rows_.len() > 1 {
+            "th"
+        } else {
+            "td"
+        };
         let mut cells: std::collections::BTreeMap<usize, (usize, String)> = Default::default();
         let mut order: Vec<usize> = r.clone();
         order.sort_by(|&a, &b| {
@@ -407,10 +425,18 @@ pub fn table_html_heads(boxes: &[[f32; 4]], texts: &[String], tab: &[Vec<f32>]) 
         .iter()
         .map(|c| {
             [
-                c.iter().map(|&k| boxes[k][0]).fold(f32::INFINITY, |a, b| a.min(b)),
-                c.iter().map(|&k| boxes[k][1]).fold(f32::INFINITY, |a, b| a.min(b)),
-                c.iter().map(|&k| boxes[k][2]).fold(f32::NEG_INFINITY, |a, b| a.max(b)),
-                c.iter().map(|&k| boxes[k][3]).fold(f32::NEG_INFINITY, |a, b| a.max(b)),
+                c.iter()
+                    .map(|&k| boxes[k][0])
+                    .fold(f32::INFINITY, |a, b| a.min(b)),
+                c.iter()
+                    .map(|&k| boxes[k][1])
+                    .fold(f32::INFINITY, |a, b| a.min(b)),
+                c.iter()
+                    .map(|&k| boxes[k][2])
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b)),
+                c.iter()
+                    .map(|&k| boxes[k][3])
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b)),
             ]
         })
         .collect();
@@ -486,7 +512,11 @@ pub fn table_html_heads(boxes: &[[f32; 4]], texts: &[String], tab: &[Vec<f32>]) 
             median_f32(&v) as f32
         })
         .collect();
-    let h = median_f32(&(0..boxes.len()).map(|i| boxes[i][3] - boxes[i][1]).collect::<Vec<_>>());
+    let h = median_f32(
+        &(0..boxes.len())
+            .map(|i| boxes[i][3] - boxes[i][1])
+            .collect::<Vec<_>>(),
+    );
     let mut grid: std::collections::HashMap<(usize, usize), (usize, String)> = Default::default();
     for c in 0..m {
         let c0 = col_of[c];
@@ -509,7 +539,11 @@ pub fn table_html_heads(boxes: &[[f32; 4]], texts: &[String], tab: &[Vec<f32>]) 
     }
     let mut out = vec!["<table>".to_string()];
     for r in 0..rows_sorted.len() {
-        let tag = if r == 0 && rows_sorted.len() > 1 { "th" } else { "td" };
+        let tag = if r == 0 && rows_sorted.len() > 1 {
+            "th"
+        } else {
+            "td"
+        };
         let mut tds = Vec::new();
         let mut c = 0usize;
         while c < cols_sorted.len() {
@@ -570,10 +604,22 @@ pub fn page_blocks(
         .collect();
     let mut out = Vec::new();
     for blk in split_blocks(order, same) {
-        let x0 = blk.iter().map(|&i| f32b[i][0]).fold(f32::INFINITY, |a, b| a.min(b));
-        let y0 = blk.iter().map(|&i| f32b[i][1]).fold(f32::INFINITY, |a, b| a.min(b));
-        let x1 = blk.iter().map(|&i| f32b[i][2]).fold(f32::NEG_INFINITY, |a, b| a.max(b));
-        let y1 = blk.iter().map(|&i| f32b[i][3]).fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let x0 = blk
+            .iter()
+            .map(|&i| f32b[i][0])
+            .fold(f32::INFINITY, |a, b| a.min(b));
+        let y0 = blk
+            .iter()
+            .map(|&i| f32b[i][1])
+            .fold(f32::INFINITY, |a, b| a.min(b));
+        let x1 = blk
+            .iter()
+            .map(|&i| f32b[i][2])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let y1 = blk
+            .iter()
+            .map(|&i| f32b[i][3])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
         out.push(LayoutBlock {
             class: block_class(&blk, cls),
             bbox: [
@@ -611,8 +657,14 @@ pub fn table_postfilter(
             if block_class(blk, cls) != TABLE {
                 return true;
             }
-            let x0 = blk.iter().map(|&i| boxes[i][0]).fold(f64::INFINITY, f64::min);
-            let y0 = blk.iter().map(|&i| boxes[i][1]).fold(f64::INFINITY, f64::min);
+            let x0 = blk
+                .iter()
+                .map(|&i| boxes[i][0])
+                .fold(f64::INFINITY, f64::min);
+            let y0 = blk
+                .iter()
+                .map(|&i| boxes[i][1])
+                .fold(f64::INFINITY, f64::min);
             let x1 = blk.iter().map(|&i| boxes[i][2]).fold(0.0f64, f64::max);
             let y1 = blk.iter().map(|&i| boxes[i][3]).fold(0.0f64, f64::max);
             let frac = if page_area > 0.0 {
@@ -620,11 +672,8 @@ pub fn table_postfilter(
             } else {
                 1.0
             };
-            let mean_conf: f64 = blk
-                .iter()
-                .map(|&i| conf[i] as f64)
-                .sum::<f64>()
-                / blk.len() as f64;
+            let mean_conf: f64 =
+                blk.iter().map(|&i| conf[i] as f64).sum::<f64>() / blk.len() as f64;
             (frac < TABLE_COMPACT_FRAC && mean_conf > TABLE_COMPACT_CONF) || has_table_caption
         })
         .collect()
@@ -691,10 +740,18 @@ pub fn page_markdown(
         );
         if parts.len() > n_before {
             part_boxes.push([
-                blk.iter().map(|&i| f32b[i][0]).fold(f32::INFINITY, |a, b| a.min(b)),
-                blk.iter().map(|&i| f32b[i][1]).fold(f32::INFINITY, |a, b| a.min(b)),
-                blk.iter().map(|&i| f32b[i][2]).fold(f32::NEG_INFINITY, |a, b| a.max(b)),
-                blk.iter().map(|&i| f32b[i][3]).fold(f32::NEG_INFINITY, |a, b| a.max(b)),
+                blk.iter()
+                    .map(|&i| f32b[i][0])
+                    .fold(f32::INFINITY, |a, b| a.min(b)),
+                blk.iter()
+                    .map(|&i| f32b[i][1])
+                    .fold(f32::INFINITY, |a, b| a.min(b)),
+                blk.iter()
+                    .map(|&i| f32b[i][2])
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b)),
+                blk.iter()
+                    .map(|&i| f32b[i][3])
+                    .fold(f32::NEG_INFINITY, |a, b| a.max(b)),
             ]);
         }
     }
@@ -712,7 +769,10 @@ pub fn page_markdown(
                     })
                     .map(|(j, _)| j)
                     .unwrap_or(parts.len());
-                slots.entry(at).or_default().push(format!("![](picture-{k})"));
+                slots
+                    .entry(at)
+                    .or_default()
+                    .push(format!("![](picture-{k})"));
             }
             let mut merged = Vec::new();
             for j in 0..=parts.len() {
@@ -771,10 +831,7 @@ fn block_part(
             // Post-filter: the table is demoted to plain joined text.
             parts.push(join_lines(&texts_b));
         } else if let Some(t) = tab_blk {
-            if heads_plausible(
-                &blk.iter().map(|&i| boxes[i]).collect::<Vec<_>>(),
-                &t[2],
-            ) {
+            if heads_plausible(&blk.iter().map(|&i| boxes[i]).collect::<Vec<_>>(), &t[2]) {
                 let tb: Vec<[f32; 4]> = blk.iter().map(|&i| boxes[i]).collect();
                 parts.push(table_html_heads(&tb, &texts_b, t));
             } else {
@@ -1003,8 +1060,16 @@ pub fn split_line(
             // rounds away.
             let lo = x0 - 0.35 * h;
             let hi = x1 + 0.35 * h;
-            let bx0 = if (lo as f32) > (box_[0] as f32) { lo } else { box_[0] };
-            let bx2 = if (hi as f32) < (box_[2] as f32) { hi } else { box_[2] };
+            let bx0 = if (lo as f32) > (box_[0] as f32) {
+                lo
+            } else {
+                box_[0]
+            };
+            let bx2 = if (hi as f32) < (box_[2] as f32) {
+                hi
+            } else {
+                box_[2]
+            };
             out.push(([bx0, box_[1], bx2, box_[3]], text, sg.to_vec()));
         }
     }
@@ -1056,8 +1121,7 @@ pub fn tidy_lines(
             // float32, and numpy 2.x (NEP 50) keeps the weak python-float
             // factors (0.5, -0.3, MARKER_GAP) in float32, so every comparison
             // below runs in f32.
-            let ov = (boxes[i][3] as f32)
-                .min(boxes[j][3] as f32)
+            let ov = (boxes[i][3] as f32).min(boxes[j][3] as f32)
                 - (boxes[i][1] as f32).max(boxes[j][1] as f32);
             if ov < 0.5f32 * h32[i].min(h32[j]) {
                 continue;
@@ -1082,7 +1146,11 @@ pub fn tidy_lines(
         // token matches the kind of the item line it is prepended to.
         if !rtl && !rec[i].2.is_empty() && !kj.is_empty() && rec[i].2[0].is_char() == chars {
             let x = ((boxes[i][2] as f32) + (boxes[b][0] as f32)) as f64 / 2.0;
-            let sp_tok = if chars { Tok::Ch(' ', x) } else { Tok::Id(space_id, x) };
+            let sp_tok = if chars {
+                Tok::Ch(' ', x)
+            } else {
+                Tok::Id(space_id, x)
+            };
             let mut newk = rec[i].2.clone();
             newk.push(sp_tok);
             newk.extend(kj);
@@ -1122,10 +1190,7 @@ mod tests {
             join_lines(&["tumori-".into(), "genesis".into()]),
             "tumorigenesis"
         );
-        assert_eq!(
-            join_lines(&["hello".into(), "world".into()]),
-            "hello world"
-        );
+        assert_eq!(join_lines(&["hello".into(), "world".into()]), "hello world");
         assert_eq!(join_lines(&["中文".into(), "文档".into()]), "中文文档");
         assert_eq!(join_lines(&["a-".into(), "B".into()]), "a- B"); // capital: no hyphen join
         assert_eq!(join_lines(&["".into(), "x".into(), "  ".into()]), "x");
@@ -1169,7 +1234,15 @@ mod tests {
     fn split_line_cuts_at_wide_gap() {
         let v = vocab();
         let toks = vec![Tok::Id(1, 10.0), Tok::Id(2, 12.0), Tok::Id(1, 60.0)];
-        let out = split_line([5.0, 0.0, 100.0, 10.0], &toks, SPLIT_GAP, None, 3, &v, false);
+        let out = split_line(
+            [5.0, 0.0, 100.0, 10.0],
+            &toks,
+            SPLIT_GAP,
+            None,
+            3,
+            &v,
+            false,
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].1, "ab");
         assert_eq!(out[1].1, "a");
@@ -1202,8 +1275,8 @@ mod tests {
     #[test]
     fn tidy_lines_drops_leaders_and_joins_markers() {
         let mut boxes = vec![
-            [10.0, 0.0, 200.0, 10.0], // "..." leader: dropped
-            [40.0, 20.0, 60.0, 30.0], // "•" marker: joins the item
+            [10.0, 0.0, 200.0, 10.0],  // "..." leader: dropped
+            [40.0, 20.0, 60.0, 30.0],  // "•" marker: joins the item
             [70.0, 20.0, 200.0, 30.0], // item text
         ];
         let mut rec = vec![
@@ -1222,10 +1295,7 @@ mod tests {
     #[test]
     fn table_postfilter_keeps_compact_confident() {
         // Two table blocks: a compact, confident one and a full-page one.
-        let boxes: Vec<[f64; 4]> = vec![
-            [10.0, 10.0, 50.0, 30.0],
-            [10.0, 100.0, 790.0, 800.0],
-        ];
+        let boxes: Vec<[f64; 4]> = vec![[10.0, 10.0, 50.0, 30.0], [10.0, 100.0, 790.0, 800.0]];
         let cls: Vec<f32> = (0..2 * N_BLOCK_CLASSES)
             .map(|i| {
                 if i % N_BLOCK_CLASSES == TABLE {
@@ -1257,14 +1327,7 @@ mod tests {
         );
         assert_eq!(keep2, vec![true, true]);
         // Low confidence demotes even a compact table.
-        let keep3 = table_postfilter(
-            &[vec![0usize]],
-            &boxes,
-            &cls,
-            &[0.3f32],
-            page_area,
-            false,
-        );
+        let keep3 = table_postfilter(&[vec![0usize]], &boxes, &cls, &[0.3f32], page_area, false);
         assert_eq!(keep3, vec![false]);
     }
 
@@ -1315,21 +1378,13 @@ mod tests {
             [10.0, 20.0, 60.0, 30.0],
             [70.0, 20.0, 120.0, 30.0],
         ];
-        let texts: Vec<String> = vec![
-            "a".into(),
-            "b".into(),
-            "c".into(),
-            "d".into(),
-        ];
+        let texts: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         let mut cls = vec![0.0f32; 4 * N_BLOCK_CLASSES];
         for i in 0..4 {
             cls[i * N_BLOCK_CLASSES + TABLE] = 9.0;
         }
         let same = [
-            0.0f32, 1.0, 1.0, 1.0,
-            1.0, 0.0, 1.0, 1.0,
-            1.0, 1.0, 0.0, 1.0,
-            1.0, 1.0, 1.0, 0.0,
+            0.0f32, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
         ];
         // Kept: a two-column table.
         let md = page_markdown(

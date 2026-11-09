@@ -82,7 +82,13 @@ pub fn is_py_lower(c: char) -> bool {
 /// (unicodedata.east_asian_width in "WF").
 pub fn display_len(t: &str) -> usize {
     t.chars()
-        .map(|c| if char_tables::in_runs(c as u32, char_tables::EAW_WF_RUNS) { 2 } else { 1 })
+        .map(|c| {
+            if char_tables::in_runs(c as u32, char_tables::EAW_WF_RUNS) {
+                2
+            } else {
+                1
+            }
+        })
         .sum()
 }
 
@@ -169,9 +175,8 @@ pub fn line_features(boxes: &[[f64; 4]], wh: (f64, f64), texts: Option<&[String]
                 // t[:3].rstrip(".)").isdigit() and len(t) > 3
                 let first3: String = chars.iter().take(3).collect();
                 let stripped = first3.trim_end_matches(['.', ')']);
-                let enumerator = !stripped.is_empty()
-                    && stripped.chars().all(is_py_digit)
-                    && chars.len() > 3;
+                let enumerator =
+                    !stripped.is_empty() && stripped.chars().all(is_py_digit) && chars.len() > 3;
                 row[12] = (LIST_MARKERS.contains(&chars[0]) || enumerator) as u8 as f32;
                 row[13] = (chars.last() == Some(&'-')) as u8 as f32;
                 row[14] = SENTENCE_END.contains(&chars[chars.len() - 1]) as u8 as f32;
@@ -218,11 +223,7 @@ pub fn decode_order(a: &[f32], n: usize, sweeps: usize) -> Vec<usize> {
     }
     // np.argsort (ascending, stable): (score, index)
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&i, &j| {
-        score[i]
-            .total_cmp(&score[j])
-            .then_with(|| i.cmp(&j))
-    });
+    order.sort_by(|&i, &j| score[i].total_cmp(&score[j]).then_with(|| i.cmp(&j)));
 
     let mut improved = true;
     let mut sweep = 0usize;
@@ -279,13 +280,20 @@ pub fn order_top_down(boxes: &[[f32; 4]]) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    let cy: Vec<f32> = (0..n).map(|i| (boxes[i][1] + boxes[i][3]) / 2.0f32).collect();
-    let h = median_f32(&(0..n).map(|i| boxes[i][3] - boxes[i][1]).collect::<Vec<_>>()) as f32;
+    let cy: Vec<f32> = (0..n)
+        .map(|i| (boxes[i][1] + boxes[i][3]) / 2.0f32)
+        .collect();
+    let h = median_f32(
+        &(0..n)
+            .map(|i| boxes[i][3] - boxes[i][1])
+            .collect::<Vec<_>>(),
+    ) as f32;
     let row_of = |i: usize| py_round((cy[i] / (h * 0.5f32).max(1e-3f32)) as f64);
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&i, &j| {
         let (ri, rj) = (row_of(i), row_of(j));
-        ri.cmp(&rj).then_with(|| (boxes[i][0] as f64).total_cmp(&(boxes[j][0] as f64)))
+        ri.cmp(&rj)
+            .then_with(|| (boxes[i][0] as f64).total_cmp(&(boxes[j][0] as f64)))
     });
     idx
 }
@@ -324,10 +332,7 @@ pub fn order_xycut(boxes: &[[f32; 4]]) -> Vec<usize> {
         let (gy, ky, oy) = best_cut(&b, 1);
         let (gx, kx, ox) = best_cut(&b, 0);
         if ky < 0 && kx < 0 {
-            return order_top_down(&b)
-                .iter()
-                .map(|&i| ids[i])
-                .collect();
+            return order_top_down(&b).iter().map(|&i| ids[i]).collect();
         }
         let (k, o): (i32, Vec<usize>) = if gy >= gx { (ky, oy) } else { (kx, ox) };
         let left: Vec<usize> = o[..k as usize].iter().map(|&i| ids[i]).collect();
@@ -347,7 +352,11 @@ pub fn xycut_blocks(boxes: &[[f32; 4]], min_gap: f64) -> Vec<Vec<usize>> {
     if boxes.is_empty() {
         return Vec::new();
     }
-    let h = median_f32(&(0..boxes.len()).map(|i| boxes[i][3] - boxes[i][1]).collect::<Vec<_>>());
+    let h = median_f32(
+        &(0..boxes.len())
+            .map(|i| boxes[i][3] - boxes[i][1])
+            .collect::<Vec<_>>(),
+    );
     let ids: Vec<usize> = (0..boxes.len()).collect();
     rec_blocks(boxes, min_gap, h, &ids)
 }
@@ -579,7 +588,11 @@ impl super::IndraEngine {
         let n = boxes.len();
         if n < 2 {
             let f32b = boxes_f32(boxes);
-            let order = if n == 0 { Vec::new() } else { order_xycut(&f32b) };
+            let order = if n == 0 {
+                Vec::new()
+            } else {
+                order_xycut(&f32b)
+            };
             return Ok(ReadingOrder {
                 order,
                 a: None,
@@ -670,11 +683,7 @@ mod tests {
     #[test]
     fn cluster_splinks_positive_means() {
         // Two tight groups, negative between them.
-        let same = [
-            0.0f32, 2.0, -1.0,
-            2.0, 0.0, -1.0,
-            -1.0, -1.0, 0.0,
-        ];
+        let same = [0.0f32, 2.0, -1.0, 2.0, 0.0, -1.0, -1.0, -1.0, 0.0];
         let c = cluster(&same, 3);
         assert_eq!(c, vec![vec![0, 1], vec![2]]);
         // All negative means: every line its own group.
@@ -728,7 +737,11 @@ mod tests {
         assert_eq!(f[N_FEATS + 15], 0.0);
         assert_eq!(f[N_FEATS + 14], 0.0);
         // empty text: all text features 0
-        let f2 = line_features(&boxes, (400.0, 400.0), Some(&["".to_string(), "  ".to_string()]));
+        let f2 = line_features(
+            &boxes,
+            (400.0, 400.0),
+            Some(&["".to_string(), "  ".to_string()]),
+        );
         for i in 10..16 {
             assert_eq!(f2[i], 0.0);
             assert_eq!(f2[N_FEATS + i], 0.0);

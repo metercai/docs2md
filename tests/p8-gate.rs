@@ -108,7 +108,11 @@ fn p8_gate_32_pages() {
             .unwrap_or_else(|e| panic!("{tag}: ocr_page failed: {e}"));
         pages.push((tag.to_string(), page));
     }
-    assert_eq!(pages.len(), 32, "all 32 pages must produce a terminal outcome");
+    assert_eq!(
+        pages.len(),
+        32,
+        "all 32 pages must produce a terminal outcome"
+    );
     let escalated: Vec<&String> = pages
         .iter()
         .filter(|(_, p)| p.escalate_l2.is_some())

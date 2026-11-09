@@ -26,23 +26,15 @@ pub(crate) mod assets {
     pub const META: &[u8] = include_bytes!("../../../assets/models/indra/meta.json");
     pub const LM: &[u8] = include_bytes!("../../../assets/models/indra/lm.npz");
     pub const LM_CJK: &[u8] = include_bytes!("../../../assets/models/indra/lm_cjk.npz");
-    pub const LM_WORLD: &[u8] = include_bytes!(
-        "../../../assets/models/indra/lm_world.npz"
-    );
+    pub const LM_WORLD: &[u8] = include_bytes!("../../../assets/models/indra/lm_world.npz");
     pub const DET: &[u8] = include_bytes!("../../../assets/models/indra/det.onnx");
     pub const REC: &[u8] = include_bytes!("../../../assets/models/indra/rec.onnx");
-    pub const REC_CJK: &[u8] = include_bytes!(
-        "../../../assets/models/indra/rec_cjk.onnx"
-    );
+    pub const REC_CJK: &[u8] = include_bytes!("../../../assets/models/indra/rec_cjk.onnx");
     pub const REC_RTL: &[u8] = include_bytes!("../../../assets/models/indra/rec_rtl.onnx");
-    pub const REC_WORLD: &[u8] = include_bytes!(
-        "../../../assets/models/indra/rec_world.onnx"
-    );
+    pub const REC_WORLD: &[u8] = include_bytes!("../../../assets/models/indra/rec_world.onnx");
     pub const ORDER: &[u8] = include_bytes!("../../../assets/models/indra/order.onnx");
     pub const ORIENT: &[u8] = include_bytes!("../../../assets/models/indra/orient.onnx");
-    pub const SCRIPT: &[u8] = include_bytes!(
-        "../../../assets/models/indra/script.onnx"
-    );
+    pub const SCRIPT: &[u8] = include_bytes!("../../../assets/models/indra/script.onnx");
 }
 
 /// One output tensor in the element type rten 0.27 actually produces
@@ -136,7 +128,11 @@ impl Session {
                 (name, *id)
             })
             .collect();
-        Ok(Self { model, inputs, outputs })
+        Ok(Self {
+            model,
+            inputs,
+            outputs,
+        })
     }
 
     fn input_id(&self, name: &str) -> Result<rten::NodeId, String> {
@@ -144,16 +140,19 @@ impl Session {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, id)| *id)
-            .ok_or_else(|| format!("input '{name}' not found (have {:?})", self.inputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()))
+            .ok_or_else(|| {
+                format!(
+                    "input '{name}' not found (have {:?})",
+                    self.inputs
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
     }
 
     /// Run with one float input.
-    pub fn run_f(
-        &self,
-        input: &str,
-        shape: &[usize],
-        data: &[f32],
-    ) -> Result<Vec<Tensor>, String> {
+    pub fn run_f(&self, input: &str, shape: &[usize], data: &[f32]) -> Result<Vec<Tensor>, String> {
         let id = self.input_id(input)?;
         let t = rten_tensor::Tensor::from_data(shape, data.to_vec());
         let outs = self
@@ -288,7 +287,11 @@ impl IndraEngine {
         let ink = preproc::orient_input(gray, preproc::ORIENT_SIDE);
         let outs = self
             .orient
-            .run_f("x", &[1, 1, preproc::ORIENT_SIDE, preproc::ORIENT_SIDE], &ink.data)
+            .run_f(
+                "x",
+                &[1, 1, preproc::ORIENT_SIDE, preproc::ORIENT_SIDE],
+                &ink.data,
+            )
             .map_err(|e| format!("orient run: {e}"))?;
         let p = outs[0]
             .as_float()
@@ -509,8 +512,12 @@ impl IndraEngine {
         let blocks: Vec<super::Block> = groups
             .iter()
             .map(|g| {
-                let (mut x0, mut y0, mut x1, mut y1) =
-                    (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                let (mut x0, mut y0, mut x1, mut y1) = (
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                );
                 for &i in g {
                     let b = line_boxes[pos_of[i]];
                     x0 = x0.min(b[0]);
@@ -649,10 +656,18 @@ impl IndraEngine {
             // every line, as the product computes cells for all of them.
             let cells: markdown::Cells = (0..boxes.len())
                 .map(|i| {
-                    markdown::split_line(boxes[i], &rec_toks[i], markdown::CELL_GAP, None, space_id, vocab, page_rtl)
-                        .into_iter()
-                        .map(|(bx, tx, _)| (geo(bx).to_vec(), tx))
-                        .collect()
+                    markdown::split_line(
+                        boxes[i],
+                        &rec_toks[i],
+                        markdown::CELL_GAP,
+                        None,
+                        space_id,
+                        vocab,
+                        page_rtl,
+                    )
+                    .into_iter()
+                    .map(|(bx, tx, _)| (geo(bx).to_vec(), tx))
+                    .collect()
                 })
                 .collect();
             let block_groups: Vec<Vec<usize>> = markdown::split_blocks(&order, &same);
@@ -714,11 +729,19 @@ mod tests {
     fn all_models_load_with_expected_io() {
         let e = engine();
         assert_eq!(
-            e.det.inputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            e.det
+                .inputs
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
             vec!["x"]
         );
         assert_eq!(
-            e.det.outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            e.det
+                .outputs
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
             vec!["out"]
         );
         for g in ["base", "cjk", "rtl", "world"] {
@@ -727,19 +750,26 @@ mod tests {
                 s.inputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
                 vec!["x", "widths"]
             );
-            let onames: Vec<&str> =
-                s.outputs.iter().map(|(n, _)| n.as_str()).collect();
+            let onames: Vec<&str> = s.outputs.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(
                 onames,
                 vec!["ids", "conf", "lengths", "blank", "topv", "topi"]
             );
         }
         assert_eq!(
-            e.order.inputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            e.order
+                .inputs
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
             vec!["feats", "mask"]
         );
         assert_eq!(
-            e.orient.inputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            e.orient
+                .inputs
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
             vec!["x"]
         );
         assert_eq!(
@@ -774,8 +804,7 @@ mod tests {
         // base rec expects [B,1,96,W]; widths in [0,W].
         let w = 64usize;
         let data = vec![0.0f32; 96 * w];
-        let out = e
-            .rec["base"]
+        let out = e.rec["base"]
             .run_fi("x", &[1, 1, 96, w], &data, "widths", &[1], &[w as i32])
             .expect("rec run");
         let names: Vec<&str> = vec!["ids", "conf", "lengths", "blank", "topv", "topi"];
@@ -811,7 +840,10 @@ mod tests {
         let e = engine();
         let n = 768 * 768;
         let data = vec![0.0f32; n];
-        let out = e.orient.run_f("x", &[1, 1, 768, 768], &data).expect("orient run");
+        let out = e
+            .orient
+            .run_f("x", &[1, 1, 768, 768], &data)
+            .expect("orient run");
         assert_eq!(out[0].shape(), &vec![1, 5]);
     }
 
@@ -830,7 +862,11 @@ mod tests {
         let outs = e
             .order
             .model
-            .run(vec![(fid, ft.view().into()), (mid, mt.view().into())], &oids, None)
+            .run(
+                vec![(fid, ft.view().into()), (mid, mt.view().into())],
+                &oids,
+                None,
+            )
             .expect("order run");
         let t0 = value_to_tensor(&outs[0]).unwrap();
         assert_eq!(t0.shape()[0], 1);

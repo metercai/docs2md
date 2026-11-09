@@ -214,7 +214,11 @@ fn main() {
             }
         }
         match std::fs::write(blocks_path, serde_json::to_string_pretty(&doc).unwrap()) {
-            Ok(()) => eprintln!("[blocks] {} ({} pages)", blocks_path.display(), result.pages.len()),
+            Ok(()) => eprintln!(
+                "[blocks] {} ({} pages)",
+                blocks_path.display(),
+                result.pages.len()
+            ),
             Err(e) => {
                 eprintln!("error: cannot write {}: {e}", blocks_path.display());
                 std::process::exit(1);

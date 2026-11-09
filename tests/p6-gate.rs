@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value;
 
-use docs2md::l1::indra::markdown::{gutter_cuts, page_markdown, split_line, tidy_lines, Cells, Tok};
+use docs2md::l1::indra::markdown::{
+    gutter_cuts, page_markdown, split_line, tidy_lines, Cells, Tok,
+};
 use docs2md::l1::indra::vocab::{Meta, Vocab};
 
 const REF_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/p1/ref");
@@ -47,7 +49,8 @@ struct Page {
 }
 
 fn arr<'a>(v: &'a Value, what: &str) -> &'a [Value] {
-    v.as_array().unwrap_or_else(|| panic!("{what}: not an array: {v:?}"))
+    v.as_array()
+        .unwrap_or_else(|| panic!("{what}: not an array: {v:?}"))
 }
 
 fn f4(v: &Value, what: &str) -> [f64; 4] {
@@ -74,7 +77,10 @@ fn toks(v: &Value) -> Vec<Tok> {
             let x = a[2].as_f64().expect("token x");
             match a[1].as_i64() {
                 Some(i) => Tok::Id(i as i32, x),
-                None => Tok::Ch(a[1].as_str().expect("char token").chars().next().unwrap(), x),
+                None => Tok::Ch(
+                    a[1].as_str().expect("char token").chars().next().unwrap(),
+                    x,
+                ),
             }
         })
         .collect()
@@ -149,16 +155,17 @@ fn p6_gate() {
             let rtoks: Vec<Vec<Tok>> = arr(&call[1], "gutter toks").iter().map(toks).collect();
             let want: Vec<Vec<f64>> = arr(&call[2], "gutter cuts")
                 .iter()
-                .map(|l| arr(l, "gutter cut line").iter().map(|v| v.as_f64().unwrap()).collect())
+                .map(|l| {
+                    arr(l, "gutter cut line")
+                        .iter()
+                        .map(|v| v.as_f64().unwrap())
+                        .collect()
+                })
                 .collect();
             let got = gutter_cuts(&b64, &rtoks, space_id);
             if got.len() != want.len() {
                 gutter_mm += 1;
-                eprintln!(
-                    "{name} gutter[{ci}]: {} lines vs {}",
-                    got.len(),
-                    want.len()
-                );
+                eprintln!("{name} gutter[{ci}]: {} lines vs {}", got.len(), want.len());
                 continue;
             }
             for (li, (g, w)) in got.iter().zip(want.iter()).enumerate() {
@@ -188,11 +195,23 @@ fn p6_gate() {
             let at: Option<Vec<f64>> = call[2]
                 .as_array()
                 .map(|a| a.iter().map(|v| v.as_f64().unwrap()).collect());
-            let got = split_line(box4, &rt, call[1].as_f64().unwrap(), at.as_deref(), space_id, vocab, false);
+            let got = split_line(
+                box4,
+                &rt,
+                call[1].as_f64().unwrap(),
+                at.as_deref(),
+                space_id,
+                vocab,
+                false,
+            );
             let wout = arr(&call[4], "split out");
             if got.len() != wout.len() {
                 split_mm += 1;
-                eprintln!("{name} split[{ci}]: {} segments vs {}", got.len(), wout.len());
+                eprintln!(
+                    "{name} split[{ci}]: {} segments vs {}",
+                    got.len(),
+                    wout.len()
+                );
                 continue;
             }
             for (si, (g, w)) in got.iter().zip(wout.iter()).enumerate() {
@@ -202,7 +221,10 @@ fn p6_gate() {
                 for (bi, wb) in wbox.iter().enumerate() {
                     if g.0[bi] != *wb {
                         split_mm += 1;
-                        eprintln!("{name} split[{ci}] seg {si} box[{bi}]: got {} want {}", g.0[bi], wb);
+                        eprintln!(
+                            "{name} split[{ci}] seg {si} box[{bi}]: got {} want {}",
+                            g.0[bi], wb
+                        );
                     }
                 }
                 if g.1 != wtext {
@@ -238,14 +260,21 @@ fn p6_gate() {
             let wrec = arr(&wout[1], "tidy out rec");
             if boxes.len() != wboxes.len() {
                 tidy_mm += 1;
-                eprintln!("{name} tidy[{ci}]: {} lines vs {}", boxes.len(), wboxes.len());
+                eprintln!(
+                    "{name} tidy[{ci}]: {} lines vs {}",
+                    boxes.len(),
+                    wboxes.len()
+                );
                 continue;
             }
             for (li, (g, w)) in boxes.iter().zip(wboxes.iter()).enumerate() {
                 for (bi, wb) in w.iter().enumerate() {
                     if g[bi] != *wb {
                         tidy_mm += 1;
-                        eprintln!("{name} tidy[{ci}] line {li} box[{bi}]: got {} want {}", g[bi], wb);
+                        eprintln!(
+                            "{name} tidy[{ci}] line {li} box[{bi}]: got {} want {}",
+                            g[bi], wb
+                        );
                     }
                 }
             }
@@ -273,15 +302,23 @@ fn p6_gate() {
                         cs.iter()
                             .map(|c| {
                                 let c = arr(c, "cell");
-                                (arr(&c[0], "cell box").iter().map(|v| v.as_f64().unwrap()).collect(), c[1].as_str().unwrap().to_string())
+                                (
+                                    arr(&c[0], "cell box")
+                                        .iter()
+                                        .map(|v| v.as_f64().unwrap())
+                                        .collect(),
+                                    c[1].as_str().unwrap().to_string(),
+                                )
                             })
                             .collect()
                     })
                     .unwrap_or_default()
             })
             .collect();
-        let pics: Option<Vec<[f64; 4]>> =
-            page.pictures.as_ref().map(|p| p.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect());
+        let pics: Option<Vec<[f64; 4]>> = page
+            .pictures
+            .as_ref()
+            .map(|p| p.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect());
         let cls: Vec<f32> = page.cls.iter().flatten().copied().collect();
         let same: Vec<f32> = page.same.iter().flatten().copied().collect();
         let got_md = page_markdown(

@@ -102,15 +102,16 @@ fn run_pass(engine: &mut Engine) -> (String, Vec<(String, u32, String)>) {
         }
         md_all.push_str(&res.markdown);
         // Per-doc class counts for calibration cross-checks.
-        let cls_counts = |want: fn(&str) -> bool| {
-            res.pages.iter().filter(|r| want(r.tier.as_str())).count()
-        };
+        let cls_counts =
+            |want: fn(&str) -> bool| res.pages.iter().filter(|r| want(r.tier.as_str())).count();
         eprintln!(
             "[p9] {stem}: {expect} pages in {dt:.1}s (S0={} S1a={} S1b={} S2={})",
             cls_counts(|t| t == "L0-native"),
             cls_counts(|t| t == "L1-indra"),
             cls_counts(|t| t.starts_with("L2-ppv6(chain:")),
-            cls_counts(|t| !matches!(t, "L0-native" | "L1-indra") && !t.starts_with("L2-ppv6(chain:")),
+            cls_counts(
+                |t| !matches!(t, "L0-native" | "L1-indra") && !t.starts_with("L2-ppv6(chain:")
+            ),
         );
     }
     (md_all, pages)

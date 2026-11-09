@@ -18,10 +18,7 @@ use image::ImageReader;
 fn pages_dir() -> String {
     std::env::var("P9_PAGES").unwrap_or_else(|_| "/tmp/indra-ab/route/pages".into())
 }
-const DOCS: [&str; 2] = [
-    "WO2024133739A1_amylin_NN_patent_oral",
-    "WO2025114501A1",
-];
+const DOCS: [&str; 2] = ["WO2024133739A1_amylin_NN_patent_oral", "WO2025114501A1"];
 
 #[test]
 fn p9_ocr_page_perf() {
@@ -30,7 +27,10 @@ fn p9_ocr_page_perf() {
     let pages = pages_dir();
     let dir = Path::new(&pages);
     if !dir.is_dir() {
-        eprintln!("[p9] SKIP: pages dir not present at {} (local-only probe; set P9_PAGES)", dir.display());
+        eprintln!(
+            "[p9] SKIP: pages dir not present at {} (local-only probe; set P9_PAGES)",
+            dir.display()
+        );
         return;
     }
     let mut engine = IndraEngine::init().expect("indra init");
@@ -88,7 +88,10 @@ fn p9_ppocrv6_perf() {
     let pages = pages_dir();
     let dir = Path::new(&pages);
     if !dir.is_dir() {
-        eprintln!("[p9] SKIP (ppocrv6): pages dir not present at {}", dir.display());
+        eprintln!(
+            "[p9] SKIP (ppocrv6): pages dir not present at {}",
+            dir.display()
+        );
         return;
     }
     let rc = docs2md::config::RouteConfig::default();

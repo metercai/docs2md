@@ -121,7 +121,9 @@ pub fn output_gate(chars: usize, mean_conf: f32, rc: &RouteConfig) -> Option<&'s
 /// length when the engine produces one (Indra), otherwise the line-text
 /// total (PP-OCRv6).
 pub fn output_chars(page: &OcrPage) -> usize {
-    page.md.as_ref().map_or_else(|| page.char_count(), |m| m.chars().count())
+    page.md
+        .as_ref()
+        .map_or_else(|| page.char_count(), |m| m.chars().count())
 }
 
 /// L2→L3 gate (plan §2.2, decision F): a weak or invalid PP-OCRv6 (L2)
@@ -226,10 +228,7 @@ mod tests {
         // gone).
         assert_eq!(output_gate(5000, 0.4, &rc()), Some(TAG_CONF));
         // usize::MAX keeps only the conf criterion live (chain rec stage).
-        assert_eq!(
-            output_gate(usize::MAX, 0.4, &rc()),
-            Some(TAG_CONF)
-        );
+        assert_eq!(output_gate(usize::MAX, 0.4, &rc()), Some(TAG_CONF));
     }
 
     #[test]

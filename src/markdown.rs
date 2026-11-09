@@ -41,8 +41,7 @@ pub const NEEDS_HIGHER_NOTE: &str =
 /// the whole cascade (L1 serial chain, L2 PP-OCRv6, L3 VLM) produced no
 /// usable output: an explicit, non-empty note so the page is never
 /// silently empty (plan G, end of the cascade).
-pub const LOW_CONF_MARKER: &str =
-    "<!-- low confidence: the OCR chain escalated this page to L2 \
+pub const LOW_CONF_MARKER: &str = "<!-- low confidence: the OCR chain escalated this page to L2 \
          (PP-OCRv6) and no usable output was produced -->\n";
 
 /// The note attached to a chain-escalated page whose L2 (PP-OCRv6) read

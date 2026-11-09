@@ -165,7 +165,8 @@ impl RouteScript {
         // deterministic alphabetical tie-break).
         let mut dominant: Option<String> = None;
         if n > 0 {
-            let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
             for g in &self.raw {
                 *counts.entry(g.as_str()).or_insert(0) += 1;
             }
@@ -221,7 +222,11 @@ pub fn route_script(
             .collect()
     };
     let crops = crop(1);
-    let tall = if window > 1 { crop(window) } else { crops.clone() };
+    let tall = if window > 1 {
+        crop(window)
+    } else {
+        crops.clone()
+    };
     let group_names: Vec<&str> = engine
         .meta
         .script_groups
@@ -288,23 +293,23 @@ pub fn recognize_groups(engine: &IndraEngine, rs: &RouteScript, boxes: &[[f64; 4
     // A vertical page's lines are CJK columns (characters on their side); the
     // CJK recognizer reads all of them (recognize: vertical branch). Otherwise
     // the script pre-pass routes each line.
-    let groups: Vec<(&str, Vec<usize>, bool)> =
-        if rs.vertical && group_names.contains(&"cjk") {
-            vec![("cjk", (0..n).collect(), false)]
-        } else {
-            // Grouping exactly as recognize(): base reads its own group's
-            // lines plus every line the pre-pass marked UNSURE (read from
-            // the tall crops); each group recognizer reads only the lines
-            // routed to it (window-1).
-            let base_sel: Vec<usize> =
-                (0..n).filter(|&j| rs.names[j] == "base" || !rs.sure[j]).collect();
-            let mut g = vec![("base", base_sel, true)];
-            for gn in &group_names {
-                let sel: Vec<usize> = (0..n).filter(|&j| rs.names[j] == *gn).collect();
-                g.push((gn, sel, false));
-            }
-            g
-        };
+    let groups: Vec<(&str, Vec<usize>, bool)> = if rs.vertical && group_names.contains(&"cjk") {
+        vec![("cjk", (0..n).collect(), false)]
+    } else {
+        // Grouping exactly as recognize(): base reads its own group's
+        // lines plus every line the pre-pass marked UNSURE (read from
+        // the tall crops); each group recognizer reads only the lines
+        // routed to it (window-1).
+        let base_sel: Vec<usize> = (0..n)
+            .filter(|&j| rs.names[j] == "base" || !rs.sure[j])
+            .collect();
+        let mut g = vec![("base", base_sel, true)];
+        for gn in &group_names {
+            let sel: Vec<usize> = (0..n).filter(|&j| rs.names[j] == *gn).collect();
+            g.push((gn, sel, false));
+        }
+        g
+    };
 
     for (gname, sel, use_tall) in groups {
         if sel.is_empty() {
@@ -568,8 +573,12 @@ mod tests {
             h: 32,
             data: vec![1.0f32; 24 * 32],
         };
-        let (names, sure, _raw) =
-            line_groups(&e.script, &[narrow], &e.meta.script_groups, &["cjk", "rtl", "world"]);
+        let (names, sure, _raw) = line_groups(
+            &e.script,
+            &[narrow],
+            &e.meta.script_groups,
+            &["cjk", "rtl", "world"],
+        );
         assert_eq!(names, ["base"]);
         assert_eq!(sure, [false]);
     }

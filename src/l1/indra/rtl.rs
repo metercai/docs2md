@@ -55,10 +55,7 @@ pub fn normalize(text: &str) -> String {
     for c in text.chars() {
         let o = c as u32;
         if (0xFB1D..=0xFDFF).contains(&o) || (0xFE70..=0xFEFF).contains(&o) {
-            if let Some(pos) = char_tables::NFKC_MAP
-                .iter()
-                .position(|(cp, _)| *cp == o)
-            {
+            if let Some(pos) = char_tables::NFKC_MAP.iter().position(|(cp, _)| *cp == o) {
                 out.push_str(char_tables::NFKC_MAP[pos].1);
             }
             continue;
@@ -324,7 +321,10 @@ mod tests {
         let visual = visual_label(logical, None);
         // The recognizer emits the visual form; label_from_visual recovers the
         // normalized logical form (no shapes: brackets stored logically).
-        assert_eq!(label_from_visual(&visual, false), visual_label(logical, None));
+        assert_eq!(
+            label_from_visual(&visual, false),
+            visual_label(logical, None)
+        );
     }
 
     #[test]
@@ -414,11 +414,7 @@ mod tests {
             let got_cls = clusters(&c.line);
             assert_eq!(got_has, c.has_rtl, "has_rtl[{i}]");
             assert_eq!(got_base, c.rtl_base, "rtl_base[{i}]");
-            assert_eq!(
-                got_flip, c.flip,
-                "flip[{i}] line={:?}",
-                c.line
-            );
+            assert_eq!(got_flip, c.flip, "flip[{i}] line={:?}", c.line);
             assert_eq!(got_flip_nm, c.flip_nomirror, "flip_nomirror[{i}]");
             assert_eq!(got_vl, c.visual_label, "visual_label[{i}]");
             assert_eq!(got_lfv, c.label_from_visual, "label_from_visual[{i}]");

@@ -133,7 +133,10 @@ pub struct L3Config {
 }
 impl Default for L3Config {
     fn default() -> Self {
-        Self { min_chars: 30, hard: 0.5 }
+        Self {
+            min_chars: 30,
+            hard: 0.5,
+        }
     }
 }
 

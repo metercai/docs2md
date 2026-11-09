@@ -157,7 +157,11 @@ fn p5_gate_order_and_blocks() {
         if gotc == refc {
             blocks_exact += 1;
         } else {
-            bad_blocks.push(format!("{tag}: rust {} blocks vs ref {} blocks", gotc.len(), refc.len()));
+            bad_blocks.push(format!(
+                "{tag}: rust {} blocks vs ref {} blocks",
+                gotc.len(),
+                refc.len()
+            ));
         }
 
         // Sub-gate C: line_features vs the Python feats (f32 stored as f64,
@@ -200,9 +204,7 @@ fn p5_gate_order_and_blocks() {
     println!(
         "P5 gate B (blocks): partition agreement {blocks_exact}/32 = {blocks_rate:.4} (>= 0.95 required)"
     );
-    println!(
-        "P5 gate C (features): {feat_checked} values, {feat_mismatch} bit-exact mismatches"
-    );
+    println!("P5 gate C (features): {feat_checked} values, {feat_mismatch} bit-exact mismatches");
     if !bad_order.is_empty() {
         println!("  order differences: {} page(s)", bad_order.len());
     }
@@ -213,7 +215,16 @@ fn p5_gate_order_and_blocks() {
     for (tag, _n, tau) in &bad_order {
         assert!(*tau > 0.99, "{tag}: tau {tau} <= 0.99");
     }
-    assert!(order_rate >= 0.95, "order exact rate {order_rate:.4} < 0.95");
-    assert!(blocks_rate >= 0.95, "blocks agreement {blocks_rate:.4} < 0.95");
-    assert_eq!(feat_mismatch, 0, "line_features outside the cols 7/8 log tolerance");
+    assert!(
+        order_rate >= 0.95,
+        "order exact rate {order_rate:.4} < 0.95"
+    );
+    assert!(
+        blocks_rate >= 0.95,
+        "blocks agreement {blocks_rate:.4} < 0.95"
+    );
+    assert_eq!(
+        feat_mismatch, 0,
+        "line_features outside the cols 7/8 log tolerance"
+    );
 }
