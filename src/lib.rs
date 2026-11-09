@@ -24,6 +24,7 @@
 //!     output: L3 result, or the best local text with a note, or an
 //!     explicit low-confidence marker — no page comes out empty (G).
 
+pub mod blocks;
 pub mod config;
 pub mod l0;
 pub mod l1;
@@ -31,14 +32,15 @@ pub mod l2;
 pub mod markdown;
 pub mod render;
 pub mod route;
-pub mod blocks;
 
 use config::Config;
+use firecrawl_pdfium::PdfDocument;
 use l1::{build_engine, L1Engine, OcrPage, PpOcrEngine};
 use l2::{L2Client, PageImage};
 use route::{l3_gate, output_gate};
 use rusto::layout::LayoutDetector;
 use rusto::types::LayoutConfig;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// What produced a page's final markdown, plus any quality note.
@@ -173,7 +175,10 @@ impl Engine {
                 }
             }
             Some(p) => {
-                eprintln!("[blocks] layout model not found: {}; relabel skipped", p.display());
+                eprintln!(
+                    "[blocks] layout model not found: {}; relabel skipped",
+                    p.display()
+                );
                 self.layout_failed = true;
                 None
             }
@@ -207,7 +212,11 @@ impl Engine {
         let img = image::load_from_memory(&png).ok()?;
         let mat = rusto::image_impl::Mat::new(img);
         let out = self.ensure_layout()?.detect(&mat).ok()?;
-        Some(blocks::layout_regions_to_relabel(&out.regions, pw as f64, ph as f64))
+        Some(blocks::layout_regions_to_relabel(
+            &out.regions,
+            pw as f64,
+            ph as f64,
+        ))
     }
 
     /// Ensure the L1 primary engine (Indra when enabled, else PP-OCRv6) is
@@ -273,7 +282,7 @@ impl Engine {
             t0.elapsed().as_millis()
         );
 
-        let mut doc: Option<pdf_oxide::document::PdfDocument> = None;
+        let mut doc: Option<PdfDocument> = None;
         let mut out = String::new();
         let mut records: Vec<PageRecord> = Vec::new();
 
@@ -297,12 +306,6 @@ impl Engine {
                 // Gated on use_indra: with use_indra = false (v0.1.0) the
                 // page keeps the native L0 output.
                 if self.cfg.l1.use_indra && p.has_table {
-                    if doc.is_none() {
-                        doc = Some(
-                            pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec())
-                                .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
-                        );
-                    }
                     let (png, _pbox, _rot) =
                         render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                             .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
@@ -325,6 +328,17 @@ impl Engine {
                     // model is configured (default path: None, no render,
                     // no model load).
                     let relabel = self.l0_relabel_regions(bytes, p.page);
+                    // Open the PDFium document lazily — only the first
+                    // L0-native page pays for it; l0_blocks reuses it.
+                    if doc.is_none() {
+                        let pdfium = firecrawl_pdfium::Pdfium::load()
+                            .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?;
+                        doc = Some(
+                            pdfium
+                                .load_document(bytes.to_vec(), None)
+                                .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
+                        );
+                    }
                     records.push(PageRecord {
                         page: page1,
                         tier: "L0-native".into(),
@@ -336,13 +350,7 @@ impl Engine {
                 continue;
             }
 
-            // needs_ocr → render once, then route.
-            if doc.is_none() {
-                doc = Some(
-                    pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec())
-                        .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
-                );
-            }
+            // needs_ocr → render once (PDFium), then route.
             let (png, _pbox, _rot) =
                 render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                     .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
@@ -385,11 +393,7 @@ impl Engine {
     /// output-level gate (former G2/G3, now `route::output_gate`) escalates
     /// a weak page to the VLM; the tier strings keep the `g2:<tag>` shape
     /// with the chain's `conf`/`chars` tags (plan §5.1 rollback path).
-    fn l1_pp_only(
-        &mut self,
-        page1: u32,
-        png: &[u8],
-    ) -> (String, PageRecord, Option<String>) {
+    fn l1_pp_only(&mut self, page1: u32, png: &[u8]) -> (String, PageRecord, Option<String>) {
         let rc = self.cfg.route.clone();
         match self.ensure_l1() {
             None => {
@@ -476,11 +480,7 @@ impl Engine {
     /// inside the Indra pipeline; a hit escalates the page to L2
     /// (PP-OCRv6) on the same rendered image — no second render, no layout
     /// model (decisions B + E). A chain-passed page stands as L1.
-    fn l1_dual(
-        &mut self,
-        page1: u32,
-        png: &[u8],
-    ) -> (String, PageRecord, Option<String>) {
+    fn l1_dual(&mut self, page1: u32, png: &[u8]) -> (String, PageRecord, Option<String>) {
         // L1 unavailable / O_I = Err: the existing L1-unavailable path —
         // escalate to the VLM with the v0.1.0 tier strings.
         let rc = self.cfg.route.clone();
@@ -725,16 +725,21 @@ impl Engine {
     }
 
     /// Structured blocks for an L0-native page, from the PDF's embedded text
-    /// layer (pdf_oxide spans). E1: every block is label `text`. The spans are
-    /// clustered into reading-order line blocks and normalized to the rendered
-    /// page's `[0,1]` y-down space. Coordinate notes (verified against
-    /// pdf_oxide 0.3.78 `postprocess_spans`, document.rs:13039): for `/Rotate
-    /// 0` spans are in raw user space (y-up, render-box origin); for
-    /// `/Rotate 180` pdf_oxide already mirrors them into the displayed frame
-    /// (still y-up) — both normalize identically. For `/Rotate 90/270` pdf_oxide
-    /// maps only rotated-content spans (horizontal content stays raw), a mixed
-    /// space we do not trust, so those pages emit no blocks. A failure at any
-    /// step yields an empty vec — blocks never affect the markdown or routing.
+    /// layer (pdf-inspector positioned text). E1: every block is label
+    /// `text`. The items are clustered into reading-order line blocks and
+    /// normalized to the rendered page's `[0,1]` y-down space. Coordinate
+    /// contract: pdf-inspector reports items relative to the visible page
+    /// box (CropBox ∩ MediaBox) with the box's lower-left origin, y-up,
+    /// `/Rotate` not applied; the box size is read from PDFium's
+    /// `FPDF_GetPageBoundingBox` (the same box the render path renders), so
+    /// the items normalize against box origin (0,0). For `/Rotate 180` the
+    /// items are mirrored into the display frame (point reflection about
+    /// the box centre) before the reading-order sort, so within-row text
+    /// keeps the displayed left-to-right order; for `/Rotate 0` they stay
+    /// as reported. For `/Rotate 90/270` the mixed raw/rotated-content
+    /// space is not trusted, so those pages emit no blocks. A failure at
+    /// any step yields an empty vec — blocks never affect the markdown or
+    /// routing.
     ///
     /// `relabel` (decision D): normalized layout regions already mapped to
     /// the rendered page's `[0,1]` y-down space (`heading`/`table` only).
@@ -744,43 +749,67 @@ impl Engine {
         &self,
         bytes: &[u8],
         page0: u32,
-        doc: Option<&pdf_oxide::document::PdfDocument>,
+        doc: Option<&PdfDocument>,
         relabel: Option<&[(f64, f64, f64, f64, &'static str)]>,
     ) -> Vec<crate::l1::Block> {
-        let parsed = if doc.is_none() {
-            pdf_oxide::document::PdfDocument::from_bytes(bytes.to_vec()).ok()
-        } else {
-            None
+        // Reuse the caller's open document when it has one; otherwise open a
+        // local one and keep it alive for the duration of this call.
+        let owned_doc: Option<PdfDocument> = match doc {
+            Some(_) => None,
+            None => {
+                let pdfium = match firecrawl_pdfium::Pdfium::load() {
+                    Ok(p) => p,
+                    Err(_) => return Vec::new(),
+                };
+                match pdfium.load_document(bytes, None) {
+                    Ok(d) => Some(d),
+                    Err(_) => return Vec::new(),
+                }
+            }
         };
-        let d = match doc.or(parsed.as_ref()) {
+        let d: &PdfDocument = match doc {
             Some(d) => d,
-            None => return Vec::new(),
+            None => owned_doc
+                .as_ref()
+                .expect("owned_doc is set whenever doc is None"),
         };
-        let ((bx0, by0, bw, bh), rotation) = match render::page_geometry(d, page0 as usize) {
+        let ((_, _, bw, bh), rotation) = match render::page_geometry(d, page0 as usize) {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
         if !(rotation == 0 || rotation == 180) {
             return Vec::new();
         }
-        let spans = match d.extract_spans(page0 as usize) {
-            Ok(s) => s,
+        // 1-based page filter: pdf-inspector numbers pages from 1.
+        let page_set = HashSet::from([page0 + 1]);
+        let items = match pdf_inspector::extractor::extract_text_with_positions_mem_pages(
+            bytes,
+            Some(&page_set),
+        ) {
+            Ok(items) => items,
             Err(_) => return Vec::new(),
         };
-        let spans: Vec<(f64, f64, f64, f64, String)> = spans
+        let spans: Vec<(f64, f64, f64, f64, String)> = items
             .iter()
-            .map(|s| {
-                (
-                    s.bbox.x as f64,
-                    s.bbox.y as f64,
-                    (s.bbox.x + s.bbox.width) as f64,
-                    (s.bbox.y + s.bbox.height) as f64,
-                    s.text.clone(),
-                )
+            .filter(|it| matches!(it.item_type, pdf_inspector::types::ItemType::Text))
+            .map(|it| {
+                let (mut x0, mut y0, mut x1, mut y1) = (
+                    it.x as f64,
+                    it.y as f64,
+                    (it.x + it.width) as f64,
+                    (it.y + it.height) as f64,
+                );
+                if rotation == 180 {
+                    // Display frame: point reflection about the box centre,
+                    // before the reading-order sort (both axes mirror).
+                    let (mx0, mx1) = (bw as f64 - x1, bw as f64 - x0);
+                    let (my0, my1) = (bh as f64 - y1, bh as f64 - y0);
+                    (x0, x1, y0, y1) = (mx0, mx1, my0, my1);
+                }
+                (x0, y0, x1, y1, it.text.clone())
             })
             .collect();
-        let blocks =
-            blocks::spans_to_text_blocks(&spans, bx0 as f64, by0 as f64, bw as f64, bh as f64, 0);
+        let blocks = blocks::spans_to_text_blocks(&spans, 0.0, 0.0, bw as f64, bh as f64, 0);
         match relabel {
             Some(regions) => blocks::relabel_l0_blocks(blocks, regions),
             None => blocks,
@@ -863,7 +892,10 @@ mod tests {
         // Nothing anywhere: the explicit low-confidence marker (non-empty).
         let primary = page(&[]);
         let (md, rec, note) = engine().l3_fallback(9, "conf", &None, &primary);
-        assert!(md.trim().is_empty(), "marker lives in the note, not the body");
+        assert!(
+            md.trim().is_empty(),
+            "marker lives in the note, not the body"
+        );
         assert_eq!(rec.tier, "L2-ppv6(chain:conf)(low-conf)");
         let note = note.expect("note present");
         assert_eq!(note, LOW_CONF_MARKER);

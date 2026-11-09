@@ -84,10 +84,9 @@ pub fn normalize_bbox(x0: f64, y0: f64, x1: f64, y1: f64, page_w: f64, page_h: f
 /// Map a PDF user-space box (y-UP, points) to the rendered page's
 /// normalized `[0,1]` y-DOWN box, for the page's `/Rotate`. The render box
 /// (CropBox ∩ MediaBox, the box `render::render_pdf_bytes` renders) is
-/// `(box_x0, box_y0, box_w, box_h)` in the same user space. Mirrors
-/// pdf_oxide's `page_base_transform` (rendering/mod.rs:188) inverted — the
-/// origin translation uses the render box, and the rotation cases are its
-/// four branches solved for the user-space point.
+/// `(box_x0, box_y0, box_w, box_h)` in the same user space. The origin
+/// translation uses the render box, and the four rotation branches solve the
+/// display-frame mapping for a user-space point.
 pub fn pdf_box_to_norm(
     x0: f64,
     y0: f64,
@@ -200,29 +199,30 @@ pub fn spans_to_text_blocks(
             });
         }
     }
-    rows.into_iter().map(|r| {
-        let mut order: Vec<usize> = r.idx;
-        order.sort_by(|&a, &b| {
-            spans[a]
-                .0
-                .partial_cmp(&spans[b].0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let text = order
-            .iter()
-            .map(|&i| spans[i].4.as_str())
-            .filter(|t| !t.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        Block {
-            label: TEXT,
-            bbox: pdf_box_to_norm(
-                r.x0, r.y0, r.x1, r.y1, box_x0, box_y0, box_w, box_h, rotation,
-            ),
-            text,
-        }
-    })
-    .collect()
+    rows.into_iter()
+        .map(|r| {
+            let mut order: Vec<usize> = r.idx;
+            order.sort_by(|&a, &b| {
+                spans[a]
+                    .0
+                    .partial_cmp(&spans[b].0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let text = order
+                .iter()
+                .map(|&i| spans[i].4.as_str())
+                .filter(|t| !t.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Block {
+                label: TEXT,
+                bbox: pdf_box_to_norm(
+                    r.x0, r.y0, r.x1, r.y1, box_x0, box_y0, box_w, box_h, rotation,
+                ),
+                text,
+            }
+        })
+        .collect()
 }
 
 impl Block {
@@ -484,10 +484,7 @@ mod tests {
         // text.
         assert_eq!(out[2].label, TEXT);
         // Empty regions → every block keeps its label.
-        let same = relabel_l0_blocks(
-            vec![mk(0.5, "x")],
-            &[],
-        );
+        let same = relabel_l0_blocks(vec![mk(0.5, "x")], &[]);
         assert_eq!(same[0].label, TEXT);
         // Text/bbox are untouched by the relabel.
         assert_eq!(out[0].bbox, [0.1, 0.05, 0.9, 0.07]);
@@ -520,7 +517,11 @@ mod tests {
             reg(LayoutType::Table, 0.9, 0, 0, 99, 99),
         ];
         let out = layout_regions_to_relabel(&regions, 100.0, 100.0);
-        assert_eq!(out.len(), 2, "only the confident compact title+table: {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "only the confident compact title+table: {out:?}"
+        );
         assert_eq!(out[0], (0.1, 0.05, 0.9, 0.2, HEADING));
         assert_eq!(out[1], (0.05, 0.3, 0.95, 0.5, TABLE));
         // Boundary: conf exactly RELABEL_MIN_CONF does not pass (`>`).

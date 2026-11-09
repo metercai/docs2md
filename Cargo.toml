@@ -22,16 +22,16 @@ path = "src/main.rs"
 
 [dependencies]
 docs2md-ocr = { path = "crates/ocr", default-features = false }
-pdf-inspector = "1.25"
+# Base (S2): routing (detect_pdf_type_mem) + L0 extraction + positioned text.
 # No `vision`/`render-pdfium` feature: pdf-inspector's `vision` feature is a
 # build bug in every published version (1.17.0-1.25.2) — fusion.rs imports
 # `complete_table_markdown_from_items`, which is `#[cfg(feature = "ocr")]`,
 # so `vision` without `ocr` never compiles. Rendering goes directly through
 # firecrawl-pdfium (the same PDFium foundation PdfiumRenderer wraps).
+pdf-inspector = "1.25"
 # Rendering foundation (S2): PDFium via libloading. Runtime .so discovery:
 # $PDFIUM_LIB_PATH -> next to the executable -> ./target/pdfium -> system.
 firecrawl-pdfium = "0.1.0"
-pdf_oxide = { version = "0.3", features = ["rendering"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }

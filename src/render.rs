@@ -8,14 +8,13 @@
 //! network access and no host-font dependency (PDFium carries its own
 //! base-14 font outlines).
 //!
-//! `page_geometry` (still pdf_oxide in this step) feeds the L0 block
-//! normalization; the pixel→PDF coordinate mapping reads the same
-//! PDFium-visible box via `page_box`.
+//! `page_box` (the render content box, `FPDF_GetPageBoundingBox`) and
+//! `rotation_degrees` stay here: they feed the pixel→PDF coordinate mapping
+//! and the L0 block normalization (both read the same PDFium-visible box).
 
 use firecrawl_pdfium::{Pdfium, RenderConfig};
 use image::codecs::png::PngEncoder;
 use image::ImageEncoder;
-use pdf_oxide::document::PdfDocument;
 
 /// Page render raster budget in pixels. A page whose render at the
 /// configured dpi would exceed this renders at a lower effective dpi
@@ -26,6 +25,10 @@ const MAX_PAGE_PIXELS: u64 = 100_000_000;
 /// One rendered page: PNG bytes, the content box (x0, y0, w, h) in PDF
 /// points, and the page's `/Rotate` in degrees.
 type RenderedPage = (Vec<u8>, (f32, f32, f32, f32), i32);
+
+/// A page's geometry without rasterizing: the content box (x0, y0, w, h) in
+/// PDF points and the page's `/Rotate` in degrees.
+type PageGeometry = ((f32, f32, f32, f32), i32);
 
 /// Render one page of the raw PDF bytes to an RGBA PNG (the pipeline
 /// converts to grayscale itself — see `preproc::Gray::from_png`).
@@ -72,38 +75,20 @@ pub fn render_pdf_bytes(bytes: &[u8], page: usize, dpi: u32) -> Result<RenderedP
 }
 
 /// The page's geometry without rasterizing: the content box (CropBox ∩
-/// MediaBox, the box this module renders) and the page's `/Rotate`.
-/// Used to map native text-layer spans into the rendered page's
-/// normalized coordinate space (blocks) without a PNG render.
+/// MediaBox, `FPDF_GetPageBoundingBox`) and the page's `/Rotate`, read from a
+/// PDFium page handle. Feeds the L0 block normalization, which maps native
+/// text-layer items into the rendered page's `[0,1]` y-down space without a
+/// PNG render.
 pub fn page_geometry(
-    doc: &PdfDocument,
+    doc: &firecrawl_pdfium::PdfDocument,
     page: usize,
-) -> Result<((f32, f32, f32, f32), i32), String> {
-    let info = doc.get_page_info(page).map_err(|e| e.to_string())?;
-    let pbox = render_box(&info.media_box, info.crop_box.as_ref());
-    Ok((pbox, info.rotation))
-}
-
-/// The visible page box: CropBox ∩ MediaBox.
-fn render_box(
-    media: &pdf_oxide::geometry::Rect,
-    crop: Option<&pdf_oxide::geometry::Rect>,
-) -> (f32, f32, f32, f32) {
-    let (mx, my, mw, mh) = (media.x, media.y, media.width, media.height);
-    let (cx0, cy0, cx1, cy1) = match crop {
-        Some(c) => (
-            c.x.max(mx),
-            c.y.max(my),
-            (c.x + c.width).min(mx + mw),
-            (c.y + c.height).min(my + mh),
-        ),
-        None => (mx, my, mx + mw, my + mh),
-    };
-    if cx1 <= cx0 || cy1 <= cy0 {
-        (mx, my, mw, mh)
-    } else {
-        (cx0, cy0, cx1 - cx0, cy1 - cy0)
-    }
+) -> Result<PageGeometry, String> {
+    let page = doc
+        .page(page)
+        .map_err(|e| format!("open page {page}: {e}"))?;
+    let pbox = page_box(&page).map_err(|e| format!("page box: {e}"))?;
+    let rotation = rotation_degrees(page.rotation());
+    Ok((pbox, rotation))
 }
 
 /// The content box from PDFium's page handle: `FPDF_GetPageBoundingBox`

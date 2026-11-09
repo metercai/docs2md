@@ -79,8 +79,10 @@ pub fn parse_zip(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
             8 => {
                 // zip method=8 is RAW deflate (no zlib header). decompress_vec
                 // appends into the vec's spare capacity, so reserve the exact
-                // uncompressed size from the central directory.
-                let mut d = flate2::Decompress::new_with_window_bits(false, 15);
+                // uncompressed size from the central directory. Window 15 is
+                // flate2's default (`new(false)`), so no `any_zlib` feature is
+                // needed — the raw stream is a full window either way.
+                let mut d = flate2::Decompress::new(false);
                 let mut buf = Vec::with_capacity(usize.max(1));
                 d.decompress_vec(payload, &mut buf, flate2::FlushDecompress::Finish)
                     .map_err(|e| format!("inflate {name}: {e}"))?;
