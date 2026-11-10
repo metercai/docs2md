@@ -12,6 +12,58 @@ use std::path::PathBuf;
 
 use crate::config::L1Config;
 
+/// One text-layer run for the L1 text-layer fusion (plan 0.3.2 T3/T4).
+/// Run-level: one item per PDF text run (a pdfium/pdftext segment between
+/// line breaks). Coordinates are a **span in the extractor's PDF-user space
+/// (bottom-left origin, y-up, points)** — the same frame `l0_blocks` reads —
+/// so the L1 engine maps it to the display frame (top-left, y-down) with the
+/// same rotation logic as [`crate::blocks`] before assigning it to detected
+/// lines. `scale` on [`LayerPage`] turns points into rendered pixels.
+#[derive(Debug, Clone)]
+pub struct LayerItem {
+    /// Span left edge (PDF points, x-right).
+    pub x0: f64,
+    /// Span bottom edge (PDF points, y-up).
+    pub y0: f64,
+    /// Span right edge.
+    pub x1: f64,
+    /// Span top edge.
+    pub y1: f64,
+    /// The run's text, in content order (spaces preserved).
+    pub text: String,
+    /// Signed baseline offset vs the body text (super/subscript); 0 = body.
+    pub baseline_shift: f64,
+    /// Run rotation in degrees CCW from +x (0 = horizontal left-to-right).
+    pub rotation: f64,
+}
+
+/// A page's usable text layer for the L1 fusion: its runs plus the render
+/// geometry needed to map them into the rendered image. `None` at the L1 call
+/// means "no text layer" (a scan) or "fusion disabled" — the engine then runs
+/// the plain OCR path (byte-identical to before the fusion landed).
+#[derive(Debug, Clone)]
+pub struct LayerPage {
+    /// The page's text runs (spans, PDF-user space, y-up), in content order.
+    pub items: Vec<LayerItem>,
+    /// The render content box (x0, y0, w, h) in the same PDF-user space.
+    pub box_rect: (f64, f64, f64, f64),
+    /// The page's `/Rotate` in degrees (0/90/180/270).
+    pub rotation: i32,
+}
+
+impl LayerPage {
+    /// Rendered-pixels-per-point, recovered from the rendered bitmap width and
+    /// the render box width (uniform scale). The render may be capped to
+    /// `MAX_PAGE_PIXELS`, so this — not `requested_dpi/72` — is the true scale.
+    pub fn scale(&self, render_w_px: f64) -> f64 {
+        if self.box_rect.2 > 0.0 {
+            render_w_px / self.box_rect.2
+        } else {
+            1.0
+        }
+    }
+}
+
 /// One recognized text line (pixel frame, y-down) with its confidence.
 #[derive(Debug, Clone)]
 pub struct OcrLine {
@@ -94,6 +146,19 @@ pub trait L1Engine: Send {
     /// the routing thresholds — the Indra engine evaluates the L1→L2 serial
     /// metric chain (plan §2.1) against it; PP-OCRv6 ignores it.
     fn ocr_page(&mut self, png: &[u8], rc: &crate::config::RouteConfig) -> Result<OcrPage, String>;
+
+    /// `ocr_page` with the page's usable text layer (plan 0.3.2 T3/T4). The
+    /// default ignores the layer and runs the plain OCR path, so an engine
+    /// that has not implemented the fusion keeps byte-identical output —
+    /// this is what keeps `l1_dual`'s `layer = None` gate a 0/48 no-op.
+    fn ocr_page_with_layer(
+        &mut self,
+        png: &[u8],
+        rc: &crate::config::RouteConfig,
+        _layer: Option<&LayerPage>,
+    ) -> Result<OcrPage, String> {
+        self.ocr_page(png, rc)
+    }
 }
 
 /// PP-OCRv6 engine (embedded `small` by default).
@@ -224,6 +289,20 @@ impl L1Engine for IndraEngine {
     }
 
     fn ocr_page(&mut self, png: &[u8], rc: &crate::config::RouteConfig) -> Result<OcrPage, String> {
+        let gray = indra::preproc::Gray::from_png(png)?;
+        self.engine.ocr_page(&gray, rc)
+    }
+
+    /// C1 (T3): the fusion entry point. It currently ignores the layer and
+    /// runs the plain pipeline — byte-identical to `ocr_page`, which is what
+    /// keeps the `layer = None` gate a 0/48 no-op. C2 (T4) changes this to
+    /// consume the runs (text-layer characters on covered lines).
+    fn ocr_page_with_layer(
+        &mut self,
+        png: &[u8],
+        rc: &crate::config::RouteConfig,
+        _layer: Option<&super::LayerPage>,
+    ) -> Result<OcrPage, String> {
         let gray = indra::preproc::Gray::from_png(png)?;
         self.engine.ocr_page(&gray, rc)
     }

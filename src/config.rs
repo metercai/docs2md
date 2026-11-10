@@ -217,6 +217,12 @@ pub struct RouteConfig {
     /// output is reassembled in page order, so the markdown is unaffected.
     #[serde(default = "default_threads")]
     pub parallel_threads: usize,
+    /// Feed the page's PDF text layer into the L1 engine (plan 0.3.2 T3/T4):
+    /// covered lines take their exact text-layer characters instead of an OCR
+    /// read. Default off (C1 lands the interface with zero behavior change;
+    /// C2 turns the fusion on after the byte-parity gate).
+    #[serde(default = "default_false")]
+    pub layer_fusion: bool,
 }
 impl Default for RouteConfig {
     fn default() -> Self {
@@ -224,6 +230,7 @@ impl Default for RouteConfig {
             chain: ChainConfig::default(),
             structure_gate: false,
             parallel_threads: 1,
+            layer_fusion: false,
         }
     }
 }

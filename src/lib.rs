@@ -35,7 +35,7 @@ pub mod route;
 
 use config::Config;
 use firecrawl_pdfium::PdfDocument;
-use l1::{build_engine, L1Engine, OcrPage, PpOcrEngine};
+use l1::{build_engine, L1Engine, LayerItem, LayerPage, OcrPage, PpOcrEngine};
 use l2::{L2Client, PageImage};
 use route::{l3_gate, output_gate};
 use rusto::layout::LayoutDetector;
@@ -217,6 +217,69 @@ impl Engine {
             pw as f64,
             ph as f64,
         ))
+    }
+
+    /// C1 (T3): the page's text layer for the L1 fusion, or `None` when there
+    /// is no usable layer (a scan), the page is rotated (C2 handles the
+    /// turn), or extraction failed. Builds one [`LayerItem`] per PDF text run
+    /// (raw spans in PDF-user space, y-up) from the same
+    /// `extract_text_with_positions` the L0 blocks read. `pbox` is the render
+    /// content box (CropBox ∩ MediaBox) and `rot` the page `/Rotate`, both
+    /// from the render the caller already did.
+    fn extract_layer(
+        &self,
+        bytes: &[u8],
+        page0: u32,
+        pbox: (f32, f32, f32, f32),
+        rot: i32,
+    ) -> Option<LayerPage> {
+        if rot != 0 {
+            return None; // straight pages only (C1); the turn lands in C2
+        }
+        let page_set = HashSet::from([page0 + 1]);
+        let items =
+            pdf_inspector::extractor::extract_text_with_positions_mem_pages(bytes, Some(&page_set))
+                .ok()?;
+        let box_rect = (pbox.0 as f64, pbox.1 as f64, pbox.2 as f64, pbox.3 as f64);
+        let items: Vec<LayerItem> = items
+            .iter()
+            .filter(|it| matches!(it.item_type, pdf_inspector::types::ItemType::Text))
+            .filter(|it| !it.text.is_empty())
+            .map(|it| LayerItem {
+                x0: it.x as f64,
+                y0: it.y as f64,
+                x1: (it.x + it.width) as f64,
+                y1: (it.y + it.height) as f64,
+                text: it.text.clone(),
+                baseline_shift: it.baseline_shift as f64,
+                rotation: it.rotation as f64,
+            })
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        Some(LayerPage {
+            items,
+            box_rect,
+            rotation: rot,
+        })
+    }
+
+    /// Gated wrapper: the layer is extracted only when
+    /// `route.layer_fusion` is on (default off — C1 ships the plumbing
+    /// with zero cost and zero behaviour change; C2 turns it on once the
+    /// Indra pipeline consumes it). Off ⇒ `None`, no PDFium text pass.
+    fn extract_layer_gated(
+        &self,
+        bytes: &[u8],
+        page0: u32,
+        pbox: (f32, f32, f32, f32),
+        rot: i32,
+    ) -> Option<LayerPage> {
+        if !self.cfg.route.layer_fusion {
+            return None;
+        }
+        self.extract_layer(bytes, page0, pbox, rot)
     }
 
     /// Ensure the L1 primary engine (Indra when enabled, else PP-OCRv6) is
@@ -423,14 +486,15 @@ impl Engine {
             if self.cfg.l1.use_indra
                 && (p.has_table || (self.cfg.route.structure_gate && p.has_columns))
             {
-                let (png, _pbox, _rot) =
+                let (png, pbox, rot) =
                     render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                         .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+                let layer = self.extract_layer_gated(bytes, p.page, pbox, rot);
                 eprintln!(
                     "[p{page1}] S0 reroute: {} page — L1",
                     if p.has_table { "table" } else { "columns" }
                 );
-                let (page_md, rec, note) = self.l1_dual(page1, &png);
+                let (page_md, rec, note) = self.l1_dual(page1, &png, layer.as_ref());
                 return Ok((page_md, rec, note));
             }
             // D: optional layout relabel of the L0 blocks — only
@@ -463,7 +527,7 @@ impl Engine {
         }
 
         // needs_ocr → render once (PDFium), then route.
-        let (png, _pbox, _rot) =
+        let (png, pbox, rot) =
             render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                 .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
         let (pw, ph) = render::png_size(&png);
@@ -472,8 +536,11 @@ impl Engine {
         // chain (plan §2.1) runs inside the Indra pipeline; a hit
         // escalates the page to L2 (PP-OCRv6) on this same rendered
         // image — no layout detector anywhere in routing (decision B).
+        // C1 (T3): pass the page's text layer (None on a pure scan) so
+        // the Indra pipeline can fuse it (C2). Gated on `layer_fusion`.
+        let layer = self.extract_layer_gated(bytes, p.page, pbox, rot);
         let (page_md, rec, note) = if self.cfg.l1.use_indra {
-            self.l1_dual(page1, &png)
+            self.l1_dual(page1, &png, layer.as_ref())
         } else {
             self.l1_pp_only(page1, &png)
         };
@@ -578,7 +645,12 @@ impl Engine {
     /// inside the Indra pipeline; a hit escalates the page to L2
     /// (PP-OCRv6) on the same rendered image — no second render, no layout
     /// model (decisions B + E). A chain-passed page stands as L1.
-    fn l1_dual(&mut self, page1: u32, png: &[u8]) -> (String, PageRecord, Option<String>) {
+    fn l1_dual(
+        &mut self,
+        page1: u32,
+        png: &[u8],
+        layer: Option<&LayerPage>,
+    ) -> (String, PageRecord, Option<String>) {
         // L1 unavailable / O_I = Err: the existing L1-unavailable path —
         // escalate to the VLM with the v0.1.0 tier strings.
         let rc = self.cfg.route.clone();
@@ -591,7 +663,7 @@ impl Engine {
                     Some(self.l1_unavailable.clone()),
                 );
             }
-            Some(engine) => match engine.ocr_page(png, &rc) {
+            Some(engine) => match engine.ocr_page_with_layer(png, &rc, layer) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("[p{page1}] Indra failed: {e}");
