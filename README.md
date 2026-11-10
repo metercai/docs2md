@@ -65,6 +65,12 @@ needs OCR → render (PDFium, 200 dpi)
   marker) and the page is marked accordingly — the cascade always ends with
   non-empty output (a page is never dropped).
 
+- **Parallelism** (`[route] parallel_threads`, default 4): the page loop
+  runs on worker threads, each with its own engine; output is reassembled
+  in page order and is byte-identical to the serial run. Multi-page
+  documents benefit (a 48-page doc: ~34.6 s at 4 workers vs ~72.9 s
+  serial); single-page inputs are unaffected.
+
 ## Quick start
 
 ```sh

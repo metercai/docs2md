@@ -51,6 +51,20 @@ health_check = true
 # Seconds to keep probing /health through the 503 "Loading model" window.
 health_wait_secs = 30
 
+# ── Route: page-level parallelism + structural reroute ─────────────────
+[route]
+# Worker threads for the page loop. Each worker owns a fresh engine
+# (det + rec models load per worker). 4 is the default: a 48-page doc
+# runs ~34.6 s at 4 workers vs ~72.9 s serial (2.1x). Single-page inputs
+# are unaffected (one worker). 1 = serial (the v0.3.0 behavior).
+parallel_threads = 4
+# Reroute multi-column native-text pages to L1 using pdf-inspector's free
+# pages_with_columns signal (no rendering, no models). OFF by default: the
+# signal mis-fires on form layouts (short scattered items trigger its
+# unguarded gutter path), which degraded two OPB form pages. Enable it for
+# corpora that are genuinely multi-column prose. (Upstream fix tracked.)
+structure_gate = false
+
 # ── L1→L2 serial metric chain (plan §2.1, calibrated on the 623-page
 #    fixture corpus) ─────────────────────────────────────────────────────
 # The chain is evaluated as the Indra pipeline advances and the first hit
