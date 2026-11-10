@@ -282,122 +282,209 @@ impl Engine {
             t0.elapsed().as_millis()
         );
 
-        let mut doc: Option<PdfDocument> = None;
+        // The selected pages, in document order.
+        let selected: Vec<l0::L0Page> = l0
+            .pages
+            .into_iter()
+            .filter(|p| pages.is_none_or(|wp| wp.contains(&(p.page + 1))))
+            .collect();
+
+        let frags = self.run_pages(bytes, &selected)?;
+
+        // Assemble in page order. The per-page marker is emitted for every
+        // page EXCEPT a pure L0-native one (the original loop pushed the
+        // marker only on the S0-reroute and needs-ocr branches); the note,
+        // when present, precedes the page markdown.
         let mut out = String::new();
-        let mut records: Vec<PageRecord> = Vec::new();
-
-        for p in &l0.pages {
-            let page1 = p.page + 1;
-            if let Some(wp) = pages {
-                if !wp.contains(&page1) {
-                    continue;
-                }
+        let mut records: Vec<PageRecord> = Vec::with_capacity(frags.len());
+        for (md, rec, note) in &frags {
+            if self.cfg.output.page_markers && rec.tier != "L0-native" {
+                out.push_str(&format!("<!-- page:{} -->\n", rec.page));
             }
-            if !p.needs_ocr {
-                // S0 candidate: a usable native text layer. Post-route
-                // reroute (zero-model): pdf-inspector's free `has_table`
-                // signal (span geometry, no rendering, no models) marks a
-                // page whose text layer is only textual while the page
-                // carries a table — L1's order model emits `<table>`
-                // structure, which the native layer flattens away. The
-                // former C1 structural reroute (render + PP-DocLayout +
-                // G1 a/b) is gone: L0 is model-free, and the layout model
-                // no longer participates in routing at all (decision C).
-                // `structure_gate` widens the same reroute to multi-column
-                // pages via the equally free `pages_with_columns` signal
-                // (text-layer x-clustering; always false on image-only
-                // pages, which never reach this gate) — column reading
-                // order is flattened away by the native layer the same way
-                // tables are. Gated on use_indra: with use_indra = false
-                // (v0.1.0) the page keeps the native L0 output.
-                if self.cfg.l1.use_indra
-                    && (p.has_table
-                        || (self.cfg.route.structure_gate && p.has_columns))
-                {
-                    let (png, _pbox, _rot) =
-                        render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
-                            .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
-                    eprintln!(
-                        "[p{page1}] S0 reroute: {} page — L1",
-                        if p.has_table { "table" } else { "columns" }
-                    );
-                    let (page_md, rec, note) = self.l1_dual(page1, &png);
-                    if self.cfg.output.page_markers {
-                        out.push_str(&format!("<!-- page:{page1} -->\n"));
-                    }
-                    if let Some(n) = &note {
-                        out.push_str(n);
-                    }
-                    out.push_str(&page_md);
-                    out.push('\n');
-                    records.push(rec);
-                } else {
-                    out.push_str(&p.markdown);
-                    out.push('\n');
-                    // D: optional layout relabel of the L0 blocks — only
-                    // when --blocks was passed explicitly and a layout
-                    // model is configured (default path: None, no render,
-                    // no model load).
-                    let relabel = self.l0_relabel_regions(bytes, p.page);
-                    // Open the PDFium document lazily — only the first
-                    // L0-native page pays for it; l0_blocks reuses it.
-                    if doc.is_none() {
-                        let pdfium = firecrawl_pdfium::Pdfium::load()
-                            .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?;
-                        doc = Some(
-                            pdfium
-                                .load_document(bytes.to_vec(), None)
-                                .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
-                        );
-                    }
-                    records.push(PageRecord {
-                        page: page1,
-                        tier: "L0-native".into(),
-                        chars: p.markdown.chars().count(),
-                        note: None,
-                        blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), relabel.as_deref()),
-                    });
-                }
-                continue;
-            }
-
-            // needs_ocr → render once (PDFium), then route.
-            let (png, _pbox, _rot) =
-                render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
-                    .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
-            let (pw, ph) = render::png_size(&png);
-
-            // needs_ocr → render once, then L1. The L1→L2 serial metric
-            // chain (plan §2.1) runs inside the Indra pipeline; a hit
-            // escalates the page to L2 (PP-OCRv6) on this same rendered
-            // image — no layout detector anywhere in routing (decision B).
-            let (page_md, rec, note) = if self.cfg.l1.use_indra {
-                self.l1_dual(page1, &png)
-            } else {
-                self.l1_pp_only(page1, &png)
-            };
-            eprintln!(
-                "[p{page1}] needs_ocr ({}) rendered {}x{} => {}",
-                p.ocr_reason.as_deref().unwrap_or("?"),
-                pw,
-                ph,
-                rec.tier
-            );
-            if self.cfg.output.page_markers {
-                out.push_str(&format!("<!-- page:{page1} -->\n"));
-            }
-            if let Some(n) = &note {
+            if let Some(n) = note {
                 out.push_str(n);
             }
-            out.push_str(&page_md);
+            out.push_str(md);
             out.push('\n');
-            records.push(rec);
+            records.push(rec.clone());
         }
 
         Ok(DocResult {
             markdown: out,
             pages: records,
         })
+    }
+
+    /// The page pass over the selected pages. `parallel_threads <= 1` (the
+    /// default) runs the original serial loop: one engine, one PDFium
+    /// document, pages in order. `>1` splits the pages across worker
+    /// threads — each a fresh `Engine` (its own L1/L2 engines and PDFium
+    /// document; render is stateless, so per-worker documents are safe) —
+    /// and reassembles the results in document order, so the markdown and
+    /// the per-page records are unaffected by the scheduling.
+    fn run_pages(
+        &mut self,
+        bytes: &[u8],
+        selected: &[l0::L0Page],
+    ) -> Result<Vec<(String, PageRecord, Option<String>)>, Error> {
+        let threads = self.cfg.route.parallel_threads.max(1);
+        if threads <= 1 || selected.len() <= 1 {
+            let mut doc: Option<PdfDocument> = None;
+            let mut frags = Vec::with_capacity(selected.len());
+            for p in selected {
+                frags.push(self.process_page(bytes, p, &mut doc)?);
+            }
+            return Ok(frags);
+        }
+        // needs_ocr pages first (the expensive ones), document order kept
+        // within each group (stable sort), then split into near-equal
+        // contiguous buckets.
+        let mut idx: Vec<usize> = (0..selected.len()).collect();
+        idx.sort_by_key(|&i| (!selected[i].needs_ocr, i));
+        let n = idx.len();
+        let chunk = n.div_ceil(threads);
+        let buckets: Vec<Vec<l0::L0Page>> = idx
+            .chunks(chunk)
+            .map(|c| c.iter().map(|&i| selected[i].clone()).collect())
+            .collect();
+        let mut handles = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let cfg = self.cfg.clone();
+            let blocks = self.blocks_requested;
+            let owned = bytes.to_vec();
+            handles.push(std::thread::spawn(move || {
+                let mut worker = Engine::new(cfg)?;
+                worker.set_blocks_requested(blocks);
+                worker.process_chunk(&owned, &bucket)
+            }));
+        }
+        let mut frags: Vec<(u32, String, PageRecord, Option<String>)> = Vec::new();
+        for h in handles {
+            let res = h
+                .join()
+                .map_err(|_| Error::Pdf("a parallel page worker panicked".to_string()))?;
+            for (md, rec, note) in res? {
+                frags.push((rec.page, md, rec, note));
+            }
+        }
+        frags.sort_by_key(|f| f.0);
+        Ok(frags
+            .into_iter()
+            .map(|(_, md, rec, note)| (md, rec, note))
+            .collect())
+    }
+
+    /// One worker's share: its bucket of pages, processed serially with
+    /// this engine (one L1 engine + one PDFium document).
+    fn process_chunk(
+        &mut self,
+        bytes: &[u8],
+        bucket: &[l0::L0Page],
+    ) -> Result<Vec<(String, PageRecord, Option<String>)>, Error> {
+        let mut doc: Option<PdfDocument> = None;
+        let mut frags = Vec::with_capacity(bucket.len());
+        for p in bucket {
+            frags.push(self.process_page(bytes, p, &mut doc)?);
+        }
+        Ok(frags)
+    }
+
+    /// Process one selected page: S0 native / S0 structural reroute /
+    /// needs-ocr render + L1 (with the serial chain). Returns the page
+    /// markdown (no trailing newline), the provenance record, and the
+    /// quality note. A page's markdown is independent of the other pages,
+    /// so the same function serves the serial loop (shared engine + shared
+    /// PDFium document) and each parallel worker (own engine + own
+    /// document).
+    fn process_page(
+        &mut self,
+        bytes: &[u8],
+        p: &l0::L0Page,
+        doc: &mut Option<PdfDocument>,
+    ) -> Result<(String, PageRecord, Option<String>), Error> {
+        let page1 = p.page + 1;
+        if !p.needs_ocr {
+            // S0 candidate: a usable native text layer. Post-route
+            // reroute (zero-model): pdf-inspector's free `has_table`
+            // signal (span geometry, no rendering, no models) marks a
+            // page whose text layer is only textual while the page
+            // carries a table — L1's order model emits `<table>`
+            // structure, which the native layer flattens away. The
+            // former C1 structural reroute (render + PP-DocLayout +
+            // G1 a/b) is gone: L0 is model-free, and the layout model
+            // no longer participates in routing at all (decision C).
+            // `structure_gate` widens the same reroute to multi-column
+            // pages via the equally free `pages_with_columns` signal
+            // (text-layer x-clustering; always false on image-only
+            // pages, which never reach this gate) — column reading
+            // order is flattened away by the native layer the same way
+            // tables are. Gated on use_indra: with use_indra = false
+            // (v0.1.0) the page keeps the native L0 output.
+            if self.cfg.l1.use_indra
+                && (p.has_table || (self.cfg.route.structure_gate && p.has_columns))
+            {
+                let (png, _pbox, _rot) =
+                    render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
+                        .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+                eprintln!(
+                    "[p{page1}] S0 reroute: {} page — L1",
+                    if p.has_table { "table" } else { "columns" }
+                );
+                let (page_md, rec, note) = self.l1_dual(page1, &png);
+                return Ok((page_md, rec, note));
+            }
+            // D: optional layout relabel of the L0 blocks — only
+            // when --blocks was passed explicitly and a layout
+            // model is configured (default path: None, no render,
+            // no model load).
+            let relabel = self.l0_relabel_regions(bytes, p.page);
+            // Open the PDFium document lazily — only the first
+            // L0-native page pays for it; l0_blocks reuses it.
+            if doc.is_none() {
+                let pdfium = firecrawl_pdfium::Pdfium::load()
+                    .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?;
+                *doc = Some(
+                    pdfium
+                        .load_document(bytes.to_vec(), None)
+                        .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
+                );
+            }
+            return Ok((
+                p.markdown.clone(),
+                PageRecord {
+                    page: page1,
+                    tier: "L0-native".into(),
+                    chars: p.markdown.chars().count(),
+                    note: None,
+                    blocks: self.l0_blocks(bytes, p.page, doc.as_ref(), relabel.as_deref()),
+                },
+                None,
+            ));
+        }
+
+        // needs_ocr → render once (PDFium), then route.
+        let (png, _pbox, _rot) =
+            render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
+                .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+        let (pw, ph) = render::png_size(&png);
+
+        // needs_ocr → render once, then L1. The L1→L2 serial metric
+        // chain (plan §2.1) runs inside the Indra pipeline; a hit
+        // escalates the page to L2 (PP-OCRv6) on this same rendered
+        // image — no layout detector anywhere in routing (decision B).
+        let (page_md, rec, note) = if self.cfg.l1.use_indra {
+            self.l1_dual(page1, &png)
+        } else {
+            self.l1_pp_only(page1, &png)
+        };
+        eprintln!(
+            "[p{page1}] needs_ocr ({}) rendered {}x{} => {}",
+            p.ocr_reason.as_deref().unwrap_or("?"),
+            pw,
+            ph,
+            rec.tier
+        );
+        Ok((page_md, rec, note))
     }
 
     /// L1 with `use_indra = false`: the v0.1.0 PP-OCRv6-only flow. The

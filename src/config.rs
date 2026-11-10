@@ -192,6 +192,11 @@ fn default_false() -> bool {
     false
 }
 
+/// RouteConfig's `parallel_threads` default: 1 (serial, v0.3.0 behavior).
+fn default_threads() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
@@ -203,12 +208,20 @@ pub struct RouteConfig {
     /// re-enable the columns reroute.
     #[serde(default = "default_false")]
     pub structure_gate: bool,
+    /// Number of page-level worker threads for the L1/L2 pass. `1` (the
+    /// default) is the original serial loop — byte-identical to v0.3.0.
+    /// `>1` splits the pages across worker threads, each with its own L1
+    /// engine and PDFium document (render is stateless, so this is safe);
+    /// output is reassembled in page order, so the markdown is unaffected.
+    #[serde(default = "default_threads")]
+    pub parallel_threads: usize,
 }
 impl Default for RouteConfig {
     fn default() -> Self {
         Self {
             chain: ChainConfig::default(),
             structure_gate: false,
+            parallel_threads: 1,
         }
     }
 }
