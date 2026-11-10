@@ -303,13 +303,24 @@ impl Engine {
                 // former C1 structural reroute (render + PP-DocLayout +
                 // G1 a/b) is gone: L0 is model-free, and the layout model
                 // no longer participates in routing at all (decision C).
-                // Gated on use_indra: with use_indra = false (v0.1.0) the
-                // page keeps the native L0 output.
-                if self.cfg.l1.use_indra && p.has_table {
+                // `structure_gate` widens the same reroute to multi-column
+                // pages via the equally free `pages_with_columns` signal
+                // (text-layer x-clustering; always false on image-only
+                // pages, which never reach this gate) — column reading
+                // order is flattened away by the native layer the same way
+                // tables are. Gated on use_indra: with use_indra = false
+                // (v0.1.0) the page keeps the native L0 output.
+                if self.cfg.l1.use_indra
+                    && (p.has_table
+                        || (self.cfg.route.structure_gate && p.has_columns))
+                {
                     let (png, _pbox, _rot) =
                         render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                             .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
-                    eprintln!("[p{page1}] S0 reroute: table page — L1");
+                    eprintln!(
+                        "[p{page1}] S0 reroute: {} page — L1",
+                        if p.has_table { "table" } else { "columns" }
+                    );
                     let (page_md, rec, note) = self.l1_dual(page1, &png);
                     if self.cfg.output.page_markers {
                         out.push_str(&format!("<!-- page:{page1} -->\n"));

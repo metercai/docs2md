@@ -23,6 +23,12 @@ pub struct L0Page {
     /// model — the zero-model replacement for the former C1 structural
     /// reroute.
     pub has_table: bool,
+    /// pdf-inspector's free multi-column signal (text-layer `column_items`
+    /// x-clustering, no rendering, no models; always false on image-only
+    /// pages, which never reach this gate). Reroutes multi-column pages to
+    /// L1, whose order model keeps column reading order the native layer
+    /// flattens away.
+    pub has_columns: bool,
 }
 
 /// Result of the L0 pass over a whole document.
@@ -36,6 +42,7 @@ pub fn extract(bytes: &[u8]) -> Result<L0Result, String> {
     let doc = extract_pages_markdown_mem(bytes, None)
         .map_err(|e| format!("L0 extraction failed: {e}"))?;
     let tables = doc.pages_with_tables;
+    let columns = doc.pages_with_columns;
     let pages = doc
         .pages
         .into_iter()
@@ -46,6 +53,7 @@ pub fn extract(bytes: &[u8]) -> Result<L0Result, String> {
             ocr_reason: p.ocr_reason,
             // pdf-inspector reports these 1-indexed; `page` is 0-based.
             has_table: tables.contains(&(p.page + 1)),
+            has_columns: columns.contains(&(p.page + 1)),
         })
         .collect();
     Ok(L0Result { pages })

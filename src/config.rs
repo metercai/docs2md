@@ -148,19 +148,6 @@ impl Default for L3Config {
 /// to L2 (PP-OCRv6).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RouteConfig {
-    pub chain: ChainConfig,
-}
-impl Default for RouteConfig {
-    fn default() -> Self {
-        Self {
-            chain: ChainConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
 pub struct ChainConfig {
     /// [det] fewer line boxes than this => L2 (a near-image page; saves the
     /// whole recognition pass).
@@ -186,6 +173,37 @@ impl Default for ChainConfig {
             unsure_line_frac: 0.5,
             rec_hard_conf: 0.5,
             min_chars: 60,
+        }
+    }
+}
+
+/// RouteConfig's `structure_gate` default: OFF. The free `pages_with_columns`
+/// signal mis-fires on form layouts (short scattered items — checkbox labels,
+/// field names — trigger pdf-inspector's unguarded absolute-valley / XY-cut
+/// paths, which lack the prose guard the relative-valley path has). Until the
+/// upstream fix (U2) lands, the default keeps v0.3.0 behavior; `true` re-enables
+/// the columns reroute.
+fn default_false() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouteConfig {
+    pub chain: ChainConfig,
+    /// Reroute multi-column native-text pages (pdf-inspector's free
+    /// `pages_with_columns` signal) to L1, whose order model keeps column
+    /// reading order the native layer flattens away. Default off (see
+    /// `default_false`): the signal mis-fires on form pages. `true` =
+    /// re-enable the columns reroute.
+    #[serde(default = "default_false")]
+    pub structure_gate: bool,
+}
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self {
+            chain: ChainConfig::default(),
+            structure_gate: false,
         }
     }
 }
