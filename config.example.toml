@@ -63,8 +63,11 @@ det_min_lines = 3
 # the engine that reads Chinese better: PP-OCRv6).
 cjk_line_frac = 0.5
 # [script] unsure (double-read) line fraction >= this => L2 (the
-# recognizer itself is uncertain on half the lines).
-unsure_line_frac = 0.5
+# recognizer itself is uncertain on half the lines). OFF by default (None)
+# since v0.3.1: the handwriting A/B showed the unsure-triggered L2 leg was
+# quality-neutral to negative for text and cost 2x the time. Uncomment and
+# set a number (e.g. 0.5) to re-enable the v0.3.0 behavior.
+# unsure_line_frac = 0.5
 # [rec] mean line conf below this => L2 (unreliable reading).
 rec_hard_conf = 0.5
 # [assemble] output characters below this => L2 (almost nothing read).

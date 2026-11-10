@@ -156,8 +156,13 @@ pub struct ChainConfig {
     /// to the engine that reads Chinese better: PP-OCRv6).
     pub cjk_line_frac: f32,
     /// [script] unsure (double-read) line fraction >= this => L2 (the
-    /// recognizer itself is uncertain on half the lines).
-    pub unsure_line_frac: f32,
+    /// recognizer itself is uncertain on half the lines). `None` (the
+    /// default) turns the criterion off: on the handwriting A/B (39 pages,
+    /// 2026-11-10) the unsure-triggered L2 leg was quality-neutral to
+    /// negative for text content and cost 2x the time; the other criteria
+    /// (cjk/novariant/det/conf/chars) are unaffected and stay live. Set a
+    /// number (e.g. 0.5) to re-enable the v0.3.0 behavior.
+    pub unsure_line_frac: Option<f32>,
     /// [rec] mean line conf below this => L2 (unreliable reading; the former
     /// G3 `hard_conf`, now without the char-count precondition).
     pub rec_hard_conf: f32,
@@ -170,7 +175,7 @@ impl Default for ChainConfig {
         Self {
             det_min_lines: 3,
             cjk_line_frac: 0.5,
-            unsure_line_frac: 0.5,
+            unsure_line_frac: None,
             rec_hard_conf: 0.5,
             min_chars: 60,
         }

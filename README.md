@@ -50,7 +50,8 @@ needs OCR → render (PDFium, 200 dpi)
             det → script pre-pass → rec → order → markdown assembly
             with a serial metric chain (route.rs, [route.chain]):
                 det lines < det_min_lines
-                script cjk / unsure fraction above threshold
+                script cjk fraction above threshold
+                (script unsure fraction: opt-in criterion, off by default)
                 rec mean conf < rec_hard_conf
                 assemble output chars < assemble.min_chars
                 any stage hit ⇒ L2

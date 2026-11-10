@@ -87,7 +87,8 @@ pub fn chain_script(sm: &ScriptMetrics, rc: &RouteConfig) -> Option<&'static str
     if sm.dominant.is_some() && !sm.dominant_has_variant {
         return Some(TAG_NOVARIANT);
     }
-    if sm.unsure_frac() >= rc.chain.unsure_line_frac {
+    // `None` threshold = criterion off (the default; see ChainConfig).
+    if rc.chain.unsure_line_frac.is_some_and(|thr| sm.unsure_frac() >= thr) {
         return Some(TAG_UNSURE);
     }
     None
@@ -207,16 +208,30 @@ mod tests {
 
     #[test]
     fn script_unsure_major_escalates() {
-        // 20 of 40 unsure (0.5 >= 0.5) => unsure (cjk is low).
-        assert_eq!(chain_script(&sm(40, 0, 20), &rc()), Some(TAG_UNSURE));
+        // Explicit threshold (the v0.3.0 behavior): 20 of 40 unsure
+        // (0.5 >= 0.5) => unsure (cjk is low).
+        let mut rc = rc();
+        rc.chain.unsure_line_frac = Some(0.5);
+        assert_eq!(chain_script(&sm(40, 0, 20), &rc), Some(TAG_UNSURE));
         // 19/40 stays L1.
-        assert_eq!(chain_script(&sm(40, 0, 19), &rc()), None);
+        assert_eq!(chain_script(&sm(40, 0, 19), &rc), None);
+    }
+
+    #[test]
+    fn script_unsure_off_by_default() {
+        // The default (None) disables the unsure criterion: even a
+        // majority-unsure page stays L1 (cjk/novariant still live).
+        assert_eq!(chain_script(&sm(40, 0, 40), &rc()), None);
+        // cjk still escalates with the default config.
+        assert_eq!(chain_script(&sm(40, 30, 30), &rc()), Some(TAG_CJK));
     }
 
     #[test]
     fn script_cjk_wins_over_unsure() {
         // both fire: the plan order puts cjk first.
-        assert_eq!(chain_script(&sm(40, 30, 30), &rc()), Some(TAG_CJK));
+        let mut rc = rc();
+        rc.chain.unsure_line_frac = Some(0.5);
+        assert_eq!(chain_script(&sm(40, 30, 30), &rc), Some(TAG_CJK));
     }
 
     // --- [rec] / [assemble] output gate ---------------------------------
