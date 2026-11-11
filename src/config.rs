@@ -146,7 +146,7 @@ impl Default for L3Config {
 /// advances — after det, after the script pre-pass, after rec, after
 /// assemble — and the first hit stops the pipeline and escalates the page
 /// to L2 (PP-OCRv6).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChainConfig {
     /// [det] fewer line boxes than this => L2 (a near-image page; saves the
@@ -220,7 +220,7 @@ fn default_cov_min_layer() -> usize {
     200
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
     pub chain: ChainConfig,
@@ -231,11 +231,12 @@ pub struct RouteConfig {
     /// re-enable the columns reroute.
     #[serde(default = "default_false")]
     pub structure_gate: bool,
-    /// Number of page-level worker threads for the L1/L2 pass. `1` (the
-    /// default) is the original serial loop — byte-identical to v0.3.0.
-    /// `>1` splits the pages across worker threads, each with its own L1
+    /// Number of page-level worker threads for the L1/L2 pass. `4` (the
+    /// default) splits the pages across worker threads, each with its own L1
     /// engine and PDFium document (render is stateless, so this is safe);
     /// output is reassembled in page order, so the markdown is unaffected.
+    /// `1` is the original serial loop (v0.3.0 behavior). Both the serde
+    /// and `Default` impls must agree — see the unit test below.
     #[serde(default = "default_threads")]
     pub parallel_threads: usize,
     /// Feed the page's PDF text layer into the L1 engine (plan 0.3.2 T3/T4):
@@ -269,7 +270,7 @@ impl Default for RouteConfig {
         Self {
             chain: ChainConfig::default(),
             structure_gate: false,
-            parallel_threads: 1,
+            parallel_threads: 4,
             layer_fusion: false,
             coverage_gate: true,
             cov_theta: 0.6,
@@ -324,20 +325,20 @@ mod tests {
     // The hand-written `Default for RouteConfig` and the serde per-field
     // defaults must agree: `Config::load` on a missing file goes through
     // the former, parsing a toml that omits a field through the latter.
-    // (C4: both paths must yield coverage_gate on + theta 0.6.)
+    // (C4 pinned coverage_gate + cov_theta; 0.3.3 P0 extends the pin to
+    // every field — a missing per-field `#[serde(default = ...)]` or a
+    // drift in either impl now fails the build, e.g. the parallel_threads
+    // 1-vs-4 divergence.)
     #[test]
     fn route_defaults_agree_serde_and_default() {
         let d = RouteConfig::default();
         let s: RouteConfig = toml::from_str("").unwrap();
-        assert_eq!(d.coverage_gate, s.coverage_gate, "coverage_gate");
-        assert!(
-            (d.cov_theta - s.cov_theta).abs() < f32::EPSILON,
-            "cov_theta"
-        );
+        assert_eq!(d, s, "RouteConfig: Default impl must equal serde defaults");
         assert!(d.coverage_gate, "coverage_gate must default to on (C4)");
         assert!(
             (d.cov_theta - 0.6).abs() < f32::EPSILON,
             "cov_theta 0.6 (C3b)"
         );
+        assert_eq!(d.parallel_threads, 4, "parallel_threads 4 (0.3.3 P0)");
     }
 }
