@@ -149,16 +149,20 @@ pub fn l3_gate(chars: usize, mean_conf: f32, l3: &L3Config) -> Option<&'static s
     }
 }
 
-/// [cov] S0 stage (plan 0.3.2 T1'/C3): a usable-native-text page whose L0
-/// output covers less than `theta` of its text layer (the layer holding at
-/// least `min_layer` non-whitespace chars) had its extraction broken by the
-/// native flattening — reroute to L1. Returns the observed cov when it
-/// fires (for logging), `None` otherwise.
+/// [cov] S0 stage (plan 0.3.2 T1'/C3, C3b): a usable-native-text page whose
+/// L0 output covers less than `theta` of its complete text layer (the layer
+/// holding at least `min_layer` non-whitespace chars) had its extraction
+/// broken by the native flattening — reroute to L1. Returns the observed
+/// cov when it fires (for logging), `None` otherwise.
 ///
 /// The criterion is `<` (strict): a page covering exactly `theta` keeps the
-/// native output. Calibrated on the OPB-16 corpus (the two broken pages sit
-/// at cov 0.37 / 0.02; the next-lowest healthy page at 0.76) and re-verified
-/// on the 623-page fixture (no page in the 0.4–0.7 band; minimum cov 0.8).
+/// native output. Calibrated on the firecrawl-pdfium per-page text layer
+/// (PDFium FPDFText — the full per-page layer; C3b swapped the denominator
+/// off pdf-inspector's under-covering positioned API): on OPB-48 the two
+/// broken pages sit at cov 0.518 / 0.021 and every healthy page at ≥1.005;
+/// on the 623-page fixture the minimum healthy cov is 0.839 and no page
+/// falls in 0.6–0.839. θ=0.6 leaves 0.082 above the worst broken page and
+/// 0.239 below the best healthy page.
 pub fn coverage_should_reroute(
     l0_chars: usize,
     layer_chars: usize,
@@ -381,12 +385,15 @@ mod tests {
 
     #[test]
     fn cov_calibrated_values_fire() {
-        // The two OPB-16 broken pages (plan §2 calibration): odot
-        // (1654/4419 ≈ 0.374) and the olmo table page (94/5187 ≈ 0.018).
-        let a = coverage_should_reroute(1654, 4419, 0.5, 200);
-        assert!(a.is_some() && (a.unwrap() - 0.3743).abs() < 1e-3);
-        let b = coverage_should_reroute(94, 5187, 0.5, 200);
-        assert!(b.is_some() && (b.unwrap() - 0.0181).abs() < 1e-3);
+        // The two OPB-48 broken pages under the C3b firecrawl denominator
+        // (plan §0.3): odot (1654/3190 ≈ 0.518) and the olmo table page
+        // (94/4367 ≈ 0.021). Both fire at θ=0.6 (odot needs θ>0.518).
+        let a = coverage_should_reroute(1654, 3190, 0.6, 200);
+        assert!(a.is_some() && (a.unwrap() - 0.5185).abs() < 1e-3);
+        let b = coverage_should_reroute(94, 4367, 0.6, 200);
+        assert!(b.is_some() && (b.unwrap() - 0.0215).abs() < 1e-3);
+        // A healthy page (cov ≥1.005 on OPB-48) stays native at θ=0.6.
+        assert_eq!(coverage_should_reroute(3001, 2986, 0.6, 200), None);
     }
 
     // --- output_chars ---------------------------------------------------

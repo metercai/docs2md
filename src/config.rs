@@ -199,11 +199,12 @@ fn default_threads() -> usize {
     4
 }
 
-/// RouteConfig's `cov_theta` default: 0.5 (plan 0.3.2 §2, calibrated on the
-/// OPB-16 corpus and re-verified on the 623-page fixture — the cov<0.5 band
-/// is empty there, the minimum observed cov is 0.8).
+/// RouteConfig's `cov_theta` default: 0.6 (C3b, calibrated on the
+/// firecrawl-pdfium per-page text layer: the two broken OPB-48 pages sit at
+/// cov 0.518 / 0.021, every healthy page at ≥1.005 there and ≥0.839 on the
+/// 623-page fixture — θ=0.6 leaves margin on both sides).
 fn default_cov_theta() -> f32 {
-    0.5
+    0.6
 }
 
 /// RouteConfig's `cov_min_layer` default: 200 non-whitespace text-layer
@@ -244,10 +245,12 @@ pub struct RouteConfig {
     /// (C3 lands it inert; C4 flips it on after the gate's acceptance run).
     #[serde(default = "default_false")]
     pub coverage_gate: bool,
-    /// cov threshold for `coverage_gate` (calibrated on OPB-16 + the
-    /// 623-page re-verification, plan 0.3.2 §2). NOTE: cov depends on
-    /// pdf-inspector's markdown extraction (numerator) and positioned text
-    /// (denominator) — re-verify the threshold when the crate is upgraded.
+    /// cov threshold for `coverage_gate` (C3b, calibrated on the
+    /// firecrawl-pdfium per-page text layer; the two broken OPB-48 pages sit
+    /// at cov 0.518 / 0.021, the lowest healthy page at 0.839 on the
+    /// 623-page fixture). NOTE: cov depends on pdf-inspector's markdown
+    /// extraction (numerator) and PDFium's text (denominator) — re-verify
+    /// the threshold when either crate is upgraded.
     #[serde(default = "default_cov_theta")]
     pub cov_theta: f32,
     /// Minimum text-layer non-whitespace chars for `coverage_gate` to

@@ -284,26 +284,29 @@ impl Engine {
 
     /// T1'/C3: the S0 coverage ratio for one candidate page — the
     /// non-whitespace characters of the L0 markdown over the non-whitespace
-    /// characters of the page's text layer (same positioned API as
-    /// [`extract_layer`]: one text-layer source of truth). Returns the cov
-    /// when [`route::coverage_should_reroute`] fires, `None` otherwise (or
-    /// when the positioned pass fails). Never called while
-    /// `route.coverage_gate` is off.
+    /// characters of the page's complete firecrawl-pdfium text (PDFium
+    /// FPDFText — the full per-page layer; C3b swapped the denominator off
+    /// pdf-inspector's under-covering positioned API). Returns the cov when
+    /// [`route::coverage_should_reroute`] fires, `None` otherwise (or when
+    /// the text pass fails). Never called while `route.coverage_gate` is off.
     /// NOTE: the cov criterion depends on pdf-inspector's markdown
-    /// extraction (numerator, incl. its table-dropping behavior) and its
-    /// positioned text (denominator) — re-verify `cov_theta` when the
-    /// crate is upgraded (623-page distribution method, plan §2).
-    fn s0_coverage_cov(&self, bytes: &[u8], p: &l0::L0Page) -> Option<f32> {
+    /// extraction (numerator) and PDFium's text (denominator) — re-verify
+    /// `cov_theta` when either crate is upgraded (48 + 623-page
+    /// distribution method, C3b plan §0.3).
+    fn s0_coverage_cov(&self, p: &l0::L0Page, doc: &PdfDocument) -> Option<f32> {
         let l0_chars = p.markdown.chars().filter(|c| !c.is_whitespace()).count();
-        let page_set = HashSet::from([p.page + 1]);
-        let items =
-            pdf_inspector::extractor::extract_text_with_positions_mem_pages(bytes, Some(&page_set))
-                .ok()?;
-        let layer_chars = items
-            .iter()
-            .filter(|it| matches!(it.item_type, pdf_inspector::types::ItemType::Text))
-            .map(|it| it.text.chars().filter(|c| !c.is_whitespace()).count())
-            .sum::<usize>();
+        // Denominator = the page's complete firecrawl-pdfium text (PDFium
+        // FPDFText — the full per-page layer; pdf-inspector's positioned API
+        // under-covers table / multi-column pages, C3b plan §0.2).
+        let layer_chars = doc
+            .page(p.page as usize)
+            .ok()?
+            .text()
+            .ok()?
+            .text()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .count();
         route::coverage_should_reroute(
             l0_chars,
             layer_chars,
@@ -521,9 +524,21 @@ impl Engine {
                 && !(p.has_table || (self.cfg.route.structure_gate && p.has_columns))
             {
                 // Only pages not already rerouted by the stronger table /
-                // columns signals pay for the positioned pass (and the log
-                // line keeps one reason per page).
-                self.s0_coverage_cov(bytes, p)
+                // columns signals pay for the PDFium text pass (and the log
+                // line keeps one reason per page). Reuse the chunk's shared
+                // document: a page that does NOT reroute hands the same doc to
+                // l0_blocks below (no second load); a rerouted page pays one
+                // load that goes unused (two corpus pages, acceptable).
+                if doc.is_none() {
+                    let pdfium = firecrawl_pdfium::Pdfium::load()
+                        .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?;
+                    *doc = Some(
+                        pdfium
+                            .load_document(bytes.to_vec(), None)
+                            .map_err(|e| Error::Pdf(format!("p{page1}: {e}")))?,
+                    );
+                }
+                self.s0_coverage_cov(p, doc.as_ref().unwrap())
             } else {
                 None
             };
