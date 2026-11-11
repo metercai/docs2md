@@ -21,7 +21,10 @@ config.
 ## Tiers, in detail
 
 - **L0 — native extraction** (`pdf-inspector`). Pages with a usable text
-  layer convert directly. No rendering, no models.
+  layer convert directly (no rendering, no models). The coverage gate
+  (`[route] coverage_gate`, default on) reroutes a page to L1 when its L0
+  output covers less than `cov_theta` of the text layer — the extraction
+  is broken (tables, multi-column pages the native layer flattens).
 - **L1 — embedded OCR** (pure Rust, ONNX on rten). The primary is the
   **Indra** OCR pipeline (`feature indra`, default on): detection, a script
   pre-pass, recognition, reading order and markdown assembly with a table
@@ -43,7 +46,9 @@ config.
 ## Routing (per page)
 
 ```
-page has a usable text layer ──────────────── L0 (direct)
+page has a usable text layer ──────────────── L0 (direct), unless the
+   coverage gate (default on) fires: L0 output covering less than
+   [route] cov_theta of the text layer ⇒ reroute to L1
 needs OCR → render (PDFium, 200 dpi)
           → L1 (embedded engine; `indra` default, PP-OCRv6-only when
             [l1].use_indra = false):
@@ -101,10 +106,11 @@ target/release/docs2md input.pdf out.md
 #    --blocks out.json  also write structured layout blocks as JSON
 ```
 
-With no config file at all: L0 pages convert natively, OCR pages run the
-embedded L1 (escalating weak pages to the embedded L2), and — since the L3
-VLM is unconfigured — a page whose L2 result is weak keeps the best local
-output with a note.
+With no config file at all: L0 pages convert natively (the coverage gate
+reroutes a page to L1 when its text layer is broken — tables, multi-column
+layout), OCR pages run the embedded L1 (escalating weak pages to the
+embedded L2), and — since the L3 VLM is unconfigured — a page whose L2
+result is weak keeps the best local output with a note.
 
 ## Structured blocks (JSON)
 
