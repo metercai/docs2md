@@ -149,6 +149,33 @@ pub fn l3_gate(chars: usize, mean_conf: f32, l3: &L3Config) -> Option<&'static s
     }
 }
 
+/// [cov] S0 stage (plan 0.3.2 T1'/C3): a usable-native-text page whose L0
+/// output covers less than `theta` of its text layer (the layer holding at
+/// least `min_layer` non-whitespace chars) had its extraction broken by the
+/// native flattening — reroute to L1. Returns the observed cov when it
+/// fires (for logging), `None` otherwise.
+///
+/// The criterion is `<` (strict): a page covering exactly `theta` keeps the
+/// native output. Calibrated on the OPB-16 corpus (the two broken pages sit
+/// at cov 0.37 / 0.02; the next-lowest healthy page at 0.76) and re-verified
+/// on the 623-page fixture (no page in the 0.4–0.7 band; minimum cov 0.8).
+pub fn coverage_should_reroute(
+    l0_chars: usize,
+    layer_chars: usize,
+    theta: f32,
+    min_layer: usize,
+) -> Option<f32> {
+    if layer_chars < min_layer {
+        return None; // scan / near-empty: not a candidate
+    }
+    let cov = l0_chars as f32 / layer_chars as f32;
+    if cov < theta {
+        Some(cov)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +341,52 @@ mod tests {
         assert_eq!(l3_gate(300, 0.9, &l3()), None);
         // boundary: exactly 30 chars passes.
         assert_eq!(l3_gate(30, 0.9, &l3()), None);
+    }
+
+    // --- [cov] S0 coverage gate (plan 0.3.2 T1'/C3) ---------------------
+
+    #[test]
+    fn cov_small_layer_never_fires() {
+        // layer below min_layer is not a candidate, no matter how low cov.
+        assert_eq!(coverage_should_reroute(0, 0, 0.5, 200), None);
+        assert_eq!(coverage_should_reroute(10, 199, 0.5, 200), None);
+    }
+
+    #[test]
+    fn cov_fires_at_min_layer() {
+        // exactly min_layer with low coverage fires.
+        assert_eq!(coverage_should_reroute(50, 200, 0.5, 200), Some(0.25));
+    }
+
+    #[test]
+    fn cov_at_theta_passes() {
+        // the criterion is `<`: covering exactly theta keeps the native
+        // output (the healthy side of the calibration split).
+        assert_eq!(coverage_should_reroute(1000, 2000, 0.5, 200), None);
+        // just below fires.
+        assert_eq!(coverage_should_reroute(999, 2000, 0.5, 200), Some(0.4995));
+    }
+
+    #[test]
+    fn cov_above_theta_passes() {
+        assert_eq!(coverage_should_reroute(1600, 2000, 0.5, 200), None);
+    }
+
+    #[test]
+    fn cov_theta_is_configurable() {
+        // theta = 0.7: a 0.5-coverage page now fires.
+        assert_eq!(coverage_should_reroute(1000, 2000, 0.7, 200), Some(0.5));
+        assert_eq!(coverage_should_reroute(1600, 2000, 0.7, 200), None);
+    }
+
+    #[test]
+    fn cov_calibrated_values_fire() {
+        // The two OPB-16 broken pages (plan §2 calibration): odot
+        // (1654/4419 ≈ 0.374) and the olmo table page (94/5187 ≈ 0.018).
+        let a = coverage_should_reroute(1654, 4419, 0.5, 200);
+        assert!(a.is_some() && (a.unwrap() - 0.3743).abs() < 1e-3);
+        let b = coverage_should_reroute(94, 5187, 0.5, 200);
+        assert!(b.is_some() && (b.unwrap() - 0.0181).abs() < 1e-3);
     }
 
     // --- output_chars ---------------------------------------------------

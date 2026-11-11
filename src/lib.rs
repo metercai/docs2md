@@ -282,6 +282,36 @@ impl Engine {
         self.extract_layer(bytes, page0, pbox, rot)
     }
 
+    /// T1'/C3: the S0 coverage ratio for one candidate page — the
+    /// non-whitespace characters of the L0 markdown over the non-whitespace
+    /// characters of the page's text layer (same positioned API as
+    /// [`extract_layer`]: one text-layer source of truth). Returns the cov
+    /// when [`route::coverage_should_reroute`] fires, `None` otherwise (or
+    /// when the positioned pass fails). Never called while
+    /// `route.coverage_gate` is off.
+    /// NOTE: the cov criterion depends on pdf-inspector's markdown
+    /// extraction (numerator, incl. its table-dropping behavior) and its
+    /// positioned text (denominator) — re-verify `cov_theta` when the
+    /// crate is upgraded (623-page distribution method, plan §2).
+    fn s0_coverage_cov(&self, bytes: &[u8], p: &l0::L0Page) -> Option<f32> {
+        let l0_chars = p.markdown.chars().filter(|c| !c.is_whitespace()).count();
+        let page_set = HashSet::from([p.page + 1]);
+        let items =
+            pdf_inspector::extractor::extract_text_with_positions_mem_pages(bytes, Some(&page_set))
+                .ok()?;
+        let layer_chars = items
+            .iter()
+            .filter(|it| matches!(it.item_type, pdf_inspector::types::ItemType::Text))
+            .map(|it| it.text.chars().filter(|c| !c.is_whitespace()).count())
+            .sum::<usize>();
+        route::coverage_should_reroute(
+            l0_chars,
+            layer_chars,
+            self.cfg.route.cov_theta,
+            self.cfg.route.cov_min_layer,
+        )
+    }
+
     /// Ensure the L1 primary engine (Indra when enabled, else PP-OCRv6) is
     /// built. Returns a human reason if it is unavailable (init failed), and
     /// `None` when ready.
@@ -481,19 +511,39 @@ impl Engine {
             // (text-layer x-clustering; always false on image-only
             // pages, which never reach this gate) — column reading
             // order is flattened away by the native layer the same way
-            // tables are. Gated on use_indra: with use_indra = false
-            // (v0.1.0) the page keeps the native L0 output.
+            // tables are. The `coverage_gate` (T1'/C3) widens it once
+            // more: a page whose L0 output covers less than `cov_theta`
+            // of its text layer (at least `cov_min_layer` chars) is
+            // broken the same way. Gated on use_indra: with
+            // use_indra = false (v0.1.0) the page keeps the native L0
+            // output.
+            let cov_fire = if self.cfg.route.coverage_gate
+                && !(p.has_table || (self.cfg.route.structure_gate && p.has_columns))
+            {
+                // Only pages not already rerouted by the stronger table /
+                // columns signals pay for the positioned pass (and the log
+                // line keeps one reason per page).
+                self.s0_coverage_cov(bytes, p)
+            } else {
+                None
+            };
             if self.cfg.l1.use_indra
-                && (p.has_table || (self.cfg.route.structure_gate && p.has_columns))
+                && (p.has_table
+                    || (self.cfg.route.structure_gate && p.has_columns)
+                    || cov_fire.is_some())
             {
                 let (png, pbox, rot) =
                     render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
                         .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
                 let layer = self.extract_layer_gated(bytes, p.page, pbox, rot);
-                eprintln!(
-                    "[p{page1}] S0 reroute: {} page — L1",
-                    if p.has_table { "table" } else { "columns" }
-                );
+                if let Some(cov) = cov_fire {
+                    eprintln!("[p{page1}] S0 reroute: coverage page (cov={cov:.2}) — L1");
+                } else {
+                    eprintln!(
+                        "[p{page1}] S0 reroute: {} page — L1",
+                        if p.has_table { "table" } else { "columns" }
+                    );
+                }
                 let (page_md, rec, note) = self.l1_dual(page1, &png, layer.as_ref());
                 return Ok((page_md, rec, note));
             }

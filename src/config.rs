@@ -199,6 +199,20 @@ fn default_threads() -> usize {
     4
 }
 
+/// RouteConfig's `cov_theta` default: 0.5 (plan 0.3.2 §2, calibrated on the
+/// OPB-16 corpus and re-verified on the 623-page fixture — the cov<0.5 band
+/// is empty there, the minimum observed cov is 0.8).
+fn default_cov_theta() -> f32 {
+    0.5
+}
+
+/// RouteConfig's `cov_min_layer` default: 200 non-whitespace text-layer
+/// chars — below that a page is a scan / near-empty page, not a coverage
+/// candidate (it is `needs_ocr` anyway).
+fn default_cov_min_layer() -> usize {
+    200
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
@@ -223,6 +237,23 @@ pub struct RouteConfig {
     /// C2 turns the fusion on after the byte-parity gate).
     #[serde(default = "default_false")]
     pub layer_fusion: bool,
+    /// T1' coverage gate (plan 0.3.2 C3): reroute a usable-native-text page
+    /// to L1 when its L0 output covers less than `cov_theta` of the text
+    /// layer (`cov_min_layer` chars minimum) — the extraction is broken,
+    /// multi-column / table pages the native layer flattens. Default off
+    /// (C3 lands it inert; C4 flips it on after the gate's acceptance run).
+    #[serde(default = "default_false")]
+    pub coverage_gate: bool,
+    /// cov threshold for `coverage_gate` (calibrated on OPB-16 + the
+    /// 623-page re-verification, plan 0.3.2 §2). NOTE: cov depends on
+    /// pdf-inspector's markdown extraction (numerator) and positioned text
+    /// (denominator) — re-verify the threshold when the crate is upgraded.
+    #[serde(default = "default_cov_theta")]
+    pub cov_theta: f32,
+    /// Minimum text-layer non-whitespace chars for `coverage_gate` to
+    /// consider a page (excludes scans / near-empty pages).
+    #[serde(default = "default_cov_min_layer")]
+    pub cov_min_layer: usize,
 }
 impl Default for RouteConfig {
     fn default() -> Self {
@@ -231,6 +262,9 @@ impl Default for RouteConfig {
             structure_gate: false,
             parallel_threads: 1,
             layer_fusion: false,
+            coverage_gate: false,
+            cov_theta: 0.5,
+            cov_min_layer: 200,
         }
     }
 }
