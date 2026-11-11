@@ -293,18 +293,17 @@ impl L1Engine for IndraEngine {
         self.engine.ocr_page(&gray, rc)
     }
 
-    /// C1 (T3): the fusion entry point. It currently ignores the layer and
-    /// runs the plain pipeline — byte-identical to `ocr_page`, which is what
-    /// keeps the `layer = None` gate a 0/48 no-op. C2 (T4) changes this to
-    /// consume the runs (text-layer characters on covered lines).
+    /// C2 (T4): the fusion entry point. Passes the page's text layer to the
+    /// pipeline so covered lines read the exact PDF characters; `None` runs
+    /// the plain pipeline (byte-identical to `ocr_page`).
     fn ocr_page_with_layer(
         &mut self,
         png: &[u8],
         rc: &crate::config::RouteConfig,
-        _layer: Option<&super::LayerPage>,
+        layer: Option<&super::LayerPage>,
     ) -> Result<OcrPage, String> {
         let gray = indra::preproc::Gray::from_png(png)?;
-        self.engine.ocr_page(&gray, rc)
+        self.engine.ocr_page_with_layer(&gray, rc, layer)
     }
 }
 

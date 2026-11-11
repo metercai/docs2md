@@ -88,7 +88,11 @@ pub fn chain_script(sm: &ScriptMetrics, rc: &RouteConfig) -> Option<&'static str
         return Some(TAG_NOVARIANT);
     }
     // `None` threshold = criterion off (the default; see ChainConfig).
-    if rc.chain.unsure_line_frac.is_some_and(|thr| sm.unsure_frac() >= thr) {
+    if rc
+        .chain
+        .unsure_line_frac
+        .is_some_and(|thr| sm.unsure_frac() >= thr)
+    {
         return Some(TAG_UNSURE);
     }
     None

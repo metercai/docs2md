@@ -527,9 +527,8 @@ impl Engine {
         }
 
         // needs_ocr → render once (PDFium), then route.
-        let (png, pbox, rot) =
-            render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
-                .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+        let (png, pbox, rot) = render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
+            .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
         let (pw, ph) = render::png_size(&png);
 
         // needs_ocr → render once, then L1. The L1→L2 serial metric

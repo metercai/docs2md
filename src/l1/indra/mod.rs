@@ -8,6 +8,7 @@
 //! the rec model's widths/ids/topi I/O is handled as i32 throughout.
 
 pub mod det;
+pub mod layer_fusion;
 pub mod lm;
 pub mod markdown;
 pub mod npz;
@@ -269,6 +270,19 @@ impl IndraEngine {
         gray: &preproc::Gray,
         rc: &crate::config::RouteConfig,
     ) -> Result<super::OcrPage, String> {
+        self.ocr_page_with_layer(gray, rc, None)
+    }
+
+    /// `ocr_page` with the page's usable text layer (plan 0.3.2 T4): covered
+    /// lines are read from the exact PDF characters instead of the OCR guess;
+    /// uncovered lines keep the OCR result. `None` runs the plain pipeline
+    /// (byte-identical to `ocr_page`).
+    pub fn ocr_page_with_layer(
+        &mut self,
+        gray: &preproc::Gray,
+        rc: &crate::config::RouteConfig,
+        layer: Option<&super::LayerPage>,
+    ) -> Result<super::OcrPage, String> {
         let small = preproc::preview(gray, preproc::PREVIEW_SIDE);
         let a = preproc::estimate_skew(&small, 800);
         // The orientation model reads the page straightened by its row angle
@@ -278,7 +292,7 @@ impl IndraEngine {
         } else {
             self.orientation(&small)?
         };
-        self.read(gray, k, a, &small, rc)
+        self.read(gray, k, a, &small, rc, layer)
     }
 
     /// orient.onnx quarter-turn choice (product `orientation`): argmax over the
@@ -314,7 +328,11 @@ impl IndraEngine {
         a: f64,
         small: &preproc::Gray,
         rc: &crate::config::RouteConfig,
+        layer: Option<&super::LayerPage>,
     ) -> Result<super::OcrPage, String> {
+        // The display (render) size, captured before `turn` shadows `gray`
+        // with the worked frame — the layer's point map needs it.
+        let render_wh = (gray.w, gray.h);
         let (gray, _k, skew) = preproc::turn(gray, k, a, small);
         let (boxes, pictures) =
             det::detect(&self.det, &gray, self.meta.det_long_side as usize, true);
@@ -347,7 +365,7 @@ impl IndraEngine {
             });
         }
 
-        let lines = rec::recognize_groups(self, &rs, &boxes);
+        let mut lines = rec::recognize_groups(self, &rs, &boxes);
         if lines.is_empty() {
             // Boxes were detected but nothing could be read: the conf
             // criterion is undefined (mean conf of zero lines), treat the
@@ -358,6 +376,27 @@ impl IndraEngine {
                 blocks: Vec::new(),
                 escalate_l2: Some(crate::route::TAG_CHARS),
             });
+        }
+
+        // T4 (plan 0.3.2): fuse the page's text layer onto the detected
+        // lines — a covered line is read from the exact PDF characters
+        // (conf 1.0, no OCR) instead of the recognizer's guess; an
+        // uncovered line keeps its OCR reading. No-op when the page has no
+        // usable layer (layer_fusion off, a pure scan, or a rotated page).
+        if let Some(layer) = layer {
+            let (fused, _lost) = layer_fusion::fuse_lines(layer, &boxes, k, skew, &gray, render_wh);
+            for (i, f) in fused.into_iter().enumerate() {
+                if let Some(f) = f {
+                    let toks: Vec<markdown::Tok> = f
+                        .tokens
+                        .iter()
+                        .map(|(c, x)| markdown::Tok::Ch(*c, *x))
+                        .collect();
+                    lines[i].text = markdown::decode_tokens(&toks, &self.meta.vocab["base"], false);
+                    lines[i].conf = 1.0;
+                    lines[i].toks = toks;
+                }
+            }
         }
 
         // [rec] stage: mean line conf below rec_hard_conf escalates before
