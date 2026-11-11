@@ -212,10 +212,23 @@ impl PpOcrEngine {
     pub fn new(tier: &str, model_dir: Option<&PathBuf>) -> Result<Self, String> {
         let (det, rec, dict) = if tier == "small" {
             // Materialize the embedded model to temp files (rusto loads by
-            // path). One set per process is enough; the engine keeps them
-            // for its lifetime.
-            let dir =
-                std::env::temp_dir().join(format!("docs2md-ppocrv6-small-{}", std::process::id()));
+            // path). Keyed by thread, not process: under
+            // `parallel_threads > 1` every worker thread builds its own
+            // engine (lib.rs `run_pages`), and concurrent writes to one
+            // shared `{pid}` file race — rusto reads a half-written rec.onnx
+            // and fails with `failed to fill whole buffer`. One set per
+            // thread is what the engine keeps alive for its lifetime.
+            let tid = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                std::thread::current().id().hash(&mut h);
+                h.finish()
+            };
+            let dir = std::env::temp_dir().join(format!(
+                "docs2md-ppocrv6-small-{}-{}",
+                std::process::id(),
+                tid
+            ));
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let det_p = dir.join("det.onnx");
             let rec_p = dir.join("rec.onnx");
