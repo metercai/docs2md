@@ -866,7 +866,10 @@ pub fn picture_boxes(logit: &InkMap, s: f64, page_hw: (usize, usize)) -> Vec<[f6
 
 /// A box of the page that rotate_page(.., degrees) made, mapped back: the
 /// bounding box of the four mapped corners, clipped to the page, rounded to
-/// one decimal (Python round-half-to-even).
+/// one decimal (Python round-half-to-even). The mapping is the exact inverse
+/// of the `warp` resample: M^-1 = [[a, -b], [b, a]] about the centre, with
+/// the y translation `- b * cx` (a `+ b * cx` here would shift every deskewed
+/// box by sin(degrees) * width — see the round-trip test).
 pub fn unrotate_box(box_: [f64; 4], degrees: f64, wh: (usize, usize)) -> [f64; 4] {
     let (w, h) = wh;
     let rad = std::f64::consts::PI * (-degrees) / 180.0;
@@ -879,7 +882,7 @@ pub fn unrotate_box(box_: [f64; 4], degrees: f64, wh: (usize, usize)) -> [f64; 4
     let pts = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
     for (i, (px, py)) in pts.iter().enumerate() {
         xs[i] = a * *px + b * *py + (1.0 - a) * cx - b * cy;
-        ys[i] = g * *px + d * *py + g * cx + (1.0 - d) * cy;
+        ys[i] = g * *px + d * *py - g * cx + (1.0 - d) * cy;
     }
     let clip = |v: f64, m: f64| v.clamp(0.0, m);
     let r1 = |v: f64| (v * 10.0).round() / 10.0;
@@ -946,6 +949,51 @@ mod tests {
         assert_eq!(rot90(&rot90(&rot90(&g, 1), 1), 1).data, rot90(&g, 3).data);
         let g180 = rot90(&g, 2);
         assert_eq!(g180.data[0], g.data[(6 - 1) * 10 + (10 - 1)]);
+    }
+
+    // A degenerate box (all four corners on one point) round-trips through
+    // unrotate_box with no bbox inflation. The forward placement comes from
+    // the `warp` resample, not from unrotate_box itself: `rotate_page(deg)`
+    // builds S = R_{+deg} (rot_matrix uses rad = +deg) and does
+    // out(q) = src(S(q)), so an original feature at p lands on the rotated
+    // page at q = S^{-1}(p) = R_{-deg}(p). unrotate_box computes S = R_{+deg}
+    // (the exact inverse), so unrotate_box(forward(p)) = p. The historical
+    // `+ g*cx` sign error added sin(degrees)*width to the y translation; the
+    // points below sit ~1000 px from the centre, so it shows up as a ~74 px
+    // deviation — far past the 0.1 px tolerance (and the points stay inside
+    // the page, so no clipping muddies the comparison).
+    #[test]
+    fn unrotate_box_roundtrips_the_forward_warp() {
+        let (w, h) = (1700usize, 2200usize);
+        let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+        let pts = [
+            (850.0, 1100.0),
+            (700.0, 1000.0),
+            (1000.0, 1200.0),
+            (600.0, 900.0),
+            (1100.0, 1300.0),
+            (750.0, 950.0),
+            (950.0, 1250.0),
+            (500.0, 800.0),
+            (1200.0, 1400.0),
+        ];
+        for &deg in &[1.0, 3.0, 5.0] {
+            let t = std::f64::consts::PI * deg / 180.0;
+            let (c, s) = (t.cos(), t.sin());
+            for &(px, py) in &pts {
+                // q: where the original point p lands on the rotated page
+                // (R_{-deg} about the centre, the inverse of the warp's S).
+                let qx = cx + c * (px - cx) + s * (py - cy);
+                let qy = cy - s * (px - cx) + c * (py - cy);
+                let b = unrotate_box([qx, qy, qx, qy], deg, (w, h));
+                assert!(
+                    (b[0] - px).abs() < 0.1 && (b[1] - py).abs() < 0.1,
+                    "deg={deg} p=({px},{py}) unrotated to ({}, {})",
+                    b[0],
+                    b[1]
+                );
+            }
+        }
     }
 
     #[test]
