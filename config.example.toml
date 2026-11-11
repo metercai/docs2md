@@ -71,12 +71,12 @@ layer_fusion = false
 # T1' coverage gate (C3): reroute a usable-native-text page to L1 when its
 # L0 output covers less than cov_theta of the text layer (at least
 # cov_min_layer non-whitespace layer chars) — multi-column / table pages
-# whose extraction the native layer flattens. OFF by default (C4 flips it
-# on). NOTE: cov depends on pdf-inspector's markdown extraction (numerator)
-# and PDFium's per-page text (denominator, firecrawl-pdfium) — re-verify
-# cov_theta when either crate is upgraded (calibrated on OPB-48 + the
-# 623-page fixture, C3b plan §0.3).
-coverage_gate = false
+# whose extraction the native layer flattens. ON by default (C4); set to
+# `false` to disable. NOTE: cov depends on pdf-inspector's markdown
+# extraction (numerator) and PDFium's per-page text (denominator,
+# firecrawl-pdfium) — re-verify cov_theta when either crate is upgraded
+# (calibrated on OPB-48 + the 623-page fixture, C3b plan §0.3).
+coverage_gate = true
 # cov threshold for the coverage gate (C3b, firecrawl denominator: the two
 # broken OPB pages sit at 0.518 / 0.021, the lowest healthy page at 0.839
 # on the 623-page fixture; 0.6 leaves margin on both sides).

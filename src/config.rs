@@ -192,6 +192,12 @@ fn default_false() -> bool {
     false
 }
 
+/// RouteConfig's `coverage_gate` default: ON (C4, after the C3b
+/// acceptance run on OPB-48 + the 623-page fixture).
+fn default_coverage_gate() -> bool {
+    true
+}
+
 /// RouteConfig's `parallel_threads` default: 4 (page-level parallelism).
 /// A 48-page document runs 34.6 s at 4 workers vs 72.9 s serial (2.1x);
 /// single-page inputs are unaffected (one worker). 1 = serial (v0.3.0).
@@ -241,9 +247,9 @@ pub struct RouteConfig {
     /// T1' coverage gate (plan 0.3.2 C3): reroute a usable-native-text page
     /// to L1 when its L0 output covers less than `cov_theta` of the text
     /// layer (`cov_min_layer` chars minimum) — the extraction is broken,
-    /// multi-column / table pages the native layer flattens. Default off
-    /// (C3 lands it inert; C4 flips it on after the gate's acceptance run).
-    #[serde(default = "default_false")]
+    /// multi-column / table pages the native layer flattens. Default on
+    /// (C4, after the C3b acceptance run).
+    #[serde(default = "default_coverage_gate")]
     pub coverage_gate: bool,
     /// cov threshold for `coverage_gate` (C3b, calibrated on the
     /// firecrawl-pdfium per-page text layer; the two broken OPB-48 pages sit
@@ -265,8 +271,8 @@ impl Default for RouteConfig {
             structure_gate: false,
             parallel_threads: 1,
             layer_fusion: false,
-            coverage_gate: false,
-            cov_theta: 0.5,
+            coverage_gate: true,
+            cov_theta: 0.6,
             cov_min_layer: 200,
         }
     }
@@ -309,4 +315,29 @@ pub enum ConfigError {
     Read(std::path::PathBuf, #[source] std::io::Error),
     #[error("cannot parse config {0}: {1}")]
     Parse(std::path::PathBuf, #[source] toml::de::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The hand-written `Default for RouteConfig` and the serde per-field
+    // defaults must agree: `Config::load` on a missing file goes through
+    // the former, parsing a toml that omits a field through the latter.
+    // (C4: both paths must yield coverage_gate on + theta 0.6.)
+    #[test]
+    fn route_defaults_agree_serde_and_default() {
+        let d = RouteConfig::default();
+        let s: RouteConfig = toml::from_str("").unwrap();
+        assert_eq!(d.coverage_gate, s.coverage_gate, "coverage_gate");
+        assert!(
+            (d.cov_theta - s.cov_theta).abs() < f32::EPSILON,
+            "cov_theta"
+        );
+        assert!(d.coverage_gate, "coverage_gate must default to on (C4)");
+        assert!(
+            (d.cov_theta - 0.6).abs() < f32::EPSILON,
+            "cov_theta 0.6 (C3b)"
+        );
+    }
 }
