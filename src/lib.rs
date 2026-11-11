@@ -777,19 +777,28 @@ impl Engine {
             .as_ref()
             .and_then(|p| l3_gate(p.char_count(), p.mean_conf(), &self.cfg.l3));
         let Some(l3_tag) = l3_tag else {
-            let pp = pp.unwrap();
-            let md = markdown::ocr_lines_to_markdown(&pp.lines);
-            return (
-                md,
-                PageRecord {
-                    page: page1,
-                    tier: format!("L2-ppv6(chain:{tag})"),
-                    chars: pp.char_count(),
-                    note: None,
-                    blocks: Vec::new(),
-                },
-                None,
-            );
+            match &pp {
+                // L2 read strong enough to stand: the PP-OCRv6 markdown
+                // is the final output (the serial-chain S1b path).
+                Some(p) => {
+                    let md = markdown::ocr_lines_to_markdown(&p.lines);
+                    return (
+                        md,
+                        PageRecord {
+                            page: page1,
+                            tier: format!("L2-ppv6(chain:{tag})"),
+                            chars: p.char_count(),
+                            note: None,
+                            blocks: Vec::new(),
+                        },
+                        None,
+                    );
+                }
+                // L2 unavailable (init failed) or its read failed: keep
+                // the best local text with the matching note. Never panic
+                // on an unavailable L2.
+                None => return self.l3_fallback(page1, tag, &None, &primary),
+            }
         };
         eprintln!(
             "[p{page1}] l3-gate:{l3_tag} (pp chars={}, conf={:.3}) — escalating to L3 (VLM)",
