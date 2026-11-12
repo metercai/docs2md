@@ -319,8 +319,9 @@ pub fn recognize_groups(engine: &IndraEngine, rs: &RouteScript, boxes: &[[f64; 4
         let vocab = &engine.meta.vocab[gname];
         // The group's language model, if its recognizer has an lm.npz (the
         // pipeline builds lms only for files that exist; rtl has none).
+        // `.get()` parses on first use (D, plan 0.3.4).
         let lm_params = engine.meta.lm_params.get(gname);
-        let lm = engine.lms.get(gname);
+        let lm = engine.lms.get(gname).map(|l| l.get());
         // Gate/alpha/beta stay f64 end to end (Python compares the f32-derived
         // conf as a Python float against the JSON f64 gate).
         let (alpha, beta, gate) = match lm_params {

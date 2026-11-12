@@ -19,6 +19,7 @@ pub mod rtl;
 pub mod vocab;
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use rten::Model;
 use rten_tensor::prelude::*;
@@ -201,11 +202,42 @@ impl Session {
     }
 }
 
+/// D (plan 0.3.4): an embedded n-gram LM that parses on first use. The npz
+/// bytes stay `include_bytes!`-embedded (the binary and its deployment model
+/// are unchanged); what moves is the *parse* — the heap tables (sorted
+/// key/value Vecs) are built only for the languages a document actually
+/// uses, instead of all three at `init`. Parsing is deterministic (same
+/// bytes -> same tables), so a lazily parsed LM is bit-identical to the
+/// one `init` used to build eagerly.
+pub struct LazyLm {
+    bytes: &'static [u8],
+    parsed: OnceLock<lm::NgramLm>,
+}
+impl LazyLm {
+    pub fn new(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes,
+            parsed: OnceLock::new(),
+        }
+    }
+    /// Parse on first call. The assets are embedded at compile time and
+    /// validated by the `lm` unit tests, so a parse failure here means a
+    /// corrupted binary (same class as the recognizer `panic!`s below).
+    pub fn get(&self) -> &lm::NgramLm {
+        self.parsed.get_or_init(|| {
+            let arr = npz::parse_npz(self.bytes).expect("embedded lm.npz: npz parse");
+            lm::NgramLm::from_arrays(&arr).expect("embedded lm.npz: from_arrays")
+        })
+    }
+}
+
 /// The Indra engine. P0: models loaded and queryable; the ocr_page pipeline
 /// lands in P1-P6.
 pub struct IndraEngine {
     pub meta: vocab::Meta,
-    pub lms: HashMap<String, lm::NgramLm>,
+    /// Parsed on first use per language (D, plan 0.3.4): `lms["base"].get()`
+    /// parses `lm.npz` only when a base-group batch is recognized.
+    pub lms: HashMap<String, LazyLm>,
     pub det: Session,
     pub rec: HashMap<String, Session>,
     pub order: Session,
@@ -228,7 +260,10 @@ type Assembled = (
 );
 
 impl IndraEngine {
-    /// Load every model from the embedded assets.
+    /// Load every model from the embedded assets. The n-gram LMs are
+    /// `LazyLm`s (D, plan 0.3.4): the bytes are embedded here, the tables
+    /// parse on first use — a pure-English document never pays for the
+    /// cjk/world table builds that `init` used to do unconditionally.
     pub fn init() -> Result<Self, String> {
         let meta = vocab::Meta::parse(assets::META)?;
         let lms = [
@@ -237,11 +272,8 @@ impl IndraEngine {
             ("world", assets::LM_WORLD),
         ]
         .into_iter()
-        .map(|(name, b)| -> Result<_, String> {
-            let arr = npz::parse_npz(b)?;
-            Ok((name.to_string(), lm::NgramLm::from_arrays(&arr)?))
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+        .map(|(name, b)| (name.to_string(), LazyLm::new(b)))
+        .collect();
         Ok(Self {
             meta,
             lms,

@@ -40,7 +40,7 @@ fn p4_gate_logp_exact() {
         .iter()
         .map(|g| (*g, refv[g].clone()))
     {
-        let lm: &NgramLm = engine.lms.get(group).unwrap();
+        let lm: &NgramLm = engine.lms.get(group).unwrap().get();
         for row in rows.as_array().unwrap() {
             let hist: Vec<i64> = row["hist"]
                 .as_array()
@@ -101,7 +101,7 @@ fn p4_gate_beam_identical() {
         for e in v.as_array().unwrap() {
             total += 1;
             let group = e["group"].as_str().unwrap();
-            let lm = engine.lms.get(group).unwrap();
+            let lm = engine.lms.get(group).unwrap().get();
             let (alpha, beta) = ab(&engine, group);
             let blank: Vec<f64> = e["blank"]
                 .as_array()
