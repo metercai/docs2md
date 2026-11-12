@@ -84,6 +84,18 @@ pub fn chain_script(sm: &ScriptMetrics, rc: &RouteConfig) -> Option<&'static str
     if sm.cjk_frac() >= rc.chain.cjk_line_frac {
         return Some(TAG_CJK);
     }
+    // C2 (plan 0.3.4): a lower, optional cjk threshold escalates
+    // mixed-script pages to PP-OCRv6 before recognition — indra's base
+    // recognizer misreads the CJK lines on them. Same escalation path as
+    // the major-cjk hit above; `None` (default) leaves v0.3.3 routing
+    // untouched.
+    if rc
+        .chain
+        .cjk_direct_line_frac
+        .is_some_and(|thr| sm.cjk_frac() >= thr)
+    {
+        return Some(TAG_CJK);
+    }
     if sm.dominant.is_some() && !sm.dominant_has_variant {
         return Some(TAG_NOVARIANT);
     }
@@ -231,6 +243,23 @@ mod tests {
         assert_eq!(chain_script(&sm(40, 20, 0), &rc()), Some(TAG_CJK));
         // English-major with a Chinese paragraph (10/40 = 0.25) stays L1.
         assert_eq!(chain_script(&sm(40, 10, 0), &rc()), None);
+    }
+
+    #[test]
+    fn script_cjk_direct_escalates_mixed_pages() {
+        // Default (None): the lower threshold is off — a 0.25 cjk page
+        // stays L1, exactly like v0.3.3.
+        assert_eq!(chain_script(&sm(40, 10, 0), &rc()), None);
+        // C2 on at 0.15: a mixed page at 0.25 cjk (10 of 40 lines) now
+        // escalates to PP-OCRv6, while a page at 0.10 (below the
+        // threshold, the English guardrail top) stays L1.
+        let mut rc = rc();
+        rc.chain.cjk_direct_line_frac = Some(0.15);
+        assert_eq!(chain_script(&sm(40, 10, 0), &rc), Some(TAG_CJK));
+        assert_eq!(chain_script(&sm(40, 4, 0), &rc), None);
+        // The major-cjk threshold still wins independently (0.6 >= 0.5).
+        let rc2 = RouteConfig::default();
+        assert_eq!(chain_script(&sm(40, 24, 0), &rc2), Some(TAG_CJK));
     }
 
     #[test]

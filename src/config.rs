@@ -174,6 +174,17 @@ pub struct ChainConfig {
     /// [script] cjk line fraction >= this => L2 (a Chinese-major page goes
     /// to the engine that reads Chinese better: PP-OCRv6).
     pub cjk_line_frac: f32,
+    /// C2: a lower cjk line-fraction threshold for direct L2 (PP-OCRv6)
+    /// escalation. `None` (the default) is off — the existing
+    /// `cjk_line_frac` is the only cjk criterion. When set, a page whose
+    /// cjk line fraction reaches this lower bound is escalated to PP-OCRv6
+    /// before recognition even though it is not cjk-major: indra's base
+    /// recognizer reads the CJK lines on such mixed pages poorly, while
+    /// PP-OCRv6 reads them well (ODB zh census: the 11 non-escalated
+    /// Chinese pages sit at cjk_frac 0.22-0.44 with F1 0.78, vs the
+    /// escalated ones at 0.96). English pages stay untouched (their
+    /// cjk_frac tops out at 0.125, below the 0.15 default suggestion).
+    pub cjk_direct_line_frac: Option<f32>,
     /// [script] unsure (double-read) line fraction >= this => L2 (the
     /// recognizer itself is uncertain on half the lines). `None` (the
     /// default) turns the criterion off: on the handwriting A/B (39 pages,
@@ -194,6 +205,7 @@ impl Default for ChainConfig {
         Self {
             det_min_lines: 3,
             cjk_line_frac: 0.5,
+            cjk_direct_line_frac: None,
             unsure_line_frac: None,
             rec_hard_conf: 0.5,
             min_chars: 60,

@@ -107,6 +107,14 @@ det_min_lines = 3
 # [script] cjk line fraction >= this => L2 (a Chinese-major page goes to
 # the engine that reads Chinese better: PP-OCRv6).
 cjk_line_frac = 0.5
+# C2: a lower cjk line-fraction threshold for direct PP-OCRv6 escalation.
+# OFF by default (None): v0.3.3 routing, only cjk-major pages escalate.
+# When set, mixed-script pages whose cjk line fraction reaches this bound
+# also go straight to PP-OCRv6 (indra's base recognizer reads their CJK
+# lines poorly). Calibrated on the ODB 40-page census: the 11 non-escalated
+# Chinese pages sit at cjk_frac 0.22-0.44, English pages top out at 0.125,
+# so 0.15 separates them cleanly. Uncomment to enable:
+# cjk_direct_line_frac = 0.15
 # [script] unsure (double-read) line fraction >= this => L2 (the
 # recognizer itself is uncertain on half the lines). OFF by default (None)
 # since v0.3.1: the handwriting A/B showed the unsure-triggered L2 leg was
