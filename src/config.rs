@@ -175,16 +175,19 @@ pub struct ChainConfig {
     /// to the engine that reads Chinese better: PP-OCRv6).
     pub cjk_line_frac: f32,
     /// C2: a lower cjk line-fraction threshold for direct L2 (PP-OCRv6)
-    /// escalation. `None` (the default) is off — the existing
-    /// `cjk_line_frac` is the only cjk criterion. When set, a page whose
-    /// cjk line fraction reaches this lower bound is escalated to PP-OCRv6
-    /// before recognition even though it is not cjk-major: indra's base
-    /// recognizer reads the CJK lines on such mixed pages poorly, while
-    /// PP-OCRv6 reads them well (ODB zh census: the 11 non-escalated
-    /// Chinese pages sit at cjk_frac 0.22-0.44 with F1 0.78, vs the
-    /// escalated ones at 0.96). English pages stay untouched (their
-    /// cjk_frac tops out at 0.125, below the 0.15 default suggestion).
-    pub cjk_direct_line_frac: Option<f32>,
+    /// escalation. `0.0` turns the criterion off. The default (0.15, since
+    /// v0.3.4) escalates mixed-script pages that the major-cjk criterion
+    /// (`cjk_line_frac`) leaves at L1: indra's base recognizer reads the
+    /// CJK lines on such pages poorly, while PP-OCRv6 reads them well.
+    /// Calibrated on the ODB 40-page census (2026-11-12): the 11
+    /// non-escalated Chinese pages sit at cjk_frac 0.22-0.44 with char-F1
+    /// 0.78 vs 0.96 once escalated; English pages top out at 0.125, below
+    /// 0.15, so they stay untouched (verified 20/20 byte-identical).
+    /// Field-level serde default (not the struct `Default`) so a config
+    /// file whose `[chain]` section omits the key keeps the 0.15 default
+    /// instead of silently falling back to `f32::default()` = 0.0 (off).
+    #[serde(default = "default_cjk_direct_frac")]
+    pub cjk_direct_line_frac: f32,
     /// [script] unsure (double-read) line fraction >= this => L2 (the
     /// recognizer itself is uncertain on half the lines). `None` (the
     /// default) turns the criterion off: on the handwriting A/B (39 pages,
@@ -205,7 +208,7 @@ impl Default for ChainConfig {
         Self {
             det_min_lines: 3,
             cjk_line_frac: 0.5,
-            cjk_direct_line_frac: None,
+            cjk_direct_line_frac: 0.15,
             unsure_line_frac: None,
             rec_hard_conf: 0.5,
             min_chars: 60,
@@ -227,6 +230,13 @@ fn default_false() -> bool {
 /// acceptance run on OPB-48 + the 623-page fixture).
 fn default_coverage_gate() -> bool {
     true
+}
+
+/// ChainConfig's `cjk_direct_line_frac` serde default: ON at 0.15 (C2,
+/// plan 0.3.4, ODB 40-page census). Field-level so a `[chain]` section
+/// that omits the key keeps 0.15 rather than the type's 0.0 (off).
+fn default_cjk_direct_frac() -> f32 {
+    0.15
 }
 
 /// RouteConfig's `parallel_threads` default: 4 (page-level parallelism).
@@ -371,5 +381,22 @@ mod tests {
             "cov_theta 0.6 (C3b)"
         );
         assert_eq!(d.parallel_threads, 4, "parallel_threads 4 (0.3.3 P0)");
+    }
+
+    // The field-level serde default on cjk_direct_line_frac must be 0.15,
+    // not the type default 0.0 (off): a config whose [chain] section
+    // omits the key (e.g. written before 0.3.4) must keep C2 on.
+    #[test]
+    fn chain_section_omitting_cjk_direct_keeps_default() {
+        let s: RouteConfig = toml::from_str("[chain]\ncjk_line_frac = 0.5\n").unwrap();
+        assert!(
+            (s.chain.cjk_direct_line_frac - 0.15).abs() < f32::EPSILON,
+            "missing cjk_direct_line_frac in [chain] must keep the 0.15 \
+             serde default, got {:?}",
+            s.chain.cjk_direct_line_frac
+        );
+        // Explicit 0.0 is the documented off switch.
+        let off: RouteConfig = toml::from_str("[chain]\ncjk_direct_line_frac = 0.0\n").unwrap();
+        assert_eq!(off.chain.cjk_direct_line_frac, 0.0);
     }
 }
