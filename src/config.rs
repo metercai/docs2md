@@ -32,10 +32,23 @@ pub struct L0Config {
     /// Render DPI for needs-ocr pages (shared by the L2 send and the
     /// optional `--blocks` layout relabel).
     pub dpi: u32,
+    /// B1 heading heuristic (L0 pages only): a line is labelled
+    /// `heading` when its median span font size is at least this many
+    /// times the page's median span font size AND at least
+    /// `heading_bold_frac` of its spans are bold. Zero-model: it reads the
+    /// PDF text layer's own font attributes. `f64::INFINITY` disables the
+    /// rule (every block stays `text`, the v0.3.3 behaviour).
+    pub heading_size_ratio: f64,
+    /// Fraction of a line's bold spans required for the heading rule.
+    pub heading_bold_frac: f64,
 }
 impl Default for L0Config {
     fn default() -> Self {
-        Self { dpi: 200 }
+        Self {
+            dpi: 200,
+            heading_size_ratio: 1.2,
+            heading_bold_frac: 0.5,
+        }
     }
 }
 

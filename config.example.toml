@@ -8,6 +8,13 @@
 # Render DPI for needs-ocr pages (shared by the L2 send and the optional
 # --blocks layout relabel).
 dpi = 200
+# B1 heading heuristic (L0 pages only): a line is labelled `heading` when
+# its median span font size is at least this many times the page's median
+# font size AND at least heading_bold_frac of its spans are bold. Set
+# heading_size_ratio = inf to disable (every block stays `text`).
+heading_size_ratio = 1.2
+# Fraction of a line's bold spans required by the heading rule above.
+heading_bold_frac = 0.5
 
 # ── L1: embedded pure-Rust PP-OCRv6 (ONNX on rten) ─────────────────────
 [l1]

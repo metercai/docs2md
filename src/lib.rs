@@ -1032,7 +1032,7 @@ impl Engine {
             Ok(items) => items,
             Err(_) => return Vec::new(),
         };
-        let spans: Vec<(f64, f64, f64, f64, String)> = items
+        let spans: Vec<(f64, f64, f64, f64, String, f64, bool)> = items
             .iter()
             .filter(|it| matches!(it.item_type, pdf_inspector::types::ItemType::Text))
             .map(|it| {
@@ -1049,10 +1049,27 @@ impl Engine {
                     let (my0, my1) = (bh as f64 - y1, bh as f64 - y0);
                     (x0, x1, y0, y1) = (mx0, mx1, my0, my1);
                 }
-                (x0, y0, x1, y1, it.text.clone())
+                // B1: carry the text layer's own font size + bold flag (the
+                // zero-model heading signal). `font_size` is the span's em;
+                // 0.0 when the item reports none (the rule then skips it).
+                let font_size = if it.font_size.is_finite() && it.font_size > 0.0 {
+                    it.font_size as f64
+                } else {
+                    0.0
+                };
+                (x0, y0, x1, y1, it.text.clone(), font_size, it.is_bold)
             })
             .collect();
-        let blocks = blocks::spans_to_text_blocks(&spans, 0.0, 0.0, bw as f64, bh as f64, 0);
+        let blocks = blocks::spans_to_text_blocks(
+            &spans,
+            0.0,
+            0.0,
+            bw as f64,
+            bh as f64,
+            0,
+            self.cfg.l0.heading_size_ratio,
+            self.cfg.l0.heading_bold_frac,
+        );
         match relabel {
             Some(regions) => blocks::relabel_l0_blocks(blocks, regions),
             None => blocks,

@@ -125,20 +125,30 @@ pub fn pdf_box_to_norm(
 }
 
 /// Cluster PDF text spans into reading-order line blocks (the L0 source of
-/// structured blocks). `spans` are `(x0, y0, x1, y1, text)` in PDF user
-/// space (y-UP, points); `box_*` is the page render box in the same space;
-/// `rotation` the page's `/Rotate`. Spans sharing a vertical line (overlap
-/// ≥ 50 % of the smaller height) merge into one block regardless of column —
-/// a two-column row stays one block; blocks come out top to bottom. The
-/// block label is always `TEXT` (E1); E2 re-labels structural rows from the
-/// layout regions (the optional `--blocks` relabel, decision D).
+/// structured blocks). `spans` are
+/// `(x0, y0, x1, y1, text, font_size, is_bold)` in PDF user space (y-UP,
+/// points); `box_*` is the page render box in the same space; `rotation`
+/// the page's `/Rotate`. Spans sharing a vertical line (overlap
+/// ≥ 50 % of the smaller height) merge into one block regardless of
+/// column — a two-column row stays one block; blocks come out top to
+/// bottom.
+///
+/// Label (E1 default + the B1 heading heuristic): a line is `heading` when
+/// its median span `font_size` is ≥ `heading_ratio` × the page's median
+/// span `font_size` AND at least `heading_bold_frac` of its spans are
+/// bold — both read from the PDF text layer (zero-model). `heading_ratio`
+/// of `f64::INFINITY` (or a page with no positive sizes) keeps every
+/// block `text`, the v0.3.3 behaviour. E2 re-labels structural rows from
+/// the layout regions (the optional `--blocks` relabel, decision D).
 pub fn spans_to_text_blocks(
-    spans: &[(f64, f64, f64, f64, String)],
+    spans: &[(f64, f64, f64, f64, String, f64, bool)],
     box_x0: f64,
     box_y0: f64,
     box_w: f64,
     box_h: f64,
     rotation: i32,
+    heading_ratio: f64,
+    heading_bold_frac: f64,
 ) -> Vec<Block> {
     if box_w <= 0.0 || box_h <= 0.0 {
         return Vec::new();
@@ -150,6 +160,25 @@ pub fn spans_to_text_blocks(
     if valid.is_empty() {
         return Vec::new();
     }
+    // Page-wide median font size (B1 heading rule denominator). Median over
+    // all valid spans with a positive size; empty when none reports a size
+    // (the rule then never fires).
+    let mut page_sizes: Vec<f64> = valid
+        .iter()
+        .map(|&i| spans[i].5)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .collect();
+    let page_median_size = if page_sizes.is_empty() {
+        0.0
+    } else {
+        page_sizes.sort_by(|a, b| a.total_cmp(b));
+        let n = page_sizes.len();
+        if n % 2 == 1 {
+            page_sizes[n / 2]
+        } else {
+            (page_sizes[n / 2 - 1] + page_sizes[n / 2]) / 2.0
+        }
+    };
     // Top first in the y-up space (larger y = higher on the page).
     valid.sort_by(|&a, &b| {
         let ay = (spans[a].1 + spans[a].3) / 2.0;
@@ -201,6 +230,43 @@ pub fn spans_to_text_blocks(
     }
     rows.into_iter()
         .map(|r| {
+            // B1 heading rule (computed before `r.idx` moves into `order`):
+            // dominant size = the median font size of the line's spans;
+            // bold_frac = the fraction of its spans that are bold. A line is
+            // `heading` only when its dominant size reaches `heading_ratio`
+            // × the page median AND its bold spans reach `heading_bold_frac`.
+            // Both signals come from the PDF text layer.
+            let label = if r.idx.is_empty() || page_median_size <= 0.0 || !heading_ratio.is_finite()
+            {
+                TEXT
+            } else {
+                let mut sz: Vec<f64> = r
+                    .idx
+                    .iter()
+                    .map(|&i| spans[i].5)
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .collect();
+                let bold = r.idx.iter().filter(|&&i| spans[i].6).count() as f64;
+                let n = r.idx.len().max(1);
+                let dominant = if sz.is_empty() {
+                    0.0
+                } else {
+                    sz.sort_by(|a, b| a.total_cmp(b));
+                    let m = sz.len();
+                    if m % 2 == 1 {
+                        sz[m / 2]
+                    } else {
+                        (sz[m / 2 - 1] + sz[m / 2]) / 2.0
+                    }
+                };
+                if dominant >= heading_ratio * page_median_size
+                    && bold as usize >= (heading_bold_frac * n as f64).ceil() as usize
+                {
+                    HEADING
+                } else {
+                    TEXT
+                }
+            };
             let mut order: Vec<usize> = r.idx;
             order.sort_by(|&a, &b| {
                 spans[a]
@@ -215,7 +281,7 @@ pub fn spans_to_text_blocks(
                 .collect::<Vec<_>>()
                 .join(" ");
             Block {
-                label: TEXT,
+                label,
                 bbox: pdf_box_to_norm(
                     r.x0, r.y0, r.x1, r.y1, box_x0, box_y0, box_w, box_h, rotation,
                 ),
@@ -432,13 +498,15 @@ mod tests {
     #[test]
     fn spans_cluster_by_line_and_read_top_down() {
         // Page box 0,0,100,200, rotation 0. Two lines: a two-column row at
-        // the top (y 150-160) and a single span below (y 100-110).
+        // the top (y 150-160) and a single span below (y 100-110). All
+        // spans share one size / no bold → the heading rule stays dormant
+        // (both blocks keep `text`).
         let spans = vec![
-            (10.0, 100.0, 50.0, 110.0, "second".to_string()), // lower line
-            (60.0, 150.0, 90.0, 160.0, "right".to_string()),  // top row, col 2
-            (10.0, 150.0, 40.0, 160.0, "left".to_string()),   // top row, col 1
+            (10.0, 100.0, 50.0, 110.0, "second".to_string(), 9.0, false), // lower line
+            (60.0, 150.0, 90.0, 160.0, "right".to_string(), 9.0, false),  // top row, col 2
+            (10.0, 150.0, 40.0, 160.0, "left".to_string(), 9.0, false),   // top row, col 1
         ];
-        let blocks = spans_to_text_blocks(&spans, 0.0, 0.0, 100.0, 200.0, 0);
+        let blocks = spans_to_text_blocks(&spans, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
         assert_eq!(blocks.len(), 2, "rows: {:?}", blocks);
         // Top line first; its two columns merged into one block.
         assert_eq!(blocks[0].text, "left right");
@@ -452,9 +520,79 @@ mod tests {
         // The lower line.
         assert_eq!(blocks[1].text, "second");
         // Empty span set → no blocks.
-        assert!(spans_to_text_blocks(&[], 0.0, 0.0, 100.0, 200.0, 0).is_empty());
+        assert!(spans_to_text_blocks(&[], 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5).is_empty());
         // Degenerate page box → no blocks.
-        assert!(spans_to_text_blocks(&spans, 0.0, 0.0, 0.0, 0.0, 0).is_empty());
+        assert!(spans_to_text_blocks(&spans, 0.0, 0.0, 0.0, 0.0, 0, 1.2, 0.5).is_empty());
+    }
+
+    #[test]
+    fn heading_rule_flags_large_bold_lines_only() {
+        // B1: a line whose median span size ≥ 1.2 × the page median AND ≥ 50 %
+        // bold spans becomes `heading`. Page median over 4 body spans of 9pt
+        // is 9.0.
+        let spans = vec![
+            // Title line: 12pt bold → 12 ≥ 1.2 × 9 and 100 % bold → heading.
+            (10.0, 180.0, 90.0, 195.0, "TITLE".to_string(), 12.0, true),
+            // Body lines: 9pt regular → 9 < 10.8 → text.
+            (10.0, 150.0, 90.0, 160.0, "a".to_string(), 9.0, false),
+            (10.0, 130.0, 90.0, 140.0, "b".to_string(), 9.0, false),
+            (10.0, 110.0, 90.0, 120.0, "c".to_string(), 9.0, false),
+        ];
+        let blocks = spans_to_text_blocks(&spans, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].label, HEADING, "large bold line → heading");
+        assert_eq!(blocks[1].label, TEXT);
+        assert_eq!(blocks[2].label, TEXT);
+        assert_eq!(blocks[3].label, TEXT);
+
+        // Size alone is not enough: a large but non-bold line stays `text`
+        // (the prototype showed dropping the bold constraint mis-flips).
+        let spans_nb = vec![
+            (10.0, 180.0, 90.0, 195.0, "BIG".to_string(), 14.0, false),
+            (10.0, 150.0, 90.0, 160.0, "a".to_string(), 9.0, false),
+            (10.0, 130.0, 90.0, 140.0, "b".to_string(), 9.0, false),
+            (10.0, 110.0, 90.0, 120.0, "c".to_string(), 9.0, false),
+        ];
+        let b2 = spans_to_text_blocks(&spans_nb, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
+        assert_eq!(b2[0].label, TEXT, "large non-bold line → text");
+
+        // Bold alone is not enough: a bold line at page size stays `text`.
+        let spans_bs = vec![
+            (10.0, 180.0, 90.0, 195.0, "B".to_string(), 9.0, true),
+            (10.0, 150.0, 90.0, 160.0, "a".to_string(), 9.0, false),
+            (10.0, 130.0, 90.0, 140.0, "b".to_string(), 9.0, false),
+            (10.0, 110.0, 90.0, 120.0, "c".to_string(), 9.0, false),
+        ];
+        let b3 = spans_to_text_blocks(&spans_bs, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
+        assert_eq!(b3[0].label, TEXT, "bold at page size → text");
+
+        // Inclusive boundary: 1.2 × median exactly still flags (12 ≥ 10.8).
+        let spans_edge = vec![
+            (10.0, 180.0, 90.0, 195.0, "E".to_string(), 12.0, true),
+            (10.0, 150.0, 90.0, 160.0, "a".to_string(), 10.0, false),
+            (10.0, 130.0, 90.0, 140.0, "b".to_string(), 10.0, false),
+            (10.0, 110.0, 90.0, 120.0, "c".to_string(), 10.0, false),
+        ];
+        let b4 = spans_to_text_blocks(&spans_edge, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
+        assert_eq!(
+            b4[0].label, HEADING,
+            "exactly 1.2× page median + bold → heading"
+        );
+
+        // Rollback: an infinite ratio disables the rule (v0.3.3 behaviour).
+        let b5 = spans_to_text_blocks(&spans, 0.0, 0.0, 100.0, 200.0, 0, f64::INFINITY, 0.5);
+        assert!(
+            b5.iter().all(|b| b.label == TEXT),
+            "INFINITY ratio → all text"
+        );
+
+        // No positive size anywhere → the rule never fires.
+        let spans_nosize = vec![
+            (10.0, 180.0, 90.0, 195.0, "X".to_string(), 0.0, true),
+            (10.0, 150.0, 90.0, 160.0, "y".to_string(), 0.0, false),
+        ];
+        let b6 = spans_to_text_blocks(&spans_nosize, 0.0, 0.0, 100.0, 200.0, 0, 1.2, 0.5);
+        assert!(b6.iter().all(|b| b.label == TEXT), "no sizes → all text");
     }
 
     #[test]
