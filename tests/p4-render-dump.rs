@@ -32,7 +32,7 @@ fn p4_render_dump() {
     };
     let page = env("P4_RENDER_PAGE", "0").parse::<usize>().unwrap_or(0);
     let dpi = env("P4_RENDER_DPI", "200").parse::<u32>().unwrap_or(200);
-    let (png, _pbox, _rot) = match render_pdf_bytes(&bytes, page, dpi) {
+    let (png, _pbox, _rot) = match render_pdf_bytes(&bytes, page, dpi, 0) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("SKIP: render failed: {e}");

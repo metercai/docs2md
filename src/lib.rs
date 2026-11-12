@@ -204,7 +204,13 @@ impl Engine {
         if !self.blocks_requested {
             return None;
         }
-        let (png, _, _) = render::render_pdf_bytes(bytes, page0 as usize, self.cfg.l0.dpi).ok()?;
+        let (png, _, _) = render::render_pdf_bytes(
+            bytes,
+            page0 as usize,
+            self.cfg.l0.dpi,
+            self.cfg.l0.max_render_side,
+        )
+        .ok()?;
         let (pw, ph) = render::png_size(&png);
         if pw == 0 || ph == 0 {
             return None;
@@ -547,9 +553,13 @@ impl Engine {
                     || (self.cfg.route.structure_gate && p.has_columns)
                     || cov_fire.is_some())
             {
-                let (png, pbox, rot) =
-                    render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
-                        .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+                let (png, pbox, rot) = render::render_pdf_bytes(
+                    bytes,
+                    p.page as usize,
+                    self.cfg.l0.dpi,
+                    self.cfg.l0.max_render_side,
+                )
+                .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
                 let layer = self.extract_layer_gated(bytes, p.page, pbox, rot);
                 if let Some(cov) = cov_fire {
                     eprintln!("[p{page1}] S0 reroute: coverage page (cov={cov:.2}) — L1");
@@ -592,8 +602,13 @@ impl Engine {
         }
 
         // needs_ocr → render once (PDFium), then route.
-        let (png, pbox, rot) = render::render_pdf_bytes(bytes, p.page as usize, self.cfg.l0.dpi)
-            .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
+        let (png, pbox, rot) = render::render_pdf_bytes(
+            bytes,
+            p.page as usize,
+            self.cfg.l0.dpi,
+            self.cfg.l0.max_render_side,
+        )
+        .map_err(|e| Error::Pdf(format!("p{page1} render: {e}")))?;
         let (pw, ph) = render::png_size(&png);
 
         // needs_ocr → render once, then L1. The L1→L2 serial metric

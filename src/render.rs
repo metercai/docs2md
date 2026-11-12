@@ -34,10 +34,17 @@ type PageGeometry = ((f32, f32, f32, f32), i32);
 /// converts to grayscale itself — see `preproc::Gray::from_png`).
 ///
 /// `dpi` is the requested resolution; the effective scale is lowered to
-/// fit `MAX_PAGE_PIXELS` (see [`effective_dpi`]). The content box is
-/// CropBox ∩ MediaBox — identical to what the PDFium viewport renders, so
-/// the pixel→PDF coordinate mapping lines up.
-pub fn render_pdf_bytes(bytes: &[u8], page: usize, dpi: u32) -> Result<RenderedPage, String> {
+/// fit `MAX_PAGE_PIXELS` and, when `max_render_side > 0`, to keep the
+/// longest rendered side within that cap (C1b: speedup for large pages,
+/// 0 = no cap, the v0.3.3 behaviour). See [`effective_dpi`]. The content
+/// box is CropBox ∩ MediaBox — identical to what the PDFium viewport
+/// renders, so the pixel→PDF coordinate mapping lines up.
+pub fn render_pdf_bytes(
+    bytes: &[u8],
+    page: usize,
+    dpi: u32,
+    max_render_side: u32,
+) -> Result<RenderedPage, String> {
     let pdfium = Pdfium::load().map_err(|e| format!("load pdfium: {e}"))?;
     let doc = pdfium
         .load_document(bytes, None)
@@ -51,7 +58,7 @@ pub fn render_pdf_bytes(bytes: &[u8], page: usize, dpi: u32) -> Result<RenderedP
         .map_err(|e| format!("open page {page}: {e}"))?;
     let page_no = page.index();
     let (w, h) = (page.width(), page.height());
-    let scale = effective_dpi(dpi as f32, w, h) / 72.0;
+    let scale = effective_dpi(dpi as f32, w, h, max_render_side) / 72.0;
     let cfg = RenderConfig::new()
         .scale(scale)
         // RGB, like the pypdfium2 reference: the pipeline's to_luma8() (Rec.709)
@@ -113,13 +120,20 @@ fn rotation_degrees(rot: firecrawl_pdfium::Rotation) -> i32 {
     }
 }
 
-/// The effective dpi after fitting the render into `MAX_PAGE_PIXELS`:
-/// `min(dpi, 72 * sqrt(budget / (w*h)))` (same formula as indra's
-/// `page_scale`).
-fn effective_dpi(dpi: f32, w: f32, h: f32) -> f32 {
+/// The effective dpi after fitting the render into `MAX_PAGE_PIXELS`
+/// and, when `max_side > 0`, keeping the longest side ≤ `max_side`
+/// pixels: `min(dpi, 72*sqrt(budget/(w*h)), 72*max_side/max(w,h))`
+/// (the first two terms match indra's `page_scale`; the third is the C1b
+/// render-side cap). `max_side == 0` leaves the v0.3.3 behaviour.
+fn effective_dpi(dpi: f32, w: f32, h: f32, max_side: u32) -> f32 {
     let area = (w * h).max(1.0);
     let fit = 72.0 * (((MAX_PAGE_PIXELS as f32) / area).sqrt());
-    dpi.min(fit)
+    let mut e = dpi.min(fit);
+    if max_side > 0 {
+        let side = (w.max(h)).max(1.0);
+        e = e.min((max_side as f32) * 72.0 / side);
+    }
+    e
 }
 
 /// Minimal PNG IHDR size reader (avoids pulling the image crate for a header).
@@ -164,7 +178,7 @@ mod tests {
         let Some(mut f) = setup() else { return };
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).expect("read fixture");
-        let (png, pbox, rot) = render_pdf_bytes(&bytes, 0, 200).expect("render");
+        let (png, pbox, rot) = render_pdf_bytes(&bytes, 0, 200, 0).expect("render");
         let (w, h) = png_size(&png);
         assert!(w > 0 && h > 0, "empty render");
         // Internal consistency: the content box at the requested scale must
@@ -194,7 +208,7 @@ mod tests {
         // px (123 MP) without the cap; effective_dpi lowers it to 180 dpi,
         // landing at exactly 10000 px (100 MP) instead of failing. No PDF
         // needed: the capping is in effective_dpi.
-        let d = effective_dpi(200.0, 4000.0, 4000.0);
+        let d = effective_dpi(200.0, 4000.0, 4000.0, 0);
         let side = (4000.0 * d / 72.0) as u64;
         assert!(d < 200.0, "budget did not engage: {d}");
         assert!(
@@ -207,10 +221,27 @@ mod tests {
     #[test]
     fn effective_dpi_fits_the_budget() {
         // A4 at 200 dpi is well under the budget — unchanged.
-        assert!((effective_dpi(200.0, 595.2, 841.9) - 200.0_f32).abs() < 1e-3);
+        assert!((effective_dpi(200.0, 595.2, 841.9, 0) - 200.0_f32).abs() < 1e-3);
         // 4000x4000 pt at 200 dpi = 123 MP > 100 MP — scaled down to ~182.6.
-        let d = effective_dpi(200.0, 4000.0, 4000.0);
+        let d = effective_dpi(200.0, 4000.0, 4000.0, 0);
         let expect = 72.0_f32 * ((100_000_000.0_f32 / (4000.0_f32 * 4000.0_f32)).sqrt());
         assert!((d - expect).abs() < 1e-2, "d={d} expect={expect}");
+    }
+
+    #[test]
+    fn effective_dpi_caps_the_longest_side() {
+        // C1b side cap: an A4 page at 200 dpi (1654x2339 px) with a 1600 px
+        // longest-side cap engages: 72*1600/841.9 = 137.2 dpi.
+        let d = effective_dpi(200.0, 595.2, 841.9, 1600);
+        let expect = 72.0_f32 * 1600.0_f32 / 841.9_f32;
+        assert!((d - expect).abs() < 1e-2, "d={d} expect={expect}");
+        // A tighter cap beats the pixel budget: 4000x4000 pt with a 4000 px
+        // side cap → 72 dpi (4000 px side), far below the 100 MP ceiling.
+        let d = effective_dpi(200.0, 4000.0, 4000.0, 4000);
+        assert!((d - 72.0_f32).abs() < 1e-2, "d={d}");
+        // No cap (0) leaves the budget-only behaviour untouched: 4000x4000
+        // pt → 72*sqrt(100MP/16MP) = 180 dpi.
+        let d = effective_dpi(200.0, 4000.0, 4000.0, 0);
+        assert!((d - 180.0_f32).abs() < 0.1, "d={d}");
     }
 }

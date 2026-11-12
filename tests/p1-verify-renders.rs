@@ -167,7 +167,7 @@ fn p1_render_pages() {
             continue;
         }
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let (png, _pbox, _rot) = docs2md::render::render_pdf_bytes(&bytes, 0, dpi)
+        let (png, _pbox, _rot) = docs2md::render::render_pdf_bytes(&bytes, 0, dpi, 0)
             .unwrap_or_else(|e| panic!("{pid} render: {e}"));
         std::fs::write(Path::new(&out).join(format!("{pid}.png")), &png).unwrap();
         eprintln!("[render] {pid}: {} bytes", png.len());

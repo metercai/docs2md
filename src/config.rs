@@ -41,6 +41,11 @@ pub struct L0Config {
     pub heading_size_ratio: f64,
     /// Fraction of a line's bold spans required for the heading rule.
     pub heading_bold_frac: f64,
+    /// C1b render-side cap: the longest rendered side (pixels) for
+    /// needs-ocr pages. 0 disables the cap (the v0.3.3 behaviour). The
+    /// effective dpi is the strictest of the dpi, the 100 MP pixel budget
+    /// and this cap.
+    pub max_render_side: u32,
 }
 impl Default for L0Config {
     fn default() -> Self {
@@ -48,6 +53,7 @@ impl Default for L0Config {
             dpi: 200,
             heading_size_ratio: 1.2,
             heading_bold_frac: 0.5,
+            max_render_side: 0,
         }
     }
 }
