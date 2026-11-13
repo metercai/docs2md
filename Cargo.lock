@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "docs2md"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "docs2md-ocr",
  "firecrawl-pdfium",
