@@ -1,0 +1,1287 @@
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
+use rten_base::num::div_ceil;
+use rten_shape_inference::ops as shape_ops;
+use rten_simd::SimdOp;
+use rten_tensor::prelude::*;
+use rten_tensor::{NdTensor, NdTensorView, NdTensorViewMut, Tensor, TensorView, TensorViewMut};
+use smallvec::SmallVec;
+
+use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
+use crate::operator::{
+    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
+    OutputTypesContext, static_dims,
+};
+use crate::ops::{Padding, check_value};
+
+/// Rounding method to use when computing the output shape for a pooling
+/// operation.
+///
+/// This corresponds to the `ceil_mode` attribute for ONNX pooling operators.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum RoundMode {
+    #[default]
+    Floor,
+    Ceil,
+}
+
+/// Padding specification for a single axis.
+#[derive(Copy, Clone)]
+enum AxisPadding {
+    Same,
+    Fixed { start: usize, end: usize },
+}
+
+impl AxisPadding {
+    /// Split a 2D padding specifier into separate specifiers for height and
+    /// width axes.
+    fn from_2d(pad: Padding) -> Result<[AxisPadding; 2], OpError> {
+        match pad {
+            Padding::Same => Ok([AxisPadding::Same, AxisPadding::Same]),
+            Padding::Fixed(pads) => {
+                let [pad_top, pad_left, pad_bottom, pad_right]: [usize; 4] = pads
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| OpError::invalid_value("Expected 4 padding values"))?;
+                let h_pad = AxisPadding::Fixed {
+                    start: pad_top,
+                    end: pad_bottom,
+                };
+                let w_pad = AxisPadding::Fixed {
+                    start: pad_left,
+                    end: pad_right,
+                };
+                Ok([h_pad, w_pad])
+            }
+        }
+    }
+}
+
+/// Compute the output size and padding along a single spatial axis.
+fn output_size_and_padding_for_axis(
+    in_size: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: AxisPadding,
+    dilation: usize,
+    round_mode: RoundMode,
+) -> Result<(usize, usize, usize), OpError> {
+    check_value!(dilation > 0, InvalidValue, "Dilations must be > 0");
+    check_value!(kernel_size > 0, InvalidValue, "Kernel size must be > 0");
+    check_value!(stride > 0, InvalidValue, "Strides must be > 0");
+
+    match padding {
+        AxisPadding::Same => {
+            // The specification gives two different equations for the output
+            // size depending on the rounding mode, but they are equivalent.
+            let out_size = in_size.div_ceil(stride);
+
+            let pad_total = ((out_size - 1) * stride + (kernel_size - 1) * dilation + 1)
+                .saturating_sub(in_size);
+
+            let pad_start = pad_total / 2;
+
+            // If the total padding is not even, we assign the remaining unit to
+            // the ends of the axis. This matches the ONNX "SAME_UPPER"
+            // value for `auto_pad`.
+            let pad_end = pad_total.div_ceil(2);
+
+            Ok((out_size, pad_start, pad_end))
+        }
+        AxisPadding::Fixed {
+            start: pad_start,
+            end: pad_end,
+        } => {
+            let in_size = in_size as isize;
+            let pad_start = pad_start as isize;
+            let pad_end = pad_end as isize;
+            let kernel_size = kernel_size as isize;
+            let dilation = dilation as isize;
+            let stride = stride as isize;
+
+            let padded_in_size = in_size + pad_start + pad_end;
+            let dilated_kernel_size = kernel_size + (kernel_size - 1) * (dilation - 1);
+
+            // Compute output size. The PyTorch docs provide the clearest
+            // formulae for this: https://docs.pytorch.org/docs/stable/generated/torch.nn.MaxPool1d.html.
+            let windowed_in_size = padded_in_size - dilated_kernel_size;
+            let out_size = match round_mode {
+                RoundMode::Floor => {
+                    if windowed_in_size < 0 {
+                        return Err(OpError::invalid_value("Input too small for kernel size"));
+                    }
+                    windowed_in_size / stride + 1
+                }
+                RoundMode::Ceil => {
+                    let mut out_size = div_ceil(windowed_in_size, stride) + 1;
+
+                    // In ceil mode, it is possible that the input for the last output
+                    // position lies entirely within the padding region. In that case
+                    // we'd have no values to pool. To avoid this, reduce the output
+                    // size. See also https://github.com/onnx/onnx/issues/5711.
+                    if (out_size - 1) * stride >= in_size + pad_start {
+                        out_size -= 1;
+                    }
+
+                    if out_size <= 0 {
+                        return Err(OpError::invalid_value("Output size is <= 0"));
+                    }
+
+                    out_size
+                }
+            };
+
+            Ok((out_size as usize, pad_start as usize, pad_end as usize))
+        }
+    }
+}
+
+/// Calculate the output size and padding for a 2D convolution or pooling operation.
+///
+/// Depending on the padding mode, the output size is be calculated from the
+/// input size and padding, or the padding size is calculated from the input
+/// size.
+///
+/// See https://github.com/onnx/onnx/blob/main/docs/Operators.md#maxpool for
+/// formulae. These includes extensions to support dilations in future.
+///
+/// Returns an `(out_h, out_w, [pad_top, pad_left, pad_bottom, pad_right])`
+/// tuple.
+///
+/// Returns an error if the padded input size is too small for the kernel
+/// size.
+pub fn calc_output_size_and_padding(
+    in_size: (usize, usize),
+    kernel_size: (usize, usize),
+    strides: (usize, usize),
+    padding: Padding,
+    dilations: Option<(usize, usize)>,
+    round_mode: RoundMode,
+) -> Result<(usize, usize, [usize; 4]), OpError> {
+    let (in_h, in_w) = in_size;
+    let (k_h, k_w) = kernel_size;
+    let (stride_h, stride_w) = strides;
+    let (dilation_y, dilation_x) = dilations.unwrap_or((1, 1));
+    let [h_pad, w_pad] = AxisPadding::from_2d(padding)?;
+
+    let (out_h, pad_top, pad_bottom) =
+        output_size_and_padding_for_axis(in_h, k_h, stride_h, h_pad, dilation_y, round_mode)?;
+    let (out_w, pad_left, pad_right) =
+        output_size_and_padding_for_axis(in_w, k_w, stride_w, w_pad, dilation_x, round_mode)?;
+
+    Ok((out_h, out_w, [pad_top, pad_left, pad_bottom, pad_right]))
+}
+
+/// Number of channels processed together by the pooling kernel.
+const CHAN_GROUP_SIZE: usize = 4;
+
+/// Counts of the elements covered by a pooling window at one output position.
+#[derive(Copy, Clone)]
+struct WindowSize {
+    /// Number of elements which come from the input, excluding padding.
+    non_padding: usize,
+
+    /// Number of elements which come from the padded input.
+    padded: usize,
+}
+
+/// Generic pooling implementation.
+///
+/// The value of each output point is computed by:
+///
+/// - Collecting values from `input`, with a window size and stride determined
+///   by `kernel_size` and `strides` respectively, except for values that are part
+///   of the padding region.
+/// - Folding the values using `fold`, starting with `fold_init`
+/// - Computing an average of the accumulated value using `average(accum,
+///   window_size)`
+fn pool_impl<T: Copy + Send, F: Fn(T, T) -> T + Sync, A: Fn(T, WindowSize) -> T + Sync>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    kernel_size: &[usize],
+    strides: &[usize],
+    padding: Padding,
+    fold_init: T,
+    fold: &F,
+    average: &A,
+    round_mode: RoundMode,
+) -> Result<Tensor<T>, OpError>
+where
+    for<'a> TensorViewMut<'a, T>: Send,
+    for<'a> TensorView<'a, T>: Send,
+    for<'a> &'a T: Sync,
+{
+    let spatial_dims = input.ndim().saturating_sub(2);
+    if kernel_size.len() != spatial_dims {
+        return Err(OpError::invalid_value(
+            "kernel_size len does not match spatial dims",
+        ));
+    }
+    if strides.len() != spatial_dims {
+        return Err(OpError::invalid_value(
+            "strides len does not match spatial dims",
+        ));
+    }
+
+    match spatial_dims {
+        1 => {
+            let mut input_2d = input.view();
+            input_2d.insert_axis(2); // Insert H axis
+            let padding_2d = padding.expand_1d_to_2d()?;
+
+            let mut result_2d = pool_impl(
+                pool,
+                input_2d,
+                &[1, kernel_size[0]],
+                &[1, strides[0]],
+                padding_2d,
+                fold_init,
+                fold,
+                average,
+                round_mode,
+            )?;
+            result_2d.remove_axis(2); // Remove H axis
+            return Ok(result_2d);
+        }
+        2 => { /* handled below */ }
+        _ => {
+            return Err(OpError::unsupported_value(
+                "Only inputs with 1 or 2 spatial dims are supported",
+            ));
+        }
+    }
+
+    let kernel_size: [usize; 2] = kernel_size.try_into().unwrap();
+    let strides: [usize; 2] = strides.try_into().unwrap();
+    let input = static_dims!(input, 4, "NCHW")?;
+    let [batch, in_c, in_h, in_w] = input.shape();
+    let (out_h, out_w, fixed_padding) = calc_output_size_and_padding(
+        (in_h, in_w),
+        (kernel_size[0], kernel_size[1]),
+        (strides[0], strides[1]),
+        padding,
+        None, /* dilations */
+        round_mode,
+    )?;
+    let mut output = NdTensor::uninit_in(pool, [batch, in_c, out_h, out_w]);
+
+    // Apply pooling to the channel indexes specified by `chans`.
+    // Assuming `N` is chosen appropriately the inner loop should get unrolled /
+    // autovectorized.
+    fn pool_chans<T: Copy, F: Fn(T, T) -> T, A: Fn(T, WindowSize) -> T, const N: usize>(
+        mut out: NdTensorViewMut<MaybeUninit<T>, 3>,
+        in_view: NdTensorView<T, 3>,
+        chans: [usize; N],
+        [kernel_h, kernel_w]: [usize; 2],
+        [stride_h, stride_w]: [usize; 2],
+        [pad_top, pad_left, pad_bottom, pad_right]: [usize; 4],
+        fold_init: T,
+        fold: F,
+        average: A,
+    ) {
+        let [out_chans, out_h, out_w] = out.shape();
+        let [in_chans, in_h, in_w] = in_view.shape();
+        assert!(chans.into_iter().all(|c| c < out_chans && c < in_chans));
+
+        let padded_h = in_h + pad_top + pad_bottom;
+        let padded_w = in_w + pad_left + pad_right;
+
+        for out_y in 0..out_h {
+            // Compute min/max input Y coordinates for this output position.
+            let min_in_y = out_y * stride_h;
+            let max_in_y = min_in_y + kernel_h.saturating_sub(1);
+            let y_non_pad_region = min_in_y >= pad_top && max_in_y < in_h + pad_top;
+
+            // Count the rows of the window which lie inside the padded input.
+            // Windows always start inside the padded input, but the last one
+            // along an axis may extend beyond the end of it.
+            let padded_rows = kernel_h.min(padded_h - min_in_y);
+
+            for out_x in 0..out_w {
+                // Compute min/max input X coordinates for this output position.
+                let min_in_x = out_x * stride_w;
+                let max_in_x = min_in_x + kernel_w.saturating_sub(1);
+                let x_non_pad_region = min_in_x >= pad_left && max_in_x < in_w + pad_left;
+                let padded_cols = kernel_w.min(padded_w - min_in_x);
+
+                let mut accumulator = [fold_init; N];
+                let mut non_pad_elements = 0;
+
+                // Use faster path with fewer branches for non-padding region.
+                if y_non_pad_region && x_non_pad_region {
+                    non_pad_elements = kernel_h * kernel_w;
+                    for k_y in 0..kernel_h {
+                        for k_x in 0..kernel_w {
+                            let in_y = out_y * stride_h + k_y;
+                            let in_x = out_x * stride_w + k_x;
+                            for (i, chan) in chans.into_iter().enumerate() {
+                                // Safety:
+                                //  - We checked all `chans` are in-bounds
+                                //  - `in_y` and `in_x` are >= pad_top and pad_left
+                                let val = unsafe {
+                                    *in_view.get_unchecked([chan, in_y - pad_top, in_x - pad_left])
+                                };
+                                accumulator[i] = fold(accumulator[i], val);
+                            }
+                        }
+                    }
+                } else {
+                    for k_y in 0..kernel_h {
+                        for k_x in 0..kernel_w {
+                            let in_y = out_y * stride_h + k_y;
+                            let in_x = out_x * stride_w + k_x;
+                            if in_y >= pad_top
+                                && in_y < in_h + pad_top
+                                && in_x >= pad_left
+                                && in_x < in_w + pad_left
+                            {
+                                for (i, chan) in chans.into_iter().enumerate() {
+                                    // Safety:
+                                    //  - We checked all `chans` are in-bounds
+                                    //  - `in_y` and `in_x` are >= pad_top and pad_left
+                                    let val = unsafe {
+                                        *in_view.get_unchecked([
+                                            chan,
+                                            in_y - pad_top,
+                                            in_x - pad_left,
+                                        ])
+                                    };
+                                    accumulator[i] = fold(accumulator[i], val);
+                                }
+                                non_pad_elements += 1;
+                            }
+                        }
+                    }
+                }
+
+                let window_size = WindowSize {
+                    non_padding: non_pad_elements,
+                    padded: padded_rows * padded_cols,
+                };
+
+                for (i, chan) in chans.into_iter().enumerate() {
+                    // Safety:
+                    //  - We checked all `chans` are in-bounds
+                    //  - `out_y` and `out_x` are in 0..out_h, 0..out_w
+                    unsafe {
+                        out.get_unchecked_mut([chan, out_y, out_x])
+                            .write(average(accumulator[i], window_size));
+                    }
+                }
+            }
+        }
+    }
+
+    // Work around error if using `fold_init` directly in closure.
+    let accum_init_val = || fold_init;
+
+    let n_init = AtomicUsize::new(0);
+    output
+        .axis_iter_mut(0)
+        .into_par_iter()
+        .zip(input.axis_iter(0))
+        .for_each(|(mut out_item, in_item)| {
+            let [_, out_h, out_w] = out_item.shape();
+
+            // Loop over channel groups.
+            const N: usize = CHAN_GROUP_SIZE;
+            for chan in (0..in_c).step_by(N) {
+                if in_c - chan < N {
+                    break;
+                }
+                pool_chans(
+                    out_item.view_mut(),
+                    in_item,
+                    [chan, chan + 1, chan + 2, chan + 3],
+                    kernel_size,
+                    strides,
+                    fixed_padding,
+                    accum_init_val(),
+                    fold,
+                    average,
+                );
+                n_init.fetch_add(N * out_h * out_w, Ordering::SeqCst);
+            }
+
+            // Loop over remaining channels.
+            for chan in (in_c - in_c % N)..in_c {
+                pool_chans(
+                    out_item.view_mut(),
+                    in_item,
+                    [chan],
+                    kernel_size,
+                    strides,
+                    fixed_padding,
+                    accum_init_val(),
+                    fold,
+                    average,
+                );
+                n_init.fetch_add(out_h * out_w, Ordering::SeqCst);
+            }
+        });
+
+    assert!(n_init.load(Ordering::SeqCst) == output.len());
+    let output = unsafe { output.assume_init() };
+    Ok(output.into())
+}
+
+pub fn average_pool(
+    pool: &BufferPool,
+    input: TensorView,
+    kernel_size: &[usize],
+    strides: &[usize],
+    padding: Padding,
+    count_include_pad: bool,
+    round_mode: RoundMode,
+) -> Result<Tensor, OpError> {
+    pool_impl(
+        pool,
+        input,
+        kernel_size,
+        strides,
+        padding,
+        0.,
+        &|acc, x| acc + x,
+        &|acc, window| {
+            let divisor = if count_include_pad {
+                window.padded
+            } else {
+                window.non_padding
+            };
+            acc / (divisor as f32)
+        },
+        round_mode,
+    )
+}
+
+#[derive(Debug)]
+pub struct AveragePool {
+    pub kernel_size: SmallVec<[usize; 2]>,
+    pub padding: Padding,
+    pub count_include_pad: bool,
+    pub strides: SmallVec<[usize; 2]>,
+    pub ceil_mode: bool,
+}
+
+impl Operator for AveragePool {
+    fn name(&self) -> &str {
+        "AveragePool"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require_as(0)?;
+        average_pool(
+            ctx.pool(),
+            input,
+            &self.kernel_size,
+            &self.strides,
+            self.padding.clone(),
+            self.count_include_pad,
+            if self.ceil_mode {
+                RoundMode::Ceil
+            } else {
+                RoundMode::Floor
+            },
+        )
+        .into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    AveragePool,
+    op,
+    shape_ops::Pool {
+        strides: &op.strides,
+        dilations: &[1, 1],
+        kernel_size: &op.kernel_size,
+        padding: op.padding.as_shape_inference_padding(),
+        ceil_mode: op.ceil_mode,
+    }
+);
+
+fn global_pool<T: Clone + Send + Sync>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    kernel: &(dyn Fn(&[T]) -> T + Send + Sync),
+) -> Result<Tensor<T>, OpError> {
+    if input.ndim() < 2 {
+        return Err(OpError::invalid_value("Input must have at least 2 dims"));
+    }
+
+    let batch = input.size(0);
+    let chan = input.size(1);
+    let mut out_shape: SmallVec<[usize; 4]> = [batch, chan].into_iter().collect();
+    out_shape.resize(input.ndim(), 1);
+
+    let n_elem = input.shape().iter().skip(2).product();
+    let input = input.reshaped_in(pool, [batch, chan, n_elem]);
+
+    let n_out = batch * chan;
+    let mut out_data = pool.alloc::<T>(n_out);
+    let out_uninit = &mut out_data.spare_capacity_mut()[..n_out];
+
+    input
+        .lanes(2)
+        .into_par_iter()
+        .zip(out_uninit.par_iter_mut())
+        .for_each(|(chan_data, out)| {
+            let chan_slice = chan_data.as_slice().unwrap();
+            let reduced = kernel(chan_slice);
+            out.write(reduced);
+        });
+
+    // Safety: All elements of `out_uninit` have been initialized.
+    unsafe {
+        out_data.set_len(n_out);
+    }
+
+    Ok(Tensor::from_data(&out_shape, out_data))
+}
+
+pub fn global_average_pool(pool: &BufferPool, input: TensorView) -> Result<Tensor, OpError> {
+    global_pool(pool, input, &|chan_data| {
+        let sum = rten_vecmath::Sum::new(chan_data).dispatch();
+        sum / chan_data.len() as f32
+    })
+}
+
+#[derive(Debug)]
+pub struct GlobalAveragePool {}
+
+impl Operator for GlobalAveragePool {
+    fn name(&self) -> &str {
+        "GlobalAveragePool"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require_as(0)?;
+        global_average_pool(ctx.pool(), input).into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&shape_ops::GlobalPool)
+    }
+}
+
+pub fn global_max_pool(pool: &BufferPool, input: TensorView) -> Result<Tensor, OpError> {
+    global_pool(pool, input, &|chan_data| {
+        rten_vecmath::MaxNum::new(chan_data).dispatch()
+    })
+}
+
+#[derive(Debug)]
+pub struct GlobalMaxPool {}
+
+impl Operator for GlobalMaxPool {
+    fn name(&self) -> &str {
+        "GlobalMaxPool"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require_as(0)?;
+        global_max_pool(ctx.pool(), input).into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&shape_ops::GlobalPool)
+    }
+}
+
+pub fn max_pool(
+    pool: &BufferPool,
+    input: TensorView,
+    kernel_size: &[usize],
+    strides: &[usize],
+    padding: Padding,
+    round_mode: RoundMode,
+) -> Result<Tensor, OpError> {
+    pool_impl(
+        pool,
+        input,
+        kernel_size,
+        strides,
+        padding,
+        f32::NEG_INFINITY,
+        &|acc, x| acc.max(x),
+        &|x, _window_size| x,
+        round_mode,
+    )
+}
+
+#[derive(Debug)]
+pub struct MaxPool {
+    pub kernel_size: SmallVec<[usize; 2]>,
+    pub padding: Padding,
+    pub strides: SmallVec<[usize; 2]>,
+    pub ceil_mode: bool,
+}
+
+impl Operator for MaxPool {
+    fn name(&self) -> &str {
+        "MaxPool"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn max_outputs(&self) -> Option<usize> {
+        // Outputs are Y and Indices. `Indices` is unsupported.
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        ctx.outputs().check_unsupported(1, "Indices")?;
+
+        let input = ctx.inputs().require_as(0)?;
+        max_pool(
+            ctx.pool(),
+            input,
+            &self.kernel_size,
+            &self.strides,
+            self.padding.clone(),
+            if self.ceil_mode {
+                RoundMode::Ceil
+            } else {
+                RoundMode::Floor
+            },
+        )
+        .into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    MaxPool,
+    op,
+    shape_ops::Pool {
+        strides: &op.strides,
+        dilations: &[1, 1],
+        kernel_size: &op.kernel_size,
+        padding: op.padding.as_shape_inference_padding(),
+        ceil_mode: op.ceil_mode,
+    }
+);
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rten_tensor::prelude::*;
+    use rten_tensor::test_util::expect_equal;
+    use rten_tensor::{Tensor, TensorView};
+    use rten_testing::TestCases;
+
+    use super::{
+        RoundMode, average_pool, calc_output_size_and_padding, global_average_pool,
+        global_max_pool, max_pool,
+    };
+    use crate::buffer_pool::BufferPool;
+    use crate::ops::tests::expect_eq_1e4;
+    use crate::ops::{OpError, Padding};
+
+    #[test]
+    fn test_average_pool() {
+        let input = Tensor::from([
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.6, 0.7, 0.8],
+            [0.1, 0.2, 0.3, 0.4],
+            [0.6, 0.7, 0.8, 0.9],
+        ])
+        .into_shape([1, 1, 4, 4])
+        .into_dyn();
+
+        let input_1d = input.slice((.., .., 0, ..));
+
+        #[derive(Debug)]
+        struct Case<'a> {
+            input: TensorView<'a>,
+            kernel_size: Vec<usize>,
+            strides: Vec<usize>,
+            padding: Padding,
+            expected: Tensor,
+        }
+        let cases = [
+            // Most common case of uniform stride and kernel size
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [2, 2].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2, 2], vec![0.35, 0.55, 0.4, 0.6]),
+            },
+            // Large uniform kernel size and stride
+            Case {
+                input: input.view(),
+                kernel_size: [4, 4].into(),
+                strides: [4, 4].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 1, 1], vec![0.475]),
+            },
+            // Kernel height > kernel width
+            Case {
+                input: input.view(),
+                kernel_size: [2, 4].into(),
+                strides: [2, 4].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2, 1], vec![0.45, 0.5]),
+            },
+            // W stride > H stride
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [1, 2].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(
+                    &[1, 1, 3, 2],
+                    vec![
+                        0.35, 0.55, // Y=0
+                        0.35, 0.55, // Y=1
+                        0.4, 0.6, // Y=2
+                    ],
+                ),
+            },
+            // H stride > W stride
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [2, 1].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(
+                    &[1, 1, 2, 3],
+                    vec![
+                        0.35, 0.45, // Y=0
+                        0.55, 0.4, // Y=1
+                        0.5, 0.6, // Y=2
+                    ],
+                ),
+            },
+            // One spatial dim
+            Case {
+                input: input_1d.view(),
+                kernel_size: [2].into(),
+                strides: [2].into(),
+                padding: [0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2], vec![0.15, 0.35]),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let result = average_pool(
+                &pool,
+                case.input.view(),
+                &case.kernel_size,
+                &case.strides,
+                case.padding.clone(),
+                false, /* count_include_pad */
+                RoundMode::default(),
+            )
+            .unwrap();
+            expect_equal(&result, &case.expected).unwrap();
+        })
+    }
+
+    #[test]
+    fn test_average_pool_padding() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+
+        // Exercise both the loop over channel groups and the tail in
+        // `pool_impl`.
+        let n_chans = super::CHAN_GROUP_SIZE + 1;
+
+        let input = Tensor::from([
+            [0.0809, 0.5529, 0.1534, 0.7507],
+            [0.4698, 0.7771, 0.9896, 0.4873],
+            [0.9750, 0.5160, 0.6419, 0.3670],
+            [0.4101, 0.3762, 0.9689, 0.4389],
+        ]);
+        let [rows, cols]: [usize; 2] = input.shape().try_into().unwrap();
+        let input = input.broadcast([1, n_chans, rows, cols]);
+
+        // Computed with `torch.nn.functional.avg_pool2d` in PyTorch with
+        // `padding=1` and `count_include_pad=False`.
+        let expected = Tensor::from([
+            [0.0809, 0.3531, 0.7507],
+            [0.7224, 0.7312, 0.4271],
+            [0.4101, 0.6725, 0.4389],
+        ]);
+        let [rows, cols]: [usize; 2] = expected.shape().try_into().unwrap();
+        let expected = expected.broadcast([1, n_chans, rows, cols]);
+
+        let result = average_pool(
+            &pool,
+            input.as_dyn(),
+            &[2, 2],
+            &[2, 2], /* stride */
+            [1, 1, 1, 1].into(),
+            false, /* count_include_pad */
+            RoundMode::default(),
+        )
+        .unwrap();
+        expect_eq_1e4(&result.view(), &expected.as_dyn())?;
+
+        // As above, but with `count_include_pad=True`.
+        let expected_include_pad = Tensor::from([
+            [0.0202, 0.1766, 0.1877],
+            [0.3612, 0.7312, 0.2136],
+            [0.1025, 0.3363, 0.1097],
+        ])
+        .broadcast([1, n_chans, 3, 3])
+        .to_tensor();
+        let result = average_pool(
+            &pool,
+            input.as_dyn(),
+            &[2, 2],
+            &[2, 2], /* stride */
+            [1, 1, 1, 1].into(),
+            true, /* count_include_pad */
+            RoundMode::default(),
+        )
+        .unwrap();
+        expect_eq_1e4(&result.view(), &expected_include_pad.as_dyn())?;
+
+        // As above, but in ceil mode with a kernel size which makes the last
+        // window along each axis extend beyond the end of the padded input.
+        let expected_ceil_mode = Tensor::from([
+            [0.2090, 0.4123, 0.2063],
+            [0.3916, 0.6181, 0.2155],
+            [0.1310, 0.2973, 0.1097],
+        ])
+        .broadcast([1, n_chans, 3, 3])
+        .to_tensor();
+        let result = average_pool(
+            &pool,
+            input.as_dyn(),
+            &[3, 3],
+            &[2, 2], /* stride */
+            [1, 1, 1, 1].into(),
+            true, /* count_include_pad */
+            RoundMode::Ceil,
+        )
+        .unwrap();
+        expect_eq_1e4(&result.view(), &expected_ceil_mode.as_dyn())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_average_pool() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+        let input = Tensor::from_data(&[1, 2, 2, 2], vec![1., 2., 3., 4., 10., 20., 30., 40.]);
+        let expected = Tensor::from_data(&[1, 2, 1, 1], vec![2.5, 25.]);
+        let result = global_average_pool(&pool, input.view()).unwrap();
+        expect_equal(&result, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_max_pool() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+        let input = Tensor::from_data(&[1, 2, 2, 2], vec![1., 2., 3., 4., 10., 20., 30., 40.]);
+        let expected = Tensor::from_data(&[1, 2, 1, 1], vec![4.0, 40.]);
+        let result = global_max_pool(&pool, input.view()).unwrap();
+        expect_equal(&result, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_pool_invalid_input() {
+        let pool = BufferPool::new();
+        let input = Tensor::from([1., 2., 3., 4.]);
+        let err = global_max_pool(&pool, input.view()).err().unwrap();
+        assert_eq!(
+            err,
+            OpError::invalid_value("Input must have at least 2 dims")
+        );
+    }
+
+    #[test]
+    fn test_max_pool() {
+        let input = Tensor::from([
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.6, 0.7, 0.8],
+            [0.1, 0.2, 0.3, 0.4],
+            [0.6, 0.7, 0.8, 0.9],
+        ])
+        .into_shape([1, 1, 4, 4])
+        .into_dyn();
+
+        let input_1d = input.slice((.., .., 0, ..));
+
+        #[derive(Debug)]
+        struct Case<'a> {
+            input: TensorView<'a>,
+            kernel_size: Vec<usize>,
+            strides: Vec<usize>,
+            padding: Padding,
+            expected: Tensor,
+        }
+
+        let cases = [
+            // Most common case of uniform stride and kernel size
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [2, 2].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2, 2], vec![0.6, 0.8, 0.7, 0.9]),
+            },
+            // Large uniform kernel size and stride
+            Case {
+                input: input.view(),
+                kernel_size: [4, 4].into(),
+                strides: [4, 4].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 1, 1], vec![0.9]),
+            },
+            // Kernel height > kernel width
+            Case {
+                input: input.view(),
+                kernel_size: [2, 4].into(),
+                strides: [2, 4].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2, 1], vec![0.8, 0.9]),
+            },
+            // W stride > H stride
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [1, 2].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(
+                    &[1, 1, 3, 2],
+                    vec![
+                        0.6, 0.8, // Y=0
+                        0.6, 0.8, // Y=1
+                        0.7, 0.9, // Y=2
+                    ],
+                ),
+            },
+            // H stride > W stride
+            Case {
+                input: input.view(),
+                kernel_size: [2, 2].into(),
+                strides: [2, 1].into(),
+                padding: [0, 0, 0, 0].into(),
+                expected: Tensor::from_data(
+                    &[1, 1, 2, 3],
+                    vec![
+                        0.6, 0.7, 0.8, // Y=0
+                        0.7, 0.8, 0.9, // Y=1
+                    ],
+                ),
+            },
+            // One spatial dim
+            Case {
+                input: input_1d.view(),
+                kernel_size: [2].into(),
+                strides: [2].into(),
+                padding: [0, 0].into(),
+                expected: Tensor::from_data(&[1, 1, 2], vec![0.2, 0.4]),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let result = max_pool(
+                &pool,
+                case.input.view(),
+                &case.kernel_size,
+                &case.strides,
+                case.padding.clone(),
+                RoundMode::default(),
+            )
+            .unwrap();
+            expect_equal(&result, &case.expected).unwrap();
+        })
+    }
+
+    #[test]
+    fn test_max_pool_padding() {
+        let pool = BufferPool::new();
+        let input = Tensor::zeros(&[1, 1, 9, 9]);
+        let rm = RoundMode::default();
+
+        let result = max_pool(
+            &pool,
+            input.view(),
+            &[2, 2],
+            &[2, 2],
+            [0, 0, 0, 0].into(),
+            rm,
+        )
+        .unwrap();
+        assert_eq!(result.shape(), &[1, 1, 4, 4]);
+
+        let result = max_pool(
+            &pool,
+            input.view(),
+            &[2, 2],
+            &[2, 2],
+            [1, 1, 1, 1].into(),
+            rm,
+        )
+        .unwrap();
+        assert_eq!(result.shape(), &[1, 1, 5, 5]);
+
+        let result = max_pool(
+            &pool,
+            input.view(),
+            &[2, 2],
+            &[2, 2],
+            [2, 2, 2, 2].into(),
+            rm,
+        )
+        .unwrap();
+        assert_eq!(result.shape(), &[1, 1, 6, 6]);
+
+        let result = max_pool(&pool, input.view(), &[2, 2], &[2, 2], Padding::Same, rm).unwrap();
+        assert_eq!(result.shape(), &[1, 1, 5, 5]);
+
+        let result = max_pool(&pool, input.view(), &[2, 2], &[3, 3], Padding::Same, rm).unwrap();
+        assert_eq!(result.shape(), &[1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn test_calc_output_size_and_padding() {
+        #[derive(Debug)]
+        struct Case {
+            in_size: (usize, usize),
+            kernel_size: (usize, usize),
+            dilations: (usize, usize),
+            strides: (usize, usize),
+            padding: Padding,
+            round_mode: RoundMode,
+            expected: Result<(usize, usize, [usize; 4]), OpError>,
+        }
+
+        impl Default for Case {
+            fn default() -> Self {
+                Case {
+                    in_size: (5, 5),
+                    kernel_size: (3, 3),
+                    dilations: (1, 1),
+                    strides: (1, 1),
+                    padding: [0, 0, 0, 0].into(),
+                    round_mode: RoundMode::Floor,
+                    expected: Err(OpError::invalid_value("default")),
+                }
+            }
+        }
+
+        let cases = [
+            // Simple case with no padding
+            Case {
+                expected: Ok((3, 3, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Fixed padding
+            Case {
+                padding: [1, 1, 1, 1].into(),
+                expected: Ok((5, 5, [1, 1, 1, 1])),
+                ..Default::default()
+            },
+            // Strides > 1
+            Case {
+                strides: (2, 2),
+                expected: Ok((2, 2, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Dilations > 1
+            Case {
+                dilations: (2, 2),
+                expected: Ok((1, 1, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // `Same` padding, uneven
+            Case {
+                in_size: (1, 20),
+                kernel_size: (1, 3),
+                padding: Padding::Same,
+                expected: Ok((1, 20, [0, 1, 0, 1])),
+                ..Default::default()
+            },
+            // Strides > kernel size. This would cause underflow if the
+            // clamping the padding to be >= 0.
+            Case {
+                in_size: (9, 9),
+                strides: (3, 3),
+                kernel_size: (2, 2),
+                padding: Padding::Same,
+                expected: Ok((3, 3, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Floor vs ceil round mode with explicit padding.
+            Case {
+                in_size: (8, 8),
+                strides: (2, 2),
+                round_mode: RoundMode::Ceil,
+                expected: Ok((4, 4, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            Case {
+                in_size: (8, 8),
+                strides: (2, 2),
+                round_mode: RoundMode::Floor,
+                expected: Ok((3, 3, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Ceil mode test cases that produced an incorrect result prior to a
+            // ceiling division fix.
+            Case {
+                in_size: (9, 9),
+                strides: (2, 2),
+                round_mode: RoundMode::Ceil,
+                expected: Ok((4, 4, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            Case {
+                in_size: (11, 11),
+                strides: (2, 2),
+                round_mode: RoundMode::Ceil,
+                expected: Ok((5, 5, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Floor vs ceil round mode with "same" padding. It is intentional
+            // that the results are the same.
+            Case {
+                in_size: (7, 7),
+                strides: (2, 2),
+                round_mode: RoundMode::Ceil,
+                padding: Padding::Same,
+                expected: Ok((4, 4, [1, 1, 1, 1])),
+                ..Default::default()
+            },
+            Case {
+                in_size: (7, 7),
+                strides: (2, 2),
+                round_mode: RoundMode::Floor,
+                padding: Padding::Same,
+                expected: Ok((4, 4, [1, 1, 1, 1])),
+                ..Default::default()
+            },
+            // Special case where output size is adjusted when using ceil mode.
+            // Test case from https://github.com/onnx/onnx/issues/5711.
+            Case {
+                in_size: (12, 12),
+                kernel_size: (1, 1),
+                strides: (2, 2),
+                round_mode: RoundMode::Ceil,
+                expected: Ok((6, 6, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // Zero stride
+            Case {
+                strides: (0, 0),
+                expected: Err(OpError::invalid_value("Strides must be > 0")),
+                ..Default::default()
+            },
+            // Zero dilation
+            Case {
+                dilations: (0, 0),
+                expected: Err(OpError::invalid_value("Dilations must be > 0")),
+                ..Default::default()
+            },
+            // Zero kernel size
+            Case {
+                kernel_size: (0, 0),
+                expected: Err(OpError::invalid_value("Kernel size must be > 0")),
+                ..Default::default()
+            },
+            // Incorrect padding length
+            Case {
+                padding: [0, 0].into(),
+                expected: Err(OpError::invalid_value("Expected 4 padding values")),
+                ..Default::default()
+            },
+            // Dilated kernel size > input size
+            Case {
+                in_size: (4, 4),
+                dilations: (2, 2),
+                expected: Err(OpError::invalid_value("Input too small for kernel size")),
+                ..Default::default()
+            },
+            // Dilated kernel size > input size in ceil mode. This is allowed
+            // as long as the output size is still > 0.
+            Case {
+                in_size: (3, 3),
+                kernel_size: (5, 5),
+                strides: (5, 5),
+                round_mode: RoundMode::Ceil,
+                expected: Ok((1, 1, [0, 0, 0, 0])),
+                ..Default::default()
+            },
+            // In ceil mode it is an error if the output size is <= 0.
+            Case {
+                in_size: (3, 3),
+                kernel_size: (5, 5),
+                round_mode: RoundMode::Ceil,
+                expected: Err(OpError::invalid_value("Output size is <= 0")),
+                ..Default::default()
+            },
+        ];
+
+        cases.test_each(|case| {
+            let Case {
+                in_size,
+                kernel_size,
+                dilations,
+                strides,
+                padding,
+                round_mode,
+                expected,
+            } = case;
+
+            assert_eq!(
+                &calc_output_size_and_padding(
+                    *in_size,
+                    *kernel_size,
+                    *strides,
+                    padding.clone(),
+                    Some(*dilations),
+                    *round_mode,
+                ),
+                expected
+            );
+        })
+    }
+}

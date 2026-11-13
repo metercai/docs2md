@@ -57,3 +57,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 2
 strip = true
+
+# Vendored rten 0.27.0 (MIT/Apache-2.0, see vendor/rten/PATCHES.md): one
+# modification — conv_2d_pointwise runs per-item GEMMs as one batched call
+# so the thread pool parallelizes the batch (the upstream serial loop
+# oversubscribes the default 64-thread pool and runs ~3.4x slower than
+# single-threaded on small per-item GEMMs). Re-vendor + re-apply the patch
+# when upgrading rten.
+[patch.crates-io]
+rten = { path = "vendor/rten" }

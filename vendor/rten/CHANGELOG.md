@@ -1,0 +1,2583 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.27.0] - 2026-10-02
+
+**Breaking changes:**
+
+- The `.rten` format has been deprecated and is no longer enabled by default.
+  RTen can still load models in this format if the `rten_format` crate feature
+  is enabled. Users should use `.onnx` format models instead. See
+  https://github.com/robertknight/rten/issues/1470.
+
+- `Model::input_ids` no longer includes constants ("initializers") which are
+  listed as graph inputs in very old ONNX models (IR version < 4).
+
+### rten
+
+- Added `Softsign` operator (https://github.com/robertknight/rten/pull/1501)
+
+- Added `DynamicQuantizeLSTM` contrib operator
+  (https://github.com/robertknight/rten/pull/1495,
+  https://github.com/robertknight/rten/pull/1498)
+
+- Added `BitCast` operator (https://github.com/robertknight/rten/pull/1479)
+
+- Added `ModelOptions::external_data_static` and the `include_external_data!`
+  macro, which enable embedding external data for ONNX models in the binary
+  without copying it (https://github.com/robertknight/rten/pull/1471)
+
+- Fixed loading ONNX models where a graph output is a constant or graph input
+  (https://github.com/robertknight/rten/pull/1493)
+
+- Fixed a panic in `ScatterND` when running in-place on a non-contiguous input
+  (https://github.com/robertknight/rten/pull/1477)
+
+- Use the buffer pool when making contiguous copies of inputs in scatter and
+  normalization operators (https://github.com/robertknight/rten/pull/1478)
+
+- Reduced compile time and binary size by sharing operator instantiations
+  between element types of the same bit-width and moving code into non-generic
+  helpers. As a side effect, `Tile` and `Trilu` now support i8 and u8 tensors
+  (https://github.com/robertknight/rten/pull/1482,
+  https://github.com/robertknight/rten/pull/1484,
+  https://github.com/robertknight/rten/pull/1509)
+
+### rten-cli
+
+- Added a `rten_format` feature to enable loading `.rten` models
+  (https://github.com/robertknight/rten/pull/1473)
+
+### rten-onnx
+
+- Added support for serializing ONNX models
+  (https://github.com/robertknight/rten/pull/1474)
+
+### rten-simd
+
+- Fixed a panic in `narrow_saturate` in the generic (non-SIMD) implementation,
+  which affected quantization operators
+  (https://github.com/robertknight/rten/pull/1486)
+
+- Integer `add`, `sub`, `mul`, `mul_add`, `neg` and `abs` ops in the generic
+  implementation now wrap on overflow in debug builds, matching native SIMD
+  implementations (https://github.com/robertknight/rten/pull/1486,
+  https://github.com/robertknight/rten/pull/1491)
+
+### rten-tensor
+
+- Fixed an issue in `TensorBase::append` and `concat` where a panic in the
+  element's `Clone` impl could result in a tensor being left with uninitialized
+  elements. These methods have a `T: Copy` bound, so this only affected types
+  with an incorrect `Clone` impl (thanks @tooson9010-spec,
+  https://github.com/robertknight/rten/pull/1496)
+
+- Added `TensorBase::bit_cast` for reinterpreting a tensor's elements as a
+  different type of the same size without copying
+  (https://github.com/robertknight/rten/pull/1468)
+
+- Added `Contiguous::data_mut`, `TensorBase::make_contiguous_in` and
+  `TensorBase::into_contiguous_in`
+  (https://github.com/robertknight/rten/pull/1477,
+  https://github.com/robertknight/rten/pull/1478)
+
+- Added default implementations for `Layout::len`, `Layout::ndim` and
+  `Layout::offset` (https://github.com/robertknight/rten/pull/1464)
+
+## [0.26.0] - 2026-08-29
+
+**Breaking changes:**
+
+- The `--range` option in the CLI now treats the upper bound as exclusive, so
+  `--range input=0:10` generates values in `[0, 10)`
+  (https://github.com/robertknight/rten/pull/1445)
+
+### rten
+
+- Optimized `ScatterElements` and `ScatterND` to run in-place when possible
+  (https://github.com/robertknight/rten/pull/1461)
+
+- Fixed `ConcatFromSequence` resolving `axis` against the input rather than the
+  output rank when `new_axis` is set (https://github.com/robertknight/rten/pull/1460)
+
+- Fuse `Conv` followed by `BatchNormalization` into a single `Conv` with
+  adjusted weights and bias (https://github.com/robertknight/rten/pull/1458,
+  https://github.com/robertknight/rten/pull/1459)
+
+- Fuse per-channel `Mul` followed by `Add` into `BatchNormalization`
+  (https://github.com/robertknight/rten/pull/1457)
+
+- Fixed incorrect output in `AveragePool` when `count_include_pad` is set and a
+  window extends beyond the end of the padded input
+  (https://github.com/robertknight/rten/pull/1456)
+
+- `AveragePool` and `MaxPool` now allow the kernel size to exceed the padded
+  input size when `ceil_mode` is enabled, matching PyTorch
+  (https://github.com/robertknight/rten/pull/1455)
+
+- Fixed NaN outputs from `Resize` when `align_corners` is used and an output
+  axis has length one (https://github.com/robertknight/rten/pull/1450)
+
+- Optimized the `GRU` and `LSTM` operators, by computing the input projection
+  for the whole sequence in one GEMM, fusing the gate and hidden state updates,
+  and evaluating both directions of a bidirectional operator in parallel
+  (https://github.com/robertknight/rten/pull/1442)
+
+- Fixed panics in the `LSTM` and `GRU` operators when input shapes did not match
+  each other or the operator's attributes
+  (https://github.com/robertknight/rten/pull/1439,
+  https://github.com/robertknight/rten/pull/1440)
+
+- Report an error when loading models which use old versions of `Resize` (opset
+  < 11) and `Tile` (opset < 6) that are not supported
+  (https://github.com/robertknight/rten/pull/1438)
+
+- Improve error messages for out-of-range indices and axes, by including the
+  invalid value and the range of valid values
+  (https://github.com/robertknight/rten/pull/1436,
+  https://github.com/robertknight/rten/pull/1437)
+
+- Unused operator outputs are now removed during graph optimization. This
+  allows operators to skip computing them, and allows models to run if they
+  request an unsupported output but never use it
+  (https://github.com/robertknight/rten/pull/1435)
+
+- Improved error messages for unsupported operator outputs. A consequence is
+  that errors for valid but unsupported outputs will now be reported during
+  inference rather than at model load time. This affects `Attention`,
+  `BatchNormalization`, `LayerNormalization` and `MaxPool`, plus the
+  `GroupQueryAttention`, `MultiHeadAttention`, `SkipLayerNormalization`,
+  `SimplifiedLayerNormalization` and `SkipSimplifiedLayerNormalization` contrib
+  operators (https://github.com/robertknight/rten/pull/1432,
+  https://github.com/robertknight/rten/pull/1433)
+
+- `QuantizeLinear` and `DequantizeLinear` now use per-tensor quantization if the
+  `scale` input is a single-element vector, for compatibility with ONNX Runtime
+  (https://github.com/robertknight/rten/pull/1429)
+
+- Accept the deprecated `spatial` attribute for `BatchNormalization` if it is
+  set to the default value (https://github.com/robertknight/rten/pull/1428)
+
+- Accept attributes which are explicitly set to their default value, rather than
+  omitted, in `Cast`, `CastLike`, `DequantizeLinear`, `GRU`, `LSTM`,
+  `QuantizeLinear` and `Range`
+  (https://github.com/robertknight/rten/pull/1427)
+
+- Support older models which specify `Reshape`'s `shape`, `TopK`'s `k` and
+  `Dropout`'s `ratio` as attributes rather than inputs
+  (https://github.com/robertknight/rten/pull/1425,
+  https://github.com/robertknight/rten/pull/1426)
+
+- Validate tensor data offsets when loading `.rten` models and prevent an
+  overflow when computing the end offset of external data
+  (https://github.com/robertknight/rten/pull/1423)
+
+- Added `ReduceLogSum` and `ReduceLogSumExp` operators
+  (https://github.com/robertknight/rten/pull/1422)
+
+- Added `QuickGelu` contrib operator
+  (https://github.com/robertknight/rten/pull/1421)
+
+- Fixed the inferred rank of `ConstantOfShape`'s output when the values of the
+  `shape` input are unknown (https://github.com/robertknight/rten/pull/1420)
+
+- Fixed a panic when `Expand`'s target shape contains negative values
+  (https://github.com/robertknight/rten/pull/1419)
+
+- Fixed incorrect `Resize` output when the scale factor is not an integer
+  (https://github.com/robertknight/rten/pull/1418)
+
+- Fixed `QuantizeLinear` and `DequantizeLinear` reading uninitialized memory if
+  the `scale` input's length did not match the size of the quantization axis,
+  and panicking if the optional `zero_point` input was omitted
+  (https://github.com/robertknight/rten/pull/1417)
+
+- Fixed the output size of `MaxPool` and `AveragePool` in ceil mode
+  (https://github.com/robertknight/rten/pull/1416)
+
+- Added `LpNormalization` operator
+  (https://github.com/robertknight/rten/pull/1415)
+
+- Support the `exclusive` and `reverse` attributes in `CumSum`
+  (https://github.com/robertknight/rten/pull/1413)
+
+- Support packed QKV inputs in `GroupQueryAttention`, and improve performance by
+  avoiding unnecessary copying of inputs
+  (https://github.com/robertknight/rten/pull/1409)
+
+- Fixed grouped `ConvTranspose` using the first group's bias values for every
+  group (https://github.com/robertknight/rten/pull/1408)
+
+- Support dilations in `ConvTranspose`
+  (https://github.com/robertknight/rten/pull/1407)
+
+- Support negative pads in the `Pad` operator
+  (https://github.com/robertknight/rten/pull/1406)
+
+### rten-convert
+
+- Fixed model conversion failing on Windows when `--infer-shapes` is enabled
+  (https://github.com/robertknight/rten/pull/1453)
+
+- Fixed the default `axis` for `Softmax` and `LogSoftmax` in `.rten` format
+  models (https://github.com/robertknight/rten/pull/1414)
+
+### rten-tensor
+
+- Added `TensorBase::is_owned` (https://github.com/robertknight/rten/pull/1463)
+
+- Fixed two soundness issues in `LaneMut`, where `nth` could re-yield an element
+  that was already yielded and `into_view` could return a view aliasing
+  previously yielded references
+  (https://github.com/robertknight/rten/pull/1412)
+
+- Implemented `DoubleEndedIterator` for `Lane` and `LaneMut`, and fixed their
+  `size_hint` implementations
+  (https://github.com/robertknight/rten/pull/1411)
+
+### rten-simd
+
+- Build docs for Arm and WASM targets on docs.rs
+  (https://github.com/robertknight/rten/pull/1446)
+
+### rten-cli
+
+- Made the upper bound of `--range` exclusive
+  (https://github.com/robertknight/rten/pull/1445)
+
+## [0.25.0] - 2026-08-01
+
+**Breaking changes:**
+
+- RTen now validates the types and shapes of input values when running ONNX
+  models. This results in better errors if values with incorrect shapes are
+  passed, but will cause errors if a caller was previously passing input values
+  that did not match the model's metadata but happened to work. See
+  https://github.com/robertknight/rten/pull/1257.
+
+- Non-standard "contrib" operators from ONNX Runtime are now gated behind a
+  `contrib` crate feature. This feature is enabled by default, but builds using
+  `default-features = false` will need to enable it to use these operators
+  (https://github.com/robertknight/rten/pull/1348).
+
+**Highlights:**
+
+- Extended the shape and type inference system (introduced in 0.24.0) to cover
+  many more operators, including `ArgMax`, `ArgMin`, `ConvInteger`,
+  `ConvTranspose`, `CumSum`, `DepthToSpace`, `Dropout`, `Einsum`, `EyeLike`,
+  `GatherElements`, `GatherND`, `GridSample`, `GRU`, `LSTM`,
+  `MultiHeadAttention`, `NonMaxSuppression`,
+  `NonZero`, `OneHot`, `Pad`, `RandomNormal`, `RandomNormalLike`,
+  `RandomUniform`, `RandomUniformLike`, `Resize`, `RotaryEmbedding`,
+  `ScatterElements`, `Size`, `SkipSimplifiedLayerNormalization`, `STFT`, `Tile`
+  and `TopK`.
+
+- Added several new operators commonly used in transformer and LLM models,
+  including `Attention`, `GroupQueryAttention`, `MultiHeadAttention`,
+  `RotaryEmbedding`, `RMSNormalization`, `SimplifiedLayerNormalization` and
+  `SkipSimplifiedLayerNormalization`.
+
+- Added the `DFT`, `Multinomial`, `ReverseSequence`, `Scatter` and (deprecated)
+  `Upsample` operators.
+
+- Added support for loading f16 ONNX models by up-converting weights to f32
+  (https://github.com/robertknight/rten/pull/1171).
+
+- Shape inference (introduced as opt-in in 0.24.0) is now enabled by default
+  (https://github.com/robertknight/rten/pull/1296).
+
+- Added a new `rten-serialize` crate which supports saving and loading tensors
+  in the `.npy`, `.npz` and Safetensors formats (thanks @xd009642).
+
+### rten
+
+- Fixed a planning error during constant propagation in models where a graph
+  output is also a graph input
+  (https://github.com/robertknight/rten/pull/1405)
+
+- Added `Gelu` and `FastGelu` contrib operators
+  (https://github.com/robertknight/rten/pull/1401)
+
+- Fixed `Range` shape inference for zero and negative deltas, and limited the
+  number of values inferred for long ranges
+  (https://github.com/robertknight/rten/pull/1400)
+
+- Fixed an out-of-bounds write in `ConvTranspose` for certain combinations of
+  input size and attributes, and fixed the order of padding sizes computed for
+  "same" padding (https://github.com/robertknight/rten/pull/1398,
+  https://github.com/robertknight/rten/pull/1399)
+
+- Accept the opset 20 "linear" spelling of `GridSample`'s bilinear mode
+  (https://github.com/robertknight/rten/pull/1393)
+
+- Support reading `pads` and `value` from attributes in `Pad`, as used by
+  models targeting opsets before 11
+  (https://github.com/robertknight/rten/pull/1392)
+
+- Fixed a panic when the output of `GatherND` is empty, and incorrect handling
+  of negative indices in a fast path
+  (https://github.com/robertknight/rten/pull/1389,
+  https://github.com/robertknight/rten/pull/1390)
+
+- Support upper-case letters as dimension labels in `Einsum` equations, matching
+  `numpy.einsum` and ONNX Runtime
+  (https://github.com/robertknight/rten/pull/1387)
+
+- Fixed a bug where the optimizer could replace float values with integer
+  constants inferred by shape inference
+  (https://github.com/robertknight/rten/pull/1382)
+
+- Support all tensor data types and data sources in the `value` attribute of
+  `ConstantOfShape` (https://github.com/robertknight/rten/pull/1380)
+
+- Fixed a panic in the `Conv` pointwise fast path when the input and kernel
+  channel counts do not match
+  (https://github.com/robertknight/rten/pull/1378)
+
+- Added a `ConvIntegerToFloat` fusion for quantized models which convert the
+  output of `ConvInteger` back to float
+  (https://github.com/robertknight/rten/pull/1377)
+
+- Fixed several panics and incorrect outputs in the `Einsum` operator,
+  including bugs in broadcasting, equations with three or more terms containing
+  repeated labels or ellipses, and equations with an empty left-hand side
+  (https://github.com/robertknight/rten/pull/1362,
+  https://github.com/robertknight/rten/pull/1366,
+  https://github.com/robertknight/rten/pull/1368,
+  https://github.com/robertknight/rten/pull/1369)
+
+- Fixed reduction operators computing incorrect results for certain input
+  shapes due to a bug in a fast path
+  (https://github.com/robertknight/rten/pull/1365)
+
+- Fixed a bug where the graph optimizer could remove values captured by
+  subgraphs (https://github.com/robertknight/rten/pull/1360)
+
+- Support broadcasting of the scale and bias inputs in `LayerNormalization` and
+  `RMSNormalization` (https://github.com/robertknight/rten/pull/1357)
+
+- Fixed a panic in int8 GEMV when the LHS data was not 4-byte aligned
+  (https://github.com/robertknight/rten/pull/1356)
+
+- Fixed a panic in `Reshape` when the input is empty but the target shape is
+  not (https://github.com/robertknight/rten/pull/1355)
+
+- Added vectorized `LogSoftmax` kernel
+  (https://github.com/robertknight/rten/pull/1354)
+
+- Improved `Gelu` fusion to recognize patterns emitted by tf2onnx
+  (https://github.com/robertknight/rten/pull/1352)
+
+- Put non-standard contrib operators behind a `contrib` crate feature, enabled
+  by default (https://github.com/robertknight/rten/pull/1348,
+  https://github.com/robertknight/rten/pull/1302)
+
+- Fixed `Unsqueeze` shape inference when there are multiple axes
+  (https://github.com/robertknight/rten/pull/1339)
+
+- Support loading f64 tensors from external data files
+  (https://github.com/robertknight/rten/pull/1338)
+
+- Added `BiasGelu` contrib operator
+  (https://github.com/robertknight/rten/pull/1336)
+
+- Added `SkipLayerNormalization` contrib operator
+  (https://github.com/robertknight/rten/pull/1328)
+
+- Include the data file path in all external data loading errors
+  (https://github.com/robertknight/rten/pull/1333)
+
+- Added `GroupQueryAttention` operator
+  (https://github.com/robertknight/rten/pull/1304,
+  https://github.com/robertknight/rten/pull/1332)
+
+- Fixed shape inference for operators with optional inputs whose shape is
+  unknown, by distinguishing missing inputs from inputs with unknown rank
+  (https://github.com/robertknight/rten/pull/1329,
+  https://github.com/robertknight/rten/pull/1330,
+  https://github.com/robertknight/rten/pull/1331)
+
+- Added the standard ONNX `Attention` operator
+  (https://github.com/robertknight/rten/pull/1325)
+
+- Support negative indices in `Gather` shape inference
+  (https://github.com/robertknight/rten/pull/1326)
+
+- Added documentation page on safety and resource usage
+  (https://github.com/robertknight/rten/pull/1324)
+
+- Improved simplification of symbolic expressions in shape inference and
+  limited their complexity to bound the time taken by shape inference
+  (https://github.com/robertknight/rten/pull/1303,
+  https://github.com/robertknight/rten/pull/1306,
+  https://github.com/robertknight/rten/pull/1308,
+  https://github.com/robertknight/rten/pull/1309)
+
+- Enabled shape inference by default
+  (https://github.com/robertknight/rten/pull/1296)
+
+- Generalized the `MatMulIntegerToFloat` fusion to support more graph patterns
+  (https://github.com/robertknight/rten/pull/1295)
+
+- Support `Scatter`, `Upsample` and `RotaryEmbedding` operators in the `.rten`
+  file format (https://github.com/robertknight/rten/pull/1301)
+
+- Added `MultiHeadAttention` operator, including shape inference (thanks
+  @xd009642) (https://github.com/robertknight/rten/pull/1251,
+  https://github.com/robertknight/rten/pull/1287,
+  https://github.com/robertknight/rten/pull/1288,
+  https://github.com/robertknight/rten/pull/1290,
+  https://github.com/robertknight/rten/pull/1321,
+  https://github.com/robertknight/rten/pull/1323,
+  https://github.com/robertknight/rten/pull/1341,
+  https://github.com/robertknight/rten/pull/1342,
+  https://github.com/robertknight/rten/pull/1343)
+
+- Added `DFT` operator, including support for the inverse one-sided DFT (IRFFT)
+  (https://github.com/robertknight/rten/pull/1261)
+
+- Added `Scatter` operator
+  (https://github.com/robertknight/rten/pull/1268)
+
+- Added `ReverseSequence` operator
+  (https://github.com/robertknight/rten/pull/1259)
+
+- Added `Multinomial` operator
+  (https://github.com/robertknight/rten/pull/1254)
+
+- Added support for the deprecated `Upsample` operator
+  (https://github.com/robertknight/rten/pull/1255)
+
+- Added fusion for `Conv` + `Add` bias into a `Conv` with bias, including 1D
+  convolutions (https://github.com/robertknight/rten/pull/1265,
+  https://github.com/robertknight/rten/pull/1266)
+
+- Optimized the `Gather` operator for contiguous inputs along inner axes
+  (https://github.com/robertknight/rten/pull/1258)
+
+- Validate the shape and dtype of model inputs
+  (https://github.com/robertknight/rten/pull/1257)
+
+- Read `Slice` starts/ends/axes from attributes in addition to inputs
+  (https://github.com/robertknight/rten/pull/1253)
+
+- Validate operator output counts when deserializing ONNX operators
+  (https://github.com/robertknight/rten/pull/1281,
+  https://github.com/robertknight/rten/pull/1283,
+  https://github.com/robertknight/rten/pull/1284)
+
+- Validate the size of bias inputs to the `Conv` and `ConvTranspose` operators
+  (https://github.com/robertknight/rten/pull/1280)
+
+- Validate the size of scale, bias, mean and var inputs to `BatchNormalization`
+  (https://github.com/robertknight/rten/pull/1277)
+
+- Handle divide-by-zero in the `Div` and `Mod` operators with integer inputs
+  (https://github.com/robertknight/rten/pull/1276)
+
+- Deduplicate axes in `Reduce*` operators and `Squeeze`
+  (https://github.com/robertknight/rten/pull/1275)
+
+- Improved shape inference for the `Identity` operator
+  (https://github.com/robertknight/rten/pull/1264)
+
+- Added `RotaryEmbedding` operator (thanks @xd009642)
+  (https://github.com/robertknight/rten/pull/1209,
+  https://github.com/robertknight/rten/pull/1294)
+
+- Added `RMSNormalization` operator
+  (https://github.com/robertknight/rten/pull/1190)
+
+- Added `SimplifiedLayerNormalization` and `SkipSimplifiedLayerNormalization`
+  operators (thanks @xd009642) (https://github.com/robertknight/rten/pull/1206,
+  https://github.com/robertknight/rten/pull/1210,
+  https://github.com/robertknight/rten/pull/1299)
+
+- Added `Swish` operator (https://github.com/robertknight/rten/pull/1223)
+
+- Added `Acosh`, `Asinh`, `Atanh`, `Cosh` and `Sinh` operators
+  (https://github.com/robertknight/rten/pull/1224)
+
+- Added `ReduceL1` operator (https://github.com/robertknight/rten/pull/1198)
+
+- Support f16 ONNX models by up-converting to f32 in the loader
+  (https://github.com/robertknight/rten/pull/1171,
+  https://github.com/robertknight/rten/pull/1338,
+  https://github.com/robertknight/rten/pull/1351,
+  https://github.com/robertknight/rten/pull/1383,
+  https://github.com/robertknight/rten/pull/1391,
+  https://github.com/robertknight/rten/pull/1402)
+
+- Support all int8/uint8 input combinations in `MatMulInteger`
+  (https://github.com/robertknight/rten/pull/1208)
+
+- Added a strict shape inference mode which reports errors when shapes cannot be
+  inferred (https://github.com/robertknight/rten/pull/1179)
+
+- Support shape inference for models in the `.rten` format
+  (https://github.com/robertknight/rten/pull/1178)
+
+- Aligned `Reduce*` operators with the ONNX spec for empty inputs
+  (https://github.com/robertknight/rten/pull/1204)
+
+- Fixed `ConvInteger` zero point handling when `group` > 1
+  (https://github.com/robertknight/rten/pull/1193)
+
+- Check that the K dimension is compatible between the LHS and RHS inputs of the
+  `Gemm` operator (https://github.com/robertknight/rten/pull/1169)
+
+- Handle the case where an ONNX operator and value have the same name
+  (https://github.com/robertknight/rten/pull/1221)
+
+- Fixed conversion of the `to` attribute for the `Cast` operator to match the
+  initializer loader (https://github.com/robertknight/rten/pull/1181)
+
+### rten-tensor
+
+- Added `TensorBase::init_if_empty` method
+  (https://github.com/robertknight/rten/pull/1389)
+
+- Fixed `TensorBase::append` marking uninitialized elements as initialized when
+  appending along an axis other than zero
+  (https://github.com/robertknight/rten/pull/1384)
+
+- Fixed a false-positive internal-overlap panic for tensors with 1-sized
+  dimensions (https://github.com/robertknight/rten/pull/1375)
+
+- Refactored tensor layouts to use separate types for tensor indices, shapes
+  and strides (https://github.com/robertknight/rten/pull/1340,
+  https://github.com/robertknight/rten/pull/1372)
+
+- Fixed `MutLayout::index_axis` for empty tensors
+  (https://github.com/robertknight/rten/pull/1370)
+
+- Fixed a panic in `TensorBase::inner_iter` when the inner views are empty
+  (https://github.com/robertknight/rten/pull/1364)
+
+- Added `TensorBase::{into_rank, into_permuted}` methods, plus `into_owned` and
+  `into_shape` for `Cow` tensors
+  (https://github.com/robertknight/rten/pull/1289,
+  https://github.com/robertknight/rten/pull/1292)
+
+- Added `Tensor::into_contiguous` method and implemented `Eq`/`Hash` for
+  `Contiguous` (https://github.com/robertknight/rten/pull/1250)
+
+- Added `Tensor::from_fn_in` method
+  (https://github.com/robertknight/rten/pull/1260)
+
+- Implemented `Eq` and `Hash` for `TensorBase`
+  (https://github.com/robertknight/rten/pull/1249)
+
+- Added `TensorBase::concat` method
+  (https://github.com/robertknight/rten/pull/1195)
+
+- Added `InsertDim` trait and `TensorBase::with_new_axis` method to insert a new
+  axis into a tensor (https://github.com/robertknight/rten/pull/1196)
+
+- Added `TensorBase::with_axis_removed` method
+  (https://github.com/robertknight/rten/pull/1197)
+
+### rten-simd
+
+- Split `Extend::extend` into `extend_low` and `extend_high` methods which each
+  return a single vector, for compatibility with scalable vector ISAs
+  (https://github.com/robertknight/rten/pull/1397)
+
+- Added basic f16 vector support
+  (https://github.com/robertknight/rten/pull/1350)
+
+- Split the `NumOps` trait into a `BitOps` base trait and a `NumOps` sub-trait
+  (https://github.com/robertknight/rten/pull/1349)
+
+### rten-serialize
+
+- Added new crate for tensor (de-)serialization, supporting the `.npy`, `.npz`
+  and Safetensors formats, including tensors with mixed data types (thanks
+  @xd009642) (https://github.com/robertknight/rten/pull/1285,
+  https://github.com/robertknight/rten/pull/1311,
+  https://github.com/robertknight/rten/pull/1312,
+  https://github.com/robertknight/rten/pull/1314)
+
+### rten-cli
+
+- Generate the `use_cache_branch` input using the shape declared by the model
+  (https://github.com/robertknight/rten/pull/1379)
+
+- Added a `--range` option to set the range of randomly generated values for a
+  named input (https://github.com/robertknight/rten/pull/1376,
+  https://github.com/robertknight/rten/pull/1395)
+
+- Avoid copying inputs on each iteration of the timing loop, which distorted
+  timings for models with large inputs
+  (https://github.com/robertknight/rten/pull/1327)
+
+### rten-examples
+
+- Updated the JS / WASM usage guide and example
+  (https://github.com/robertknight/rten/pull/1172)
+
+## [0.24.0] - 2025-12-23
+
+**Highlights:**
+
+- Add support for the non-standard `MatMulNBits` operator which is
+  used in LLM models for 4-bit block quantization. This is demonstrated via a new
+  Llama 3 chat example. This supports using int8 or fp32 compute internally.
+  The int8 mode is much faster, but is currently only optimized for vector-matrix
+  products. See [this issue](https://github.com/robertknight/rten/issues/1164).
+
+- New APIs for operator input and output types (`Value`, `ValueView` etc.) make it
+  possible to use rten in applications without a direct dependency on
+  `rten-tensor`. Instead inputs can be constructed directly from shape and data
+  vectors and outputs can be directly converted into shape and data vectors.
+
+- Added a new experimental shape and type inference system which enables more
+  complex graph optimizations. This is used in the Llama 3 chat example to
+  enable new attention-related optimizations, improving performance as the
+  context size grows. In this release, shape inference is opt-in via
+  `ModelOptions`. This will be enabled by default when it is more mature.
+
+- Added graph optimization diagnostics, initially enabled via an
+  `RTEN_OPTIMIZER_DEBUG` environment variable which can be set to `warn` or
+  `info` (more verbose)
+
+**Breaking changes:**
+
+- Several enums and structs have been marked as non-exhaustive to enable evolving
+  the API without breaking changes in future. This includes `LoadError` and
+  `RunOptions`.
+
+- The `TensorBase::to_contiguous` method now returns a wrapper type which
+  guarantees its input is contiguous. Calling `data` on this type now returns
+  a `[T]` instead of `Option<[T]>`, so no `unwrap` is required.
+
+### rten
+
+- Fixed panic in `Reshape` operator when target shape is invalid for input shape
+  and the target shape product is an exact multiple of the input length
+  (https://github.com/robertknight/rten/pull/1161).
+
+- Added a peak activation memory usage statistic to profiler output
+  (https://github.com/robertknight/rten/pull/1158)
+
+- Fixed reading of value metadata for input and output dimensions without a size
+  or name (https://github.com/robertknight/rten/pull/1154)
+
+- Support `auto_pad` attribute for convolution and pooling operators in ONNX
+  loader (https://github.com/robertknight/rten/pull/1153)
+
+- Added graph optimizer diagnostics system to enable inspecting which
+  optimizations were applied and why certain optimizations may have been
+  skipped (https://github.com/robertknight/rten/pull/1139,
+  https://github.com/robertknight/rten/pull/1141,
+  https://github.com/robertknight/rten/pull/1142)
+
+- Changed model input/output metadata type to be able to
+  represent non-tensor types (eg. sequences) (https://github.com/robertknight/rten/pull/1134)
+
+- Added built-in shape and type inference system that enables more complex
+  graph optimizations (https://github.com/robertknight/rten/pull/1124 and many
+  others)
+
+- Fixed confusing error message when an ONNX model uses an unsupported operator
+  (https://github.com/robertknight/rten/pull/1115)
+
+- Support `Pow` operator with i32/i64 base and exponent
+  (https://github.com/robertknight/rten/pull/1105)
+
+- Added fusions for common subgraphs patterns in attention implementations such
+  as `torch.repeat_interleave`, "safe" softmax and Grouped-Query Attention (GQA)
+  (https://github.com/robertknight/rten/pull/1103,
+  https://github.com/robertknight/rten/pull/1104,
+  https://github.com/robertknight/rten/pull/1107)
+
+- Fixed panic in ConstantOfShape op if input shape is invalid
+  (https://github.com/robertknight/rten/pull/1093)
+
+- Support providing external data when loading ONNX models from in-memory
+  buffers (https://github.com/robertknight/rten/pull/1081)
+
+- Support loading i64 and bool tensors from external data in ONNX loader
+  (https://github.com/robertknight/rten/pull/1080)
+
+- Added `Debug` impls for `Model` and other types, making it easier to impl
+  `Debug` for structs containing fields of these types in downstream
+  applications (https://github.com/robertknight/rten/pull/1073,
+  https://github.com/robertknight/rten/pull/1075)
+
+- Added `GlobalMaxPool` operator and improved performance of `GlobalAveragePool`
+  (https://github.com/robertknight/rten/pull/1072)
+
+- Support `noop_with_empty_axes` attribute for reduction operators
+  (https://github.com/robertknight/rten/pull/1057)
+
+- Fixed loading of ONNX operators when the `domain` field is present but
+  empty. This was encountered with models trained using JAX
+  (https://github.com/robertknight/rten/pull/1056)
+
+- Fixed handling of missing `dilations` attribute for `Conv` operator in ONNX
+  loader (https://github.com/robertknight/rten/pull/1047)
+
+- Improved performance of int8 vector-matrix products under AVX512 by using VNNI
+  if available (https://github.com/robertknight/rten/pull/1046)
+
+- Check operator input count against maximum supported when loading ONNX
+  operators. This helps to avoid silently producing incorrect outputs if
+  an operators has more inputs than expected
+  (https://github.com/robertknight/rten/pull/1039)
+
+- Added support for quantizing models using the newer "nbits" quantizer in
+  the `ort-quantize.py` script. This quantizes models to 4-bit weights using
+  `MatMulNBits` (https://github.com/robertknight/rten/pull/1035,
+  https://github.com/robertknight/rten/pull/1037). It enables quantizing LLM
+  models with sufficient quantization granularity to retain good accuracy.
+
+- Added support for the non-standard `MatMulNBits` operator which is used in
+  many published LLM models for matrix multiplication with 4-bit block-quantized
+  weights (https://github.com/robertknight/rten/pull/1031)
+
+- Check both the domain and op_type when deserializing ONNX operators.
+  This avoids incorrect handling of `com.microsoft` operators which have the
+  same name as a built-in operator
+  (https://github.com/robertknight/rten/pull/1029)
+
+- Changed `Value::dtype` to return both the element data type (f32, i32 etc.)
+  and the collection type (tensor, sequence)
+  (https://github.com/robertknight/rten/pull/1028).
+
+- Fixed warnings about unused variants when `rten_format` feature is disabled
+  (https://github.com/robertknight/rten/pull/1027)
+
+- Added new APIs to simplify creating and extracting data from `Value`s and
+  `ValueView`s: `Value::from_shape`, `ValueView::from_shape`,
+  `Value::into_shape_vec`. These changes make it possible for downstream
+  projects to use rten without a dependency on the `rten-tensor` crate.
+  https://github.com/robertknight/rten/pull/1025
+
+- Fixed build when `mmap` feature is enabled and either the `rten_format` or
+  `onnx_format` features are disabled
+  (https://github.com/robertknight/rten/pull/1024)
+
+- Renamed the error type used when converting values to tensors from `CastError`
+  to `TryFromValueError` and added it to the public API
+  (https://github.com/robertknight/rten/pull/1023)
+
+- Removed the `model_builder` crate feature and associated API
+  (https://github.com/robertknight/rten/pull/1020). This was previously used
+  to help with writing tests in the Ocrs project. That project has now been
+  changed to use a mock implementation of `Model` for unit tests.
+
+- Improve error when attempting to load an ONNX model where an initializer
+  has an unsupported data type (https://github.com/robertknight/rten/pull/1016)
+
+- Made `DataType`, `Value` and `ValueView` non-exhaustive enums
+  (https://github.com/robertknight/rten/pull/1015)
+
+- Made `RunOptions` a non-exhaustive struct so that adding new fields is no
+  longer a breaking change. Instead it can be configured with a builder-like
+  API (https://github.com/robertknight/rten/pull/1013)
+
+- Changed API for loading models with a subset of operators enabled to make
+  it easier to use (https://github.com/robertknight/rten/pull/1011). A related
+  change is that the internal structs for each operator are no longer exposed
+  in the public API (https://github.com/robertknight/rten/pull/1018).
+
+- Revised error types for model load and inference errors to be more like
+  `std::io::Error`, helping to avoid breaking changes in future
+  (https://github.com/robertknight/rten/pull/1007,
+  https://github.com/robertknight/rten/pull/1008).
+
+- Made `flatbuffers` an optional dependency, used when `rten_format` feature
+  ise enabled (https://github.com/robertknight/rten/pull/1006)
+
+### rten-cli
+
+- Group inputs and outputs whose names are the same except for a single number.
+  This is common in transformer models which have many KV-cache inputs and
+  outputs, with the same name except for a layer number
+  (https://github.com/robertknight/rten/pull/1055)
+
+- Support input and dimension names with periods in the `--size` flag. Such
+  names can be specified by quoting them. See
+  https://github.com/robertknight/rten/pull/1048.
+
+### rten-examples
+
+- Support SmolLM v3 in the Qwen chat example (https://github.com/robertknight/rten/pull/1086)
+
+- Added Llama 3 chat example (https://github.com/robertknight/rten/pull/1042).
+  This is a demonstration of the newly-added support for 4-bit quantized
+  weights.
+
+### rten-generate
+
+- Added `Generator::process_prompt` API to enable processing the current prompt
+  without generating the logits output or sampling a token
+  (https://github.com/robertknight/rten/pull/1165). This can speed up processing
+  of long prompts.
+
+- Added `Generator::clear_prompt` API to enable resetting the prompt used for
+  the next generation (https://github.com/robertknight/rten/pull/1159)
+
+- Improved efficiency of top-K sampling, assuming K is small relative to
+  vocabulary size (https://github.com/robertknight/rten/pull/1094)
+
+- Redesigned the logit filtering and sampling APIs to enable composing filters
+  (eg. top-K followed by top-P) (https://github.com/robertknight/rten/pull/1084)
+
+- Changed profiler to return options for duration metrics, which may be `None`
+  if called before any tokens have been generated
+  (https://github.com/robertknight/rten/pull/1045). Previously these would
+  return `NaN`s.
+
+- Added support for Top-P sampling (https://github.com/robertknight/rten/pull/1044)
+
+### rten-simd
+
+- Improved error in `load` and `load_many` methods if slice length is shorter
+  than SIMD vector lane count (https://github.com/robertknight/rten/pull/1070)
+
+- Fixed warnings about obsolete `unsafe` blocks when building for wasm32
+  (https://github.com/robertknight/rten/pull/1053)
+
+- Added `ToFloat` trait for int-to-float conversion for i32 vectors
+  (https://github.com/robertknight/rten/pull/1052)
+
+- Implemented `Interleave` trait for u8 vectors (https://github.com/robertknight/rten/pull/1051)
+
+- Added `shift_right` for integer types. This is an arithmetic rather than
+  logical shift (https://github.com/robertknight/rten/pull/1049)
+
+### rten-tensor
+
+- Improved panic message in `TensorBase::from_data` if length is incorrect for
+  shape (https://github.com/robertknight/rten/pull/1071)
+
+- Removed deprecated `tensor` and `ndtensor` macros
+  (https://github.com/robertknight/rten/pull/1064)
+
+- Streamlined API of rten-tensor root module by moving some lesser-used types
+  and functions to submodules (https://github.com/robertknight/rten/pull/1063)
+
+- Added experimental `Contiguous` API which is a tensor wrapper that guarantees
+  the wrapped tensor has a contiguous layout (https://github.com/robertknight/rten/pull/1058).
+
+### rten-text
+
+- Optimized loading of BPE tokenizers from tokenizer.json files
+  (https://github.com/robertknight/rten/pull/1099,
+  https://github.com/robertknight/rten/pull/1100)
+
+- Depend on `serde_derive` directly instead of via Serde crate feature. This
+  can enable better build parallelism (https://github.com/robertknight/rten/pull/1095)
+
+- Added support for `ignore_merges` configuration setting for BPE tokenizers
+  (https://github.com/robertknight/rten/pull/1043)
+
+- Changed the BPE tokenizer implementation's representation of the merge list
+  to fix an issue encountered with the Llama 3 tokenizer
+  (https://github.com/robertknight/rten/pull/1041)
+
+## [0.23.0] - 2025-10-16
+
+This release adds support for loading models in ONNX format directly, without
+requiring conversion to `.rten` format first. This includes ONNX models with
+external data. ONNX format models are more convenient to use as there is no
+conversion step and more tools support this format, but they can be slower to load.
+See the [model format documentation](docs/model-formats.md) for a comparison.
+
+Support for both formats is enabled by default. This can be controlled using
+the `onnx_format` and `rten_format` crate features. Disabling formats that you
+don't need can improve build times.
+
+### rten
+
+- Partially support models with f64 tensors by casting to f32 (https://github.com/robertknight/rten/pull/971)
+
+- Add support for loading ONNX models directly (https://github.com/robertknight/rten/pull/958
+  and many others)
+
+- Improve constant propagation into sub-graphs by using
+  reference counting for all graph constants (https://github.com/robertknight/rten/pull/952).
+  This enables more effective optimization of some models.
+
+- Add `onnx_format` and `rten_format` crate features to control which model
+  formats are supported (https://github.com/robertknight/rten/pull/1004). Also
+  add a section to the crate documentation root which describes all crate
+  features.
+
+### rten-cli
+
+- Ported argument parsing from lexopt to argh. This improves help output.
+  As a consequence single-letter flags can no longer be combined into a single
+  argument. To get detailed profiling for example, use `-p -p` instead of `-pp`
+  (https://github.com/robertknight/rten/pull/986)
+
+- Add support for loading ONNX models and mention ONNX support in help output
+
+### rten-examples
+
+- Ported argument parsing from lexopt to argh. This improves help output and
+  simplifies the code (https://github.com/robertknight/rten/pull/985)
+
+- Update example instructions to use ONNX format models. This simplifies
+  getting started with RTen (https://github.com/robertknight/rten/pull/968
+  and many others)
+
+### rten-tensor
+
+- Add support for reference-counted tensors and cheap conversion of owned
+  tensors into shared tensors (https://github.com/robertknight/rten/pull/949,
+  https://github.com/robertknight/rten/pull/951)
+
+## [0.22.1] - 2025-09-18
+
+### rten
+
+- Declare `rust-version` in Cargo.toml for rten, rten-simd. Build with the
+  MSRV version in CI (https://github.com/robertknight/rten/pull/943)
+
+- Support i32 input tensors in `DequantizeLinear` (https://github.com/robertknight/rten/pull/941)
+
+- Fixed missing shapes for in-placed inputs in timing reports (https://github.com/robertknight/rten/pull/940)
+
+- Add operator type filter in timing report (https://github.com/robertknight/rten/pull/939)
+
+- Make BatchNormalization, InstanceNormalization parallel over batch dimension
+  (https://github.com/robertknight/rten/pull/937)
+
+- Avoid storing small buffers in buffer pool, as this can degrade allocation
+  performance (https://github.com/robertknight/rten/pull/936)
+
+- Optimize `RandomNormal`, `RandomNormalLike` by using approximate algorithm
+  (https://github.com/robertknight/rten/pull/935)
+
+## [0.22.0] - 2025-09-11
+
+### Highlights
+
+- This release adds support for the `Loop` operator, sequence types and sequence
+  operations, as well as `GridSample`, `PRelu` and `STFT`
+- Performance of several `Reduce*` ops, `Sin`, `Cos`, `Elu`, `LeakyRelu` and
+  `ScatterElements` has been improved.
+- New examples have been added for Kokoro text-to-speech and ByT5
+  text-to-phoneme. Image recognition examples have been updated to support
+  RT-DETR for object detection.
+- The CLI tool can now check inference results against a reference implementation.
+
+### rten
+
+- Fixed incorrect reporting of operator input shapes during verbose logging
+  when an operator runs in-place (https://github.com/robertknight/rten/pull/925)
+
+- Put the undocumented `ModelBuilder` API behind a `model_builder` crate feature
+  to avoid compiling it for consumers that won't need this (https://github.com/robertknight/rten/pull/923)
+
+- Moved FlatBuffers schema for .rten models into a separate crate to improve
+  compile times (https://github.com/robertknight/rten/pull/924)
+
+- Implement STFT operator using rustfft as the backend (https://github.com/robertknight/rten/pull/921)
+
+- Improve errors when running a model fails because it uses operators that
+  require non-enabled crate features (https://github.com/robertknight/rten/pull/920)
+
+- Eliminate `Identity` operations during optimization (https://github.com/robertknight/rten/pull/918,
+  https://github.com/robertknight/rten/pull/927)
+
+- Support 1D-3D inputs in `Resize` op, with up to two resized dimensions (https://github.com/robertknight/rten/pull/917)
+
+- Eliminate no-op `Cast` operations during optimization (https://github.com/robertknight/rten/pull/914)
+
+- Improved performance of `ScatterElements` (https://github.com/robertknight/rten/pull/912)
+
+- Vectorized `Elu` operator (https://github.com/robertknight/rten/pull/909)
+
+- Fixed slow copying of tensor slices when last dimension was contiguous but
+  very small (https://github.com/robertknight/rten/pull/905)
+
+- Vectorized `LeakyRelu` operator (https://github.com/robertknight/rten/pull/904)
+
+- Report error instead of crashing with stack overflow when loading a model
+  if the graph has cycles (https://github.com/robertknight/rten/pull/899)
+
+- Revised unary, binary and control-flow operator implementations to reduce
+  code size (https://github.com/robertknight/rten/pull/896,
+  https://github.com/robertknight/rten/pull/897,
+  https://github.com/robertknight/rten/pull/898)
+
+- Revised unary operator kernels to decouple paralleism and vectorization.
+  This enabled parallelizing several unary operators that do not yet have
+  vectorized implementations (https://github.com/robertknight/rten/pull/896)
+
+- Implemented `PRelu` operator (https://github.com/robertknight/rten/pull/888)
+
+- Enable running `Cast` operations in-place when input and output dtypes have
+  same element size (https://github.com/robertknight/rten/pull/887)
+
+- Optimized `Pad` operator where padding value is zero (https://github.com/robertknight/rten/pull/880)
+
+- Slightly optimized `SiLU` operator (https://github.com/robertknight/rten/pull/875)
+
+- Vectorized `ReduceSum` and `ReduceSumSquare` operators for float inputs
+  (https://github.com/robertknight/rten/pull/873)
+
+- Optimized OneHot operator https://github.com/robertknight/rten/pull/872)
+
+- Fixed a bug where OneHot operator output was inverted (https://github.com/robertknight/rten/pull/871)
+
+- Vectorized `ReduceMin` and `ReduceMax` operators for float inputs (https://github.com/robertknight/rten/pull/870)
+
+- Support `ceil_mode` attribute for AveragePool, MaxPool (https://github.com/robertknight/rten/pull/868)
+
+- Implemented `GridSample` operator (https://github.com/robertknight/rten/pull/867,
+  https://github.com/robertknight/rten/pull/903)
+
+- Made errors from operators in subgraphs easier to trace by including
+  details of parent nodes in error messages (https://github.com/robertknight/rten/pull/866)
+
+- Implemented sequence operators: `SequenceAt`, `SequenceEmpty`,
+  `SequenceInsert`, `ConcatFromSequence`, `SplitToSequence`, `SequenceErase`,
+  `SequenceLength`, `SequenceConstruct`
+  (https://github.com/robertknight/rten/pull/858,
+  https://github.com/robertknight/rten/pull/859,
+  https://github.com/robertknight/rten/pull/860,
+  https://github.com/robertknight/rten/pull/863,
+  https://github.com/robertknight/rten/pull/864,
+  https://github.com/robertknight/rten/pull/865)
+
+- Support sequence types as operator inputs and outputs
+  (https://github.com/robertknight/rten/pull/856, https://github.com/robertknight/rten/pull/857)
+
+- Support `Loop` operator (https://github.com/robertknight/rten/pull/855)
+
+- Support `output_padding` attribute for ConvTranspose (https://github.com/robertknight/rten/pull/853)
+
+### rten-cli
+
+- Added CLI options `--inputs`, `--check-outputs` which enables checking RTen's
+  output for a model against outputs from a reference implementation (eg. from
+  PyTorch or ONNX Runtime). These use Safetensors as the format for passing
+  tensors.
+
+### rten-convert
+
+- Gracefully handle invalid negative sizes in value shape metadata (https://github.com/robertknight/rten/pull/930)
+
+- Handle unused optional outputs better (https://github.com/robertknight/rten/pull/908)
+
+- Slightly improve Whisper output by fixing correnctness issues in STFT and
+  Hann window implementations (https://github.com/robertknight/rten/pull/919,
+  https://github.com/robertknight/rten/pull/926)
+
+- Support conversion of ONNX attributes with `floats` type (https://github.com/robertknight/rten/pull/906)
+
+- Fixed a bug in converting captured values in subgraphs in some cases
+  (https://github.com/robertknight/rten/pull/902)
+
+### rten-examples
+
+- Added text-to-phoneme example using a ByT5 model (https://github.com/robertknight/rten/pull/931,
+  https://github.com/robertknight/rten/pull/932).
+  This can be used to generate inputs for the Piper and Kokoro examples.
+
+- Added Kokoro TTS example (https://github.com/robertknight/rten/pull/928)
+
+- Updated ImageNet example to support more models (https://github.com/robertknight/rten/pull/907)
+
+- Simplified using DETR examples with DETR variants and made it work with
+  RT-DETR and RT-DETR v2 (https://github.com/robertknight/rten/pull/885)
+
+### rten-tensor
+
+- Reduce bounds checks when indexing tensors with "trusted" layout types
+  (https://github.com/robertknight/rten/pull/913)
+
+- Fix an issue where `Tensor::data` and related methods could return a slice
+  that was longer than it should have been (https://github.com/robertknight/rten/pull/861).
+
+  These methods will now always return a slice whose length is equal to the
+  layout's `min_data_len`.
+
+### rten-simd
+
+- Added [`MaskOps::{any, all}`](https://github.com/robertknight/rten/pull/895)
+  for testing whether any or all lanes of a mask are set.
+
+- Added trait for getting the associated SIMD type of an `Isa` that corresponds
+  to a given element type (https://github.com/robertknight/rten/pull/890)
+
+- Revised APIs for working with mask types and operations (https://github.com/robertknight/rten/pull/874).
+  All SIMD vectors with a given element size in an `Isa` will now use the same
+  mask type.
+
+## [0.21.1] - 2025-08-08
+
+- Fix a bug where model converter would produce an empty model if the input is
+  larger than 2GB in size and shape inference is enabled (https://github.com/robertknight/rten/pull/852)
+
+## [0.21.0] - 2025-08-05
+
+This release improves int8 matrix multiplication performance for all targets,
+but especially low-end Arm CPUs without dotprod support and high-end Arm CPUs
+with i8mm support. It also adds support for `IsInf` and `IsNaN` operators.
+
+Two new internal crates have been added, `rten-base` and `rten-gemm`.
+
+### All crates
+
+- Fixed `mismatched_lifetime_syntaxes` warnings that appeared when compiling
+  with nightly Rust (https://github.com/robertknight/rten/pull/814)
+
+### rten-base
+
+- Created a new `rten-base` crate at the root of the dependency tree that
+  contains various shared utilities.
+
+### rten-convert
+
+- Run shape inference as part of ONNX model conversion. This enables additional
+  graph optimizations (https://github.com/robertknight/rten/pull/820)
+
+- Don't warn about models which use `-i64::MAX` to represent `-Infinity` when
+  slicing tensors (https://github.com/robertknight/rten/pull/821)
+
+### rten-examples
+
+- Report time spent in encoder, prompt processing and decoder in Whisper
+  example (https://github.com/robertknight/rten/pull/842)
+
+### rten-gemm
+
+- Improve int8 GEMM performance by increasing depth blocking size
+  (https://github.com/robertknight/rten/pull/840)
+
+- Added UMLAL-based kernel for older/low-end Arm CPUs. This gives a ~50%
+  improvement on eg. Cortex A53 compared to the previous kernel
+  (https://github.com/robertknight/rten/pull/832)
+
+- Added i8mm kernel for newer/high-end Arm CPUs. This gives a ~1.6x
+  performance improvement on eg. Graviton 4 compared to the previous kernel
+  (https://github.com/robertknight/rten/pull/824, https://github.com/robertknight/rten/pull/829)
+
+- Extracted f32 and int8 matrix multiplication kernels into a new `rten-gemm`
+  crate.
+
+### rten
+
+- Impl `Default` and `Clone` for `ModelOptions` (https://github.com/robertknight/rten/pull/844)
+
+- Support IsInf and IsNaN operators (https://github.com/robertknight/rten/pull/837)
+
+- Fixed WASM relaxed-simd build (https://github.com/robertknight/rten/pull/834)
+
+- Optimized handling of zero points in int8 matmul (https://github.com/robertknight/rten/pull/812)
+
+- Improved int8 LHS packing efficiency (https://github.com/robertknight/rten/pull/809)
+
+- Added graph optimization that can determine when `Slice(Shape(X))` operations
+  produce a constant even if some dimensions of X are dynamic. This enables
+  better fusion for scaled-dot-product operations in some models
+  (https://github.com/robertknight/rten/pull/805).
+
+- Parallelize weight prepacking (https://github.com/robertknight/rten/pull/802)
+
+- Add graph optimization to eliminate common identity operations (eg. `Mul(X, 1)`)
+  (https://github.com/robertknight/rten/pull/798, https://github.com/robertknight/rten/pull/799)
+
+- Optimized Trilu operator (https://github.com/robertknight/rten/pull/797)
+
+- Support fusing MatMulInteger + Cast + Mul subgraphs produced by dynamic
+  quantization (https://github.com/robertknight/rten/pull/795)
+
+### rten-cli
+
+- Support setting `--num-iters=0`. This loads the model, runs optimization and
+  prints metadata, but skips inference (https://github.com/robertknight/rten/pull/801)
+
+## [0.20.0] - 2025-07-06
+
+### rten-examples
+
+- Support stereo .wav files in Whisper example (https://github.com/robertknight/rten/pull/785)
+
+### rten-generate
+
+- Support pre-allocation of KV-cache capacity (https://github.com/robertknight/rten/pull/786)
+
+### rten-tensor
+
+- Fixed invalid use of `memcpy` on non-`Copy` types when copying tensors with
+  contiguous last axis (https://github.com/robertknight/rten/pull/773)
+
+- Make `fold` and fold-based operations on iterators more efficient
+  (https://github.com/robertknight/rten/pull/772)
+
+- Removed inherent methods of layouts which duplicated trait methods
+  (https://github.com/robertknight/rten/pull/771)
+
+- Support tensors with borrowed layouts (https://github.com/robertknight/rten/pull/770)
+
+### rten
+
+- Support fusing Add + Softmax where `axis` attribute is positive
+  (https://github.com/robertknight/rten/pull/794)
+
+- Support fusing LayerNormalization and RmsNormalization ops where `ReduceMean`
+  op has `axes` specified via input rather than attribute and/or a positive
+  value (https://github.com/robertknight/rten/pull/793)
+
+- Improve buffer re-use if `Slice` op falls back to non in-place operation
+  (https://github.com/robertknight/rten/pull/789)
+
+- Added `Reciprocal` op fusion (https://github.com/robertknight/rten/pull/790)
+
+- Allow ops with fused input transposes to run in place. This fixes a regression
+  in performance for the Whisper example (https://github.com/robertknight/rten/pull/787)
+
+- Make TensorPool usable across threads (https://github.com/robertknight/rten/pull/782)
+
+- Parallelize QuantizeLinear and DynamicQuantizeLinear (https://github.com/robertknight/rten/pull/780)
+
+- Fixed issue where operator fusions were not applied correctly for subgraphs
+  (https://github.com/robertknight/rten/pull/779)
+
+- Fixed timings for operators in subgraphs being counted multiple times (https://github.com/robertknight/rten/pull/778)
+
+- Parallelize BatchNormalization, InstanceNormalization (https://github.com/robertknight/rten/pull/777)
+
+- Fixed depthwise ConvInteger (https://github.com/robertknight/rten/pull/776)
+
+- Optimize ConvTranspose via parallelized and more efficient col2im step
+  (https://github.com/robertknight/rten/pull/775)
+
+- Prevent fusion of subgraphs with shared nodes (https://github.com/robertknight/rten/pull/768)
+
+- Handle non-contiguous mask tensor more efficiently in fused Add + Softmax
+  (https://github.com/robertknight/rten/pull/766)
+
+## [0.19.0] - 2025-06-16
+
+**Breaking changes:**
+
+The `Input`, `Output` and `InputOrOutput` types have been renamed to
+`ValueView`, `Value` and `ValueOrView` respectively. This reflects the fact these
+types are owned or borrowed values of runtime-determined type, rather than just
+model inputs or outputs.
+
+### rten
+
+- Improved `Gelu` performance by using native `abs(x)` instruction
+  (https://github.com/robertknight/rten/pull/755)
+
+- Added `Add -> Softmax` fusion (https://github.com/robertknight/rten/pull/754)
+
+- Enabled `Transpose -> {Split, Slice, Concat, Expand}` fusion
+  (https://github.com/robertknight/rten/pull/747)
+
+- Fixed panic during graph optimization if an operator takes the same input
+  value in multiple positions (https://github.com/robertknight/rten/pull/746)
+
+- Fixed warning about `stdarch_x86_avx512` feature opt-in not being required on
+  latest Rust nightly builds (https://github.com/robertknight/rten/pull/744)
+
+- Implemented `EyeLike` operator (https://github.com/robertknight/rten/pull/741)
+
+- Improved formatting of tensor types and shapes in errors (https://github.com/robertknight/rten/pull/735)
+
+- Fixed unnecessary large deallocation in `Expand` operator (https://github.com/robertknight/rten/pull/734)
+
+- Added `Tile` fast path for when innermost dimensions are not repeated
+  (https://github.com/robertknight/rten/pull/733)
+
+- Renamed `Input` and `Output` types (https://github.com/robertknight/rten/pull/731).
+  The previous names are retained as deprecated aliases (https://github.com/robertknight/rten/pull/752).
+
+- Improved error messages when operator inputs are invalid due to a rank
+  mismatch (https://github.com/robertknight/rten/pull/730)
+
+- Reduced graph optimization time by reducing number of graph traversals
+  (https://github.com/robertknight/rten/pull/726)
+
+- Support `Pow` operator with different base and exponent types
+  (https://github.com/robertknight/rten/pull/724)
+
+- Added information about operator input shapes and data types to operator
+  errors (https://github.com/robertknight/rten/pull/721,
+  https://github.com/robertknight/rten/pull/723)
+
+- Combined profiling outputs for main graph and subgraphs (https://github.com/robertknight/rten/pull/718)
+
+- Added support for `approximate="tanh"` attribute in `Gelu` operator and
+  support fusing approximate Gelu subgraphs (https://github.com/robertknight/rten/pull/717)
+
+- Improved efficiency of applying unary op fusions to graphs
+  (https://github.com/robertknight/rten/pull/716)
+
+- Added API and CLI options to set number of threads used for inference
+  (https://github.com/robertknight/rten/pull/712)
+
+- Updated AVX-512 support for latest Rust nightly (https://github.com/robertknight/rten/pull/711)
+
+- Fixed optimizer issue where optimized graph could run the same operator
+  multiple times if intermediate values in fused subgraphs were used outside
+  the subgraph (https://github.com/robertknight/rten/pull/709)
+
+- Fixed performance regression in int8 model inference on Arm under Rust v1.87+
+  (https://github.com/robertknight/rten/pull/706)
+
+- Fixed issue where performance of vectorized unary operators could significantly
+  degrade in certain contexts (https://github.com/robertknight/rten/pull/705)
+
+- Removed the `{operation}_in_place` functions for most unary operators
+  (https://github.com/robertknight/rten/pull/703)
+
+- Parallelized `LayerNormalization`, `RmsNormalization` operators
+  (https://github.com/robertknight/rten/pull/698)
+
+- Support fusing `Transpose` + `MatMul` subgraphs where both inputs are
+  transposed (https://github.com/robertknight/rten/pull/696)
+
+- Support `Split` v13 operators that don't specify the expected number of
+  outputs (https://github.com/robertknight/rten/pull/692)
+
+- Improved execution planning error messages, e.g. when there is no way to
+  compute the requested outputs given the inputs (https://github.com/robertknight/rten/pull/688,
+  https://github.com/robertknight/rten/pull/690)
+
+- Improved input validation in `Slice` op (https://github.com/robertknight/rten/pull/687)
+
+- Fixed issue where fast paths were not always used in `Slice` op
+  (https://github.com/robertknight/rten/pull/686)
+
+### rten-cli
+
+- Fixed issue where run timings were rounded down to nearest millisecond
+  (https://github.com/robertknight/rten/pull/756)
+
+- Output detailed profiling information if `-p`/`--profile` flag is repeated
+  (https://github.com/robertknight/rten/pull/753)
+
+- Improved formatting of errors in CLI (https://github.com/robertknight/rten/pull/729)
+
+### rten-generate
+
+- Added `Metrics::token_count` API which provides a convenient way to get the
+  total number of generated tokens (https://github.com/robertknight/rten/pull/699)
+
+### rten-tensor
+
+- Improved `Iterator::nth` worst-case performance for several iterators
+  (https://github.com/robertknight/rten/pull/750)
+
+- Optimized `TensorBase::inner_iter` and related iterators (https://github.com/robertknight/rten/pull/748)
+
+- Added `DoubleEndedIterator` support to several iterators (https://github.com/robertknight/rten/pull/720,
+  https://github.com/robertknight/rten/pull/749)
+
+- Optimized tensor iteration for non-contiguous tensors (https://github.com/robertknight/rten/pull/713,
+  https://github.com/robertknight/rten/pull/757)
+
+## [0.18.0] - 2025-05-08
+
+### rten
+
+- Optimized `Softmax`, `Erf` and `Gelu` using reduced-range exp function
+  (https://github.com/robertknight/rten/pull/682,
+  https://github.com/robertknight/rten/pull/684)
+
+- Optimized copying of transposed and partly-contiguous tensors
+  (https://github.com/robertknight/rten/pull/681)
+
+- Optimized int8 matrix multiplication on Arm using indexed UDOT instructions
+  (https://github.com/robertknight/rten/pull/680)
+
+- Optimized normalization operators with fast paths in kernels
+  (https://github.com/robertknight/rten/pull/677, https://github.com/robertknight/rten/pull/678)
+
+- Optimized min/max reductions in `DynamicQuantizeLinear` (https://github.com/robertknight/rten/pull/676)
+
+- Fixed deserialization of `CastLike` operators (https://github.com/robertknight/rten/pull/673)
+
+- Improved model load errors by adding node names and more attribute details
+  (https://github.com/robertknight/rten/pull/672, https://github.com/robertknight/rten/pull/674)
+
+- Optimized reductions in `LayerNormalization` and `Softmax` operators by
+  improving instruction level parallelism (https://github.com/robertknight/rten/pull/671,
+  https://github.com/robertknight/rten/pull/683)
+
+- Fixed "instruction requires: dotprod" error in Linux build on Arm and added
+  Arm Linux CI (https://github.com/robertknight/rten/pull/670,
+  https://github.com/robertknight/rten/pull/669)
+
+- Optimized f32 matrix multiplication on Arm by adjusting tile size and using
+  indexed FMLA instructions (https://github.com/robertknight/rten/pull/666,
+  https://github.com/robertknight/rten/pull/679)
+
+- Optimized `AveragePool` and `MaxPool` by using separate loops for padding and
+  non-padding regions of input (https://github.com/robertknight/rten/pull/665)
+
+- Support 1D and 2D inputs in `BatchNormalization` (https://github.com/robertknight/rten/pull/663)
+
+- Optimized `BatchNormalization` and `InstanceNormalization` by removing tensor
+  slicing overhead (https://github.com/robertknight/rten/pull/661,
+  https://github.com/robertknight/rten/pull/662)
+
+- Fixed error when reducing multiple axes if reduced chunks are not contiguous
+  (https://github.com/robertknight/rten/pull/660)
+
+### rten-generate
+
+- Improved performance of ArgMax sampler (https://github.com/robertknight/rten/pull/667)
+
+## [0.17.0] - 2025-04-09
+
+This release is largely an internal refactoring to reduce the amount of unsafe
+code in SIMD vectorized kernels and prepare for supporting more data types in
+future. This has been achieved by creating a new portable SIMD API in the
+rten-simd crate, which uses witness types to enable writing vectorized
+operations with safe code. See the rten-simd crate docs for more details.
+
+### rten
+
+- Support `num_outputs` attribute in `Split` operator (https://github.com/robertknight/rten/pull/658)
+
+- Support `Dropout` operator (inference mode only) (https://github.com/robertknight/rten/pull/652)
+
+- Added option to use TorchDynamo ONNX export in `tools/export-timm-model.py`
+  script (https://github.com/robertknight/rten/pull/651)
+
+- Support `value_{float, floats, int, ints}` attributes in
+  `Constant` operator (https://github.com/robertknight/rten/pull/649)
+
+- Support `start` and `end` attributes for `Shape` operator (https://github.com/robertknight/rten/pull/648)
+
+- Support `pytorch_half_pixel` value for `coordinate_transform_mode` in `Resize`
+  operator (https://github.com/robertknight/rten/pull/647,
+  https://github.com/robertknight/rten/pull/654)
+
+- Support `CastLike` operator (https://github.com/robertknight/rten/pull/646)
+
+- Fixed broken links to model files in ImageNet example (https://github.com/robertknight/rten/pull/603)
+
+- Fixed broken `ArgMin` operator (https://github.com/robertknight/rten/pull/592)
+
+- Support vector inputs in `MatMulInteger` (https://github.com/robertknight/rten/pull/589)
+
+- Reduced use of unsafe code in vectorized SIMD kernels. See tracking issue
+  in https://github.com/robertknight/rten/issues/549.
+
+### rten-tensor
+
+- Add `Tensor::{slice_axis, slice_axis_mut}` methods (https://github.com/robertknight/rten/pull/657)
+
+- Export `AssumeInit` utility trait (https://github.com/robertknight/rten/pull/598)
+
+- Add `CowTensor` and `CowNdTensor` alias for maybe-owned tensors (https://github.com/robertknight/rten/pull/568)
+
+- Make `Tensor::broadcast` panic error message more helpful (https://github.com/robertknight/rten/pull/588)
+
+- Provide more detailed messages in debug builds if argument to
+  `Tensor::{size, stride}` is invalid (https://github.com/robertknight/rten/pull/565)
+
+### rten-simd
+
+The APIs for this internal crate have changed completely to support defining
+operations without `unsafe`.
+
+### rten-vecmath
+
+Operations in this internal crate were changed to use the new safe SIMD API in
+rten-simd.
+
+## [0.16.0] - 2025-02-08
+
+This release adds support for running models that have been quantized to int8,
+taking advantage of dot product CPU instructions if available.
+A guide to quantization support in RTen has been added in `docs/quantization.md`.
+The `tools/ort-quantize.py` script in the rten repository has been updated to
+provide an easy way to quantize ONNX models with recommended settings.
+
+Further optimizations for quantized model inference will come in future releases.
+
+### rten
+
+- Added a guide to quantization support in RTen (https://github.com/robertknight/rten/pull/584)
+
+- Support `axis` equal to input rank in `Flatten` operator (https://github.com/robertknight/rten/pull/577)
+
+- Support all tensor types in `Split` operator (https://github.com/robertknight/rten/pull/576)
+
+- Support `auto_pad=VALID` in `Conv` and other operators (https://github.com/robertknight/rten/pull/575)
+
+- Support `ConvInteger` operator (https://github.com/robertknight/rten/pull/566,
+  https://github.com/robertknight/rten/pull/570)
+
+- Set default thread count on macOS to match performance core count rather than
+  total core count (https://github.com/robertknight/rten/pull/552)
+
+- `ort-quantize.py` now avoids quantizing `Conv` operators by default to work
+  around an issue in ONNX Runtime. If the produced model does not need to be
+  compatible with ORT, quantization can be enabled using `--quantize-conv`
+  (https://github.com/robertknight/rten/pull/550,
+  https://github.com/robertknight/rten/pull/566)
+
+- Support models with subgraphs in `tools/ort-quantize.py` script and adjust
+  configuration so that it produces usable results with more models
+  (https://github.com/robertknight/rten/pull/530)
+
+- Added initial optimized implementation of `MatMulInteger` for x64 (AVX2,
+  AVX512 VNNI) and Arm 64 (with dotprod extensions)
+  (https://github.com/robertknight/rten/pull/528,
+  https://github.com/robertknight/rten/pull/535,
+  https://github.com/robertknight/rten/pull/537,
+  https://github.com/robertknight/rten/pull/541,
+  https://github.com/robertknight/rten/pull/542,
+  https://github.com/robertknight/rten/pull/543)
+
+- Optimized and vectorized `DynamicQuantizeLinear` and `QuantizeLinear` operations
+  (https://github.com/robertknight/rten/pull/531,
+  https://github.com/robertknight/rten/pull/532,
+  https://github.com/robertknight/rten/pull/538)
+
+- Fixed edge case bug with incorrect handling of fused MatMul-Add operations
+  when K dimension (LHS column count) is zero (https://github.com/robertknight/rten/pull/526)
+
+- Fixed panic in `Conv` operator if group count is zero (https://github.com/robertknight/rten/pull/523)
+
+- Support `MatMulInteger` operators where zero point is a vector (https://github.com/robertknight/rten/pull/521,
+  https://github.com/robertknight/rten/pull/572)
+
+### rten-examples
+
+- Added ModernBERT masked word prediction example (https://github.com/robertknight/rten/pull/520)
+
+### rten-tensor
+
+- Added `CowTensor` and `CowNdTensor` type aliases for tensors which can be
+  either owned or borrowed (https://github.com/robertknight/rten/pull/568)
+
+## [0.15.1] - 2025-01-06
+
+### rten
+
+- Refactored matrix multiplication internals to prepare for supporting additional
+  data types and architectures (https://github.com/robertknight/rten/pull/510,
+  https://github.com/robertknight/rten/pull/511,
+  https://github.com/robertknight/rten/pull/513,
+  https://github.com/robertknight/rten/pull/519)
+
+- Optimized Softmax by using multiplication-by-reciprocal instead of
+  division (https://github.com/robertknight/rten/pull/516)
+
+- Optimized matrix multiplication with specialized code for edge tiles
+  (https://github.com/robertknight/rten/pull/505), more efficient indexing
+  into LHS / A input (https://github.com/robertknight/rten/pull/512) and
+  more aggressive unrolling (https://github.com/robertknight/rten/pull/518)
+
+- Fuse RMSNorm subgraphs (https://github.com/robertknight/rten/pull/497)
+
+- Optimized Gather with fast path for common case of axis=0 and faster general case
+  (https://github.com/robertknight/rten/pull/496)
+
+### rten-cli
+
+- Error if a dimension size specified with `--size` does not match any model
+  input (https://github.com/robertknight/rten/pull/517)
+
+- Made output less noisy when a dimension size repeated in many inputs is not
+  specified and is defaulted to 1 (https://github.com/robertknight/rten/pull/517)
+
+- Prefix timing for each run with a run number (https://github.com/robertknight/rten/pull/508)
+
+## [0.15.0] - 2024-12-28
+
+### rten
+
+- Fuse and vectorize Swish activation function used in CLIP and other models
+  (https://github.com/robertknight/rten/pull/493).
+
+- Avoid redundant zeroing of output buffer in `Gather` operator
+  (https://github.com/robertknight/rten/pull/492)
+
+- Fuse `MatMul` + `Mul` or `Div` by constant on either inputs or outputs
+  (https://github.com/robertknight/rten/pull/487,
+  https://github.com/robertknight/rten/pull/489).  In Transformers this occurs
+  in the context of Scaled Dot Product Attention.
+
+- Fix panic if `Model::run` is passed an input or output node ID which refers to
+  an operator node rather than a value or constant node
+  (https://github.com/robertknight/rten/pull/485).
+
+- Support prepacked weights. This increases model load time and memory usage but
+  decreases inference time. Weight pre-packing is disabled by default and can be
+  enabled via `ModelOptions::prepack_weights`
+  (https://github.com/robertknight/rten/pull/483).
+
+- Support fusing LayerNormalization operator variants that don't use a bias,
+  such as found in ModernBERT and other models (https://github.com/robertknight/rten/pull/470).
+
+- Support `DepthToSpace` operator (https://github.com/robertknight/rten/pull/468)
+
+- Support fusing `Add(MatMul(a, b), bias)` subgraphs (https://github.com/robertknight/rten/pull/462)
+
+- Improved Where operator performance by removing an old "fast" path that is
+  now slower than the standard path (https://github.com/robertknight/rten/pull/460)
+
+- Optimized ReduceMean, ReduceL2 operators using SIMD (
+  https://github.com/robertknight/rten/pull/457)
+
+- Unified and optimized implementation of normalization operators (BatchNormalization,
+  InstanceNormalization, LayerNormalization) using SIMD (
+  https://github.com/robertknight/rten/pull/456, https://github.com/robertknight/rten/pull/457,
+  https://github.com/robertknight/rten/pull/465, https://github.com/robertknight/rten/pull/469,
+  https://github.com/robertknight/rten/pull/471).
+
+- Added Nougat PDF-to-Markdown OCR example (https://github.com/robertknight/rten/pull/448).
+
+- Make Depth Anything example support variants with 3D (instead of 4D) outputs
+  (https://github.com/robertknight/rten/pull/447).
+
+- Make error message more helpful if converting a model `Output` into an
+  `NdTensor` fails due to a rank (dimension count) mismatch
+  (https://github.com/robertknight/rten/pull/446)
+
+- Release buffer back to memory pool in Concat op if in-place concatenation
+  is not possible (https://github.com/robertknight/rten/pull/426)
+
+- Enable Resize operations to be very cheap if the target size is the same as
+  the input size (https://github.com/robertknight/rten/pull/423)
+
+- Reduced some unnecessary memory reservation when constructing model graph
+  (https://github.com/robertknight/rten/pull/422).
+
+- Added CLIP example (https://github.com/robertknight/rten/pull/421). This
+  computes similarity between images and text labels.
+
+- Added data type information to model inputs and outputs
+  (https://github.com/robertknight/rten/pull/420)
+
+- Support vector inputs in MatMul operator (https://github.com/robertknight/rten/pull/418)
+
+- Support additional DETR-based models in the DETR example, such as
+  Table Transformer (https://github.com/robertknight/rten/pull/413)
+
+### rten-tensor
+
+**Breaking changes:** The result of `TensorBase::reshaped` now has a shorter
+lifetime as it may be an owned tensor instead of a view. Method call chains that
+used `reshaped` in the middle may need to be split into separate statements.
+
+- Support indexing 1D tensors using scalars instead of arrays
+  (https://github.com/robertknight/rten/pull/480).
+
+- Support using slice ranges with steps in `TensorBase::slice`
+  (https://github.com/robertknight/rten/pull/464)
+
+- `TensorBase::reshaped` now copies its input instead of panicking if non
+  contiguous. As a result it returns a copy-on-write (maybe owned) tensor with a
+  shorter lifetime.
+
+### rten-text
+
+- Support `Lowercase`, `Replace`, `Sequence` normalizers
+  (https://github.com/robertknight/rten/pull/451)
+
+- Support all the Unicode normalization normalizers (NFC, NFD, NFKC, NFKD)
+  (https://github.com/robertknight/rten/pull/450)
+
+- Support `Digits`, `Sequence`, `Split` pre-tokenizers
+  (https://github.com/robertknight/rten/pull/449)
+
+- Add `Tokenizer::from_file` convenience method
+  (https://github.com/robertknight/rten/pull/445)
+
+- Added `Tokenizer::{encode, decode}` methods for more ergonomic tokenization
+  and de-tokenization of text (https://github.com/robertknight/rten/pull/429)
+
+- Started to revise tokenization pipeline to follow the one used by HuggingFace
+  Tokenizers (https://github.com/robertknight/rten/pull/428,
+  https://github.com/robertknight/rten/pull/429, https://github.com/robertknight/rten/pull/430,
+  https://github.com/robertknight/rten/pull/440, https://github.com/robertknight/rten/pull/441,
+  https://github.com/robertknight/rten/pull/443, https://github.com/robertknight/rten/pull/444,
+  https://github.com/robertknight/rten/pull/452)
+
+- Support `end_of_word_suffix` in BPE model
+  (https://github.com/robertknight/rten/pull/425)
+
+## [0.14.1] - 2024-11-16
+
+This release adds Serde support for rten tensors and several optimizations which
+allow the Whisper example to run significantly faster.
+
+### rten-tensor
+
+- Support (de-)serializing tensors using Serde (https://github.com/robertknight/rten/pull/402)
+
+### rten
+
+### Examples
+
+- Output transcription speed as a multiple of real-time in Whisper example
+  (https://github.com/robertknight/rten/pull/403)
+
+- Support longer audio inputs and normalize inputs in wav2vec2 speech
+  recognition example (https://github.com/robertknight/rten/pull/400)
+
+### Bug fixes
+
+- Fixed an issue where metadata associated with output value nodes was lost
+  after a graph fusion. In the Whisper example this prevented several Transpose-MatMul
+  fusions from being used (https://github.com/robertknight/rten/pull/401).
+
+### Performance improvements
+
+- Added fast path for ArgMin / ArgMax for case when axis has unit stride
+  (https://github.com/robertknight/rten/pull/411)
+
+- Optimized GatherND by avoiding redundant zeroing of output and adding fast
+  path for contiguous inputs (https://github.com/robertknight/rten/pull/410)
+
+- Optimized copying of tensors with 5+ dimensions (https://github.com/robertknight/rten/pull/409)
+
+- Operators in subgraphs which capture their first input from a parent graph can
+  now run in-place (https://github.com/robertknight/rten/pull/407)
+
+- After the initial execution plan is created, it is now re-ordered to enable
+  more operations to run in-place
+  (https://github.com/robertknight/rten/pull/405)
+
+### rten-generate
+
+- The strategy for reserving capacity for KV-cache growth has been modified to
+  work with models that don't append to KV-cache inputs on the first run.
+  This benefits Hugging Face "merged" transformer models with "past" and "no-past"
+  branches (https://github.com/robertknight/rten/pull/408)
+
+## [0.14.0] - 2024-10-27
+
+### Breaking changes
+
+- The `NodeId` type used to identify model inputs and outputs is now an opaque
+  `u32`-sized type instead of a `usize`
+  (https://github.com/robertknight/rten/pull/381)
+
+- The tensor slicing APIs (`TensorBase::slice` etc.) now infer the rank of the
+  output automatically, instead of requiring the caller to specify. See
+  https://github.com/robertknight/rten/pull/367.
+
+### rten
+
+#### New features
+
+- Added Whisper speech recognition example (https://github.com/robertknight/rten/pull/397)
+
+- Added background removal example using RMBG (https://github.com/robertknight/rten/pull/344)
+
+- Support i8 and u8 tensors in operator inputs, outputs and model weights
+  (https://github.com/robertknight/rten/pull/345).
+
+- Support 8-bit int tensors in Cast, Gather, GatherElements, GatherND,
+  ScatterElements, ScatterND, Expand, Flatten, Reshape, Squeeze, Transpose,
+  Pad, Unsqueeze ops (https://github.com/robertknight/rten/pull/387)
+
+- Implement `QuantizeLinear`, `DequantizeLinear` and `DynamicQuantizeLinear`
+  ops (https://github.com/robertknight/rten/pull/346)
+
+- Added reference implementation of `MatMulInteger`. Quantized models using this
+  operator will now run, but very slowly. Optimized execution for quantized
+  models will come in future releases (https://github.com/robertknight/rten/pull/356).
+
+- Support f16 models in model converter by widening to f32 (https://github.com/robertknight/rten/pull/372).
+  This is an interim measure until f16 tensors are properly supported in RTen.
+
+- Added YOLOv11 support to YOLO example (https://github.com/robertknight/rten/pull/374)
+
+#### Bug fixes
+
+- Fixed AVX-512 build (https://github.com/robertknight/rten/pull/376)
+
+- Fixed graph optimizations not being applied correctly when a fused operation
+  feeds directly into a subsequent fused operation (https://github.com/robertknight/rten/pull/369)
+
+- Fixed errors when running WebAssembly builds compiled without SIMD support (https://github.com/robertknight/rten/pull/348)
+
+#### Performance improvements
+
+- Made `NodeId` a u32-sized type with a niche, reducing the size of various
+  internal data structures (https://github.com/robertknight/rten/pull/381)
+
+- Optimized `Cast` op when source and dest types are the same (https://github.com/robertknight/rten/pull/388)
+
+- Avoid unnecessary copying in `Squeeze` and `Unsqueeze` ops (https://github.com/robertknight/rten/pull/339,
+  https://github.com/robertknight/rten/pull/340)
+
+### rten-cli
+
+- Added `--no-optimize` flag to enable testing impact of graph optimizations
+  (https://github.com/robertknight/rten/pull/368)
+
+### rten-generate
+
+- Added more context to token generation errors (https://github.com/robertknight/rten/pull/396)
+
+- Support `cache_position` input in models exported from Optimum
+  (https://github.com/robertknight/rten/pull/395)
+
+- Added API for modifying model outputs ("logits") before sampling
+  (https://github.com/robertknight/rten/pull/393,
+  https://github.com/robertknight/rten/pull/394)
+
+- Support the new `merges` format in tokenizer.json files exported by
+  current versions of HuggingFace Transformers
+  (https://github.com/robertknight/rten/pull/392)
+
+### rten-imageproc
+
+- Added `normalize_image` utility (https://github.com/robertknight/rten/pull/343)
+
+### rten-tensor
+
+- Improved debug formatting of tensors (https://github.com/robertknight/rten/pull/377)
+
+- Changed `TensorBase::slice` to infer the rank of the output based on the
+  rank of the input and the number of index entries in the slice arguments
+  (https://github.com/robertknight/rten/pull/367).
+
+## [0.13.1] - 2024-08-30
+
+### rten
+
+#### New features
+
+- Added speech detection example using Silero VAD
+  (https://github.com/robertknight/rten/pull/338)
+
+- Support int tensors in ArgMin and ArgMax ops
+  (https://github.com/robertknight/rten/pull/329)
+
+- Support "reflect" padding mode (https://github.com/robertknight/rten/pull/326)
+
+#### Bug fixes
+
+- Fixed panic with certain combinations of input, kernel size and padding in
+  depthwise convolution (https://github.com/robertknight/rten/pull/336)
+
+- Fixed attempted out-of-bounds slice in depthwise convolution when input tensor
+  has a row stride that exceeds the row length
+  (https://github.com/robertknight/rten/pull/335)
+
+- Fixed conversion of `auto_pad` attribute for Conv operator
+  (https://github.com/robertknight/rten/pull/333)
+
+- Round timings to microseconds in verbose log
+  (https://github.com/robertknight/rten/pull/331)
+
+- Fixed panic when slicing empty tensors
+  (https://github.com/robertknight/rten/pull/325)
+
+- Fixed 1D convolution failing with non-contiguous inputs
+  (https://github.com/robertknight/rten/pull/324)
+
+- Fixed conversion of shape information for scalar tensors
+  (https://github.com/robertknight/rten/pull/323)
+
+- Fixed panic in softmax if the size of the normalized axis is zero
+  (https://github.com/robertknight/rten/pull/322)
+
+### rten-cli
+
+- Added `--mmap` flag to load model using memory mapping instead of reading
+  whole file into a buffer (https://github.com/robertknight/rten/pull/330)
+
+## [0.13.0] - 2024-08-24
+
+This release adds the infrastructure to support subgraphs, which are used in
+control flow operators like `If`, plus an implementation of the `If` operator
+and a TrOCR example which uses it.
+
+### rten
+
+- Added [`Model::load_static_slice`](https://github.com/robertknight/rten/pull/316)
+  API which can be used to load models embedded in the binary with
+  `include_bytes!`. Thanks @hsfzxjy.
+
+- Added TrOCR example (https://github.com/robertknight/rten/pull/304)
+
+- Support `If` operator (https://github.com/robertknight/rten/pull/306)
+
+- Added full support for `Einsum` operator (https://github.com/robertknight/rten/pull/297,
+  https://github.com/robertknight/rten/pull/299, https://github.com/robertknight/rten/pull/300,
+  https://github.com/robertknight/rten/pull/302, https://github.com/robertknight/rten/pull/303)
+
+### rten-cli
+
+- Added `--quiet` flag (https://github.com/robertknight/rten/pull/313)
+
+- Inputs named `use_cache_branch` now get a default value of `0` (ddf4109)
+
+### rten-generate
+
+- Support models with cross-attention KV caches that are computed on the first
+  run of the decoder (https://github.com/robertknight/rten/pull/318). This
+  is used by Hugging Face models for encoder-decoder systems.
+
+- Support models without a KV cache (https://github.com/robertknight/rten/pull/305)
+
+### rten-tensor
+
+- Added `Tensor::remove_axis` (b823d46)
+- Added `Tensor::from_storage_and_layout` (54d2941)
+
+### rten-text
+
+- The BPE tokenizer no longer complains if a tokenizer contains tokens in the
+  vocabulary which are never generated by merges and are not added special
+  tokens (18e9b2a)
+
+## [0.12.0] - 2024-07-30
+
+### rten
+
+#### Breaking changes
+
+- The `rten-convert` tool now generates models in the V2 format by default
+  (https://github.com/robertknight/rten/pull/272).
+  These models can only be loaded by RTen version 0.11.0 or later. The V1
+  format can be generated by specifying the `--v1` flag. The `rten` crate can
+  load both V1 and V2 format models.
+
+  See [the `.rten` file format documentation](https://github.com/robertknight/rten/blob/main/docs/rten-file-format.md)
+  for more details.
+
+- The `reduce_{max, min, sum}` tensor methods have moved from the
+  `FloatOperators` trait to the `Operators` trait (https://github.com/robertknight/rten/pull/274).
+
+#### Examples and documentation
+
+- Added Segment Anything example (https://github.com/robertknight/rten/pull/295).
+  This supports the original SAM models plus several derivatives with
+  lighter-weight image encoders.
+
+- Added chatbot example using Qwen2 (https://github.com/robertknight/rten/pull/282).
+  This also works with [SmolLM](https://huggingface.co/blog/smollm).
+
+- `Model::load_mmap` docs now have a better explanation of the memory and
+  performance impact (ce0b717)
+
+#### New features
+
+- Added partial support for `Einsum` operator (https://github.com/robertknight/rten/pull/295).
+
+#### Performance improvements
+
+- Avoid allocations in most cases when broadcasting tensor shapes (c4b5f26).
+
+- Strides of size-1 dimensions are ignored when determining whether a tensor is
+  contiguous (https://github.com/robertknight/rten/pull/292). This allows more
+  operations to use fast paths for contiguous tensors.
+
+- Optimized `LayerNormalization` and `ReduceMean` (https://github.com/robertknight/rten/pull/291)
+
+- Added fast-path for `Resize` operator when input scale is 1 (https://github.com/robertknight/rten/pull/290)
+
+- Return input buffer to pool in `Cast` operator if input needs to be copied
+  (https://github.com/robertknight/rten/pull/289).
+
+- Implemented `LayerNormalization` fusion (https://github.com/robertknight/rten/pull/280)
+
+- Implemented `GELU` fusion (https://github.com/robertknight/rten/pull/277)
+
+### rten-cli
+
+- Inputs with names matching the pattern `*_ids` now use zero as the
+  auto-generated input value (78cd621)
+
+### rten-generate
+
+- `TopKSampler` now supports specifying a temperature (65b837b)
+
+- Added `Generator::append_prompt` to append to prompt after initial generation.
+  This is useful for chat-like applications (5ef3cb2)
+
+- Fixed an issue where `attention_mask` input had the wrong size (cae6134)
+
+### rten-tensor
+
+#### Breaking changes
+
+- The `tensor` and `ndtensor` macros have been deprecated in favor of
+  `Tensor::from` and `NdTensor::from` (https://github.com/robertknight/rten/pull/286).
+
+#### Other changes
+
+- `Tensor::from` now supports creating tensors from scalar values (d2ca876)
+
+- `Tensor::lanes` iterator performance was improved by making them exact-sized
+  and fused (9e31556)
+
+### rten-text
+
+- Token IDs are now represented as `u32` rather than `usize`, for consistency
+  with rten-generate (https://github.com/robertknight/rten/pull/288).
+
+- The `vocab` mapping in `tokenizer.json` files is now used to determine token
+  IDs when decoding (https://github.com/robertknight/rten/pull/287).
+
+## [0.11.1] - 2024-07-17
+
+### rten
+
+- Fixed a crash in WebAssembly due to unsupported use of `Instant::now`
+  (https://github.com/robertknight/rten/pull/283).
+
+## [0.11.0] - 2024-07-05
+
+### rten
+
+#### Breaking changes
+
+- The `inputs` argument to `Model::run` now accepts a `Vec<(NodeId,
+  InputOrOutput)>` instead of `&[(NodeId, Input)]`, where `InputOrOutput` is an
+  enum that is either an owned `Tensor` or a `TensorView`. This enables passing
+  ownership of an input to `Model::run`, which is in turn enables efficient
+  in-place updates to cache-like inputs.
+
+  The `InputOrOutput` type implements `From` for tensors and tensor views, so
+  code such as:
+
+  ```rs
+  model.run(&[(input_id, tensor_view.into())], output_ids, None)
+  ```
+
+  Becomes:
+
+  ```rs
+  model.run(vec![(input_id, tensor_view.into())], output_ids, None)
+  ```
+
+#### New features
+
+- Add a new version of the `.rten` file format which supports models over 2GB
+  in size. The `rten-convert` tool still generates V1 models by default but
+  will generate the V2 format if the `--v2` flag is provided
+  (https://github.com/robertknight/rten/pull/260).
+
+- Support `Gelu` operator (https://github.com/robertknight/rten/pull/248)
+
+#### Bug fixes
+
+- Prevent `Model::partial_run` from propagating values through randomized
+  operators (https://github.com/robertknight/rten/pull/240).
+
+- Improved accuracy of timing metrics and eliminated unaccounted for
+  ("[Other]") time https://github.com/robertknight/rten/pull/254.
+
+#### Performance improvements
+
+This release adds a new graph optimization step as part of loading models. This
+performs fusions and other optimizations to speed up inference. These
+optimizations are enabled by default, but can be disabled via options in
+`ModelOptions`.
+
+- Improved parallelism in the `Softmax` operator (https://github.com/robertknight/rten/pull/258)
+
+- Made `Tensor::inner_iter` faster (https://github.com/robertknight/rten/pull/259)
+
+- Made `Gather`, `Concat` and `Unsqueeze` operators faster for small inputs.
+  These operations are common in subgraphs that operator on tensor shapes.
+  https://github.com/robertknight/rten/pull/255,
+  https://github.com/robertknight/rten/pull/256,
+  https://github.com/robertknight/rten/pull/257.
+
+- Optimized vector-matrix multiplication (https://github.com/robertknight/rten/pull/250,
+  https://github.com/robertknight/rten/pull/253). This benefits transformer
+  decoder inference when the batch size is 1.
+
+- Fuse `Mul(X, Sigmoid(X))` subgraphs into a `Silu` operation. This speeds up
+  YOLOv8 by 8%. See https://github.com/robertknight/rten/pull/246.
+
+- Further reduce small allocations during graph execution
+  (https://github.com/robertknight/rten/pull/243,
+  https://github.com/robertknight/rten/pull/245).
+
+- Fuse `MatMul(Transpose(X), Y)` subgraphs to avoid materializing the transposed
+  matrix (https://github.com/robertknight/rten/pull/242).
+
+- Perform constant propagation when loading models
+  (https://github.com/robertknight/rten/pull/241).
+
+- Enabled `Concat` operator to run in-place if the caller has specifically
+  reserved space in the first input's buffer
+  (https://github.com/robertknight/rten/pull/239).
+
+- Cache the last-used execution plan. This avoids recomputing the sequence of
+  execution steps when a model is run in a loop
+  (https://github.com/robertknight/rten/pull/234).
+
+- Improved performance of unary operators for non-contiguous inputs
+  (https://github.com/robertknight/rten/pull/223)
+
+- Optimized `Where` operator for non-contiguous inputs
+  (https://github.com/robertknight/rten/pull/213)
+
+- Optimized variadic operators (https://github.com/robertknight/rten/pull/212)
+
+- Optimized `Pow` operator (https://github.com/robertknight/rten/pull/219)
+
+### rten-examples
+
+- Added GPT-2 text generation example (https://github.com/robertknight/rten/pull/228)
+- Added DistilViT image captioning example (https://github.com/robertknight/rten/pull/230)
+
+### rten-generate
+
+This is a new crate which provides a convenient `Iterator`-based interface for
+running auto-regressive decoder models. See the `gpt2` and `distilvit` examples
+in the `rten-examples` crate for code samples.
+
+### rten-tensor
+
+- Support more primitive element types in `NdTensor::from`
+  (https://github.com/robertknight/rten/pull/226).
+
+### rten-text
+
+- Added Byte Pair Encoding (BPE) tokenizer (https://github.com/robertknight/rten/pull/227)
+
+## [0.10.0] - 2024-05-25
+
+### rten
+
+#### Breaking changes
+
+- RTen now creates its own Rayon thread pool where the number of threads is
+  configured to match the physical rather than logical core count, rather than
+  using the global Rayon thread pool. This improves performance on systems with
+  Simultaneous Multi-Threading (aka. SMT, Hyper-Threading) (most x86_64 CPUs),
+  but can lead to contention if the calling application has its own
+  multi-threaded parallelism. Applications may need to adjust their own use of
+  threading to avoid this. RTen provides functions for applications to run
+  their own tasks within this thread pool.
+
+  See https://github.com/robertknight/rten/pull/183.
+
+#### Bug fixes
+
+- Fixed conversion of `Transpose` operators without a `perm` attribute
+  (https://github.com/robertknight/rten/pull/201)
+
+- The `RunError` type returned by `Model::run` is now exported
+  (https://github.com/robertknight/rten/pull/206)
+
+#### Performance improvements
+
+- Made `Resize` operator parallel over rows. This benefits resize operations on
+  images with large spatial dimensions and few channels
+  (https://github.com/robertknight/rten/pull/208).
+
+- Improved performance of `Conv` operator on Intel CPUs with a mitigation for
+  the Gather Data Sampling /
+  "[Downfall](https://en.wikipedia.org/wiki/Downfall_(security_vulnerability))"
+  vulnerability applied. This affects most 6th-11th generation Intel CPUs
+  (https://github.com/robertknight/rten/pull/204).
+
+- Optimized `Concat` operator when input is not contiguous (eg. following a
+  `Slice` op) (https://github.com/robertknight/rten/pull/204)
+
+- Improved performance of `GRU` operator by combining operations on separate
+  gates (https://github.com/robertknight/rten/pull/188)
+
+- Improved performance of binary operators on non-contiguous tensors
+(https://github.com/robertknight/rten/pull/190)
+
+### rten-cli
+
+- Added `--n_iters` flag to control how many times the model is run (https://github.com/robertknight/rten/pull/202)
+
+- Optimize model by performing constant propagation before running the model
+  (https://github.com/robertknight/rten/pull/202)
+
+- Made it easier to specify sizes for dynamic inputs. The new syntax is
+  `--size dim_name=size`. Additionally the size for dynamic dimensions defaults
+  to 1. See https://github.com/robertknight/rten/pull/182.
+
+- Added `--version` flag (https://github.com/robertknight/rten/pull/181)
+
+### rten-imageproc
+
+- Added `serde_traits` feature which implements serde `Serialize` and
+  `Deserialize` traits for geometry types
+  (Thanks @luketpeterson, https://github.com/robertknight/rten/pull/198)
+
+### rten-tensor
+
+- Added `Tensor::split_at` and `Tensor::split_at_mut` (
+  https://github.com/robertknight/rten/pull/205, https://github.com/robertknight/rten/pull/207)
+
+- `Tensor::{axis_chunks, axis_chunks_mut}` iterators now preserve the layout
+  in their output type (https://github.com/robertknight/rten/pull/207).
+
+### rten-vecmath, rten-simd
+
+- The internal crate providing portable SIMD and vectorized math functions
+  was split into two. rten-simd now contains the portable SIMD code.
+  rten-vecmath contains the vectorized math functions.
+
+## [0.9.0] - 2024-05-16
+
+### Breaking Changes
+
+This release contains breaking changes to the model loading APIs and code using
+the `TensorBase` type directly (as opposed to aliases like `Tensor`). See the
+notes for the `rten` and `rten-tensor` crates respectively.
+
+### rten
+
+#### Breaking changes
+
+- The `Model::load` API now takes a `Vec<u8>` rather than `&[u8]` as an
+  argument. This enables it to avoid copying data internally. For the most
+  common use case of loading a model from disk, use the new `Model::load_file`
+  API.
+
+- The `Model::load_with_ops` API has been replaced by `ModelOptions::with_ops`.
+
+#### New features
+
+- Added `Model::load_file` API for more convenient loading of a model from
+  a file (https://github.com/robertknight/rten/pull/174)
+
+- Added `Model::load_mmap` API for zero-copy loading of models by using
+  memory maps. This can be faster than `Model::load` for very large models
+  (https://github.com/robertknight/rten/pull/174).
+
+- Added Piper text-to-speech example (https://github.com/robertknight/rten/pull/161)
+
+- Support 1D inputs and padding in `ConvTranspose` (https://github.com/robertknight/rten/pull/156)
+
+- Support `GatherND` operator (https://github.com/robertknight/rten/pull/155)
+
+- Support `Softplus` operator (https://github.com/robertknight/rten/pull/146)
+
+- Support converting ONNX models containing unnamed operator nodes
+  (https://github.com/robertknight/rten/pull/143)
+
+- Support `RandomNormal`, `RandomNormalLike`, `RandomUniformLike` operators
+  (https://github.com/robertknight/rten/pull/144)
+
+#### Bug fixes
+
+- Fixed incorrect calculation of update slice size in `ScatterND` operator
+  (https://github.com/robertknight/rten/pull/157)
+
+- Fixed incorrect conversion of `axis` attribute for `ArgMin` and `ArgMax`
+  operators (https://github.com/robertknight/rten/pull/142)
+
+- Fixed uninitialized read in `Gemm` operator when `alpha != 1` and `beta == 0`
+  (https://github.com/robertknight/rten/pull/150)
+
+- Fixed `NonMaxSuppression` operator missing overlap of boxes due to confusion
+  of X/Y coordinates (https://github.com/robertknight/rten/pull/177)
+
+#### Optimizations
+
+- Optimize `Gather`, `NonZero` operator by allocating from memory pool
+  (https://github.com/robertknight/rten/pull/168)
+
+- Optimize `Slice` operator when slice ranges contain negative steps
+  (https://github.com/robertknight/rten/pull/167)
+
+- Optimize `Pad` operator by making copying of non-contiguous views more
+  efficient (https://github.com/robertknight/rten/pull/166)
+
+- Optimize `Conv` operator by avoiding redundant zeroing of packing buffers,
+  optimizing `im2col` setup (https://github.com/robertknight/rten/pull/165)
+
+- Optimize `ConvTranspose` by fusing bias addition into `col2im` transform
+  (https://github.com/robertknight/rten/pull/159)
+
+- Parallelize `AveragePool` operator (https://github.com/robertknight/rten/pull/138)
+
+- Improved model loading performance by avoiding copying weights in `Model::load`
+  (https://github.com/robertknight/rten/pull/174)
+
+### rten-imageproc
+
+- The mask matrix argument to `find_contours` now uses `bool` instead of `i32`
+  for elements. This improves performance / reduces memory usage for large masks.
+
+### rten-tensor
+
+#### Breaking changes
+
+This release changes the signature of the `TensorBase` struct from
+`TensorBase<T, S: AsRef<[T]>, L: MutLayout>` to `TensorBase<S: Storage, L:
+MutLayout>`. The element type is now available via `S::Elem`. The type of `S`
+used by views has changed from slices to new custom types. The
+`TensorBase::from_data` method still accepts both `Vec<T>` and slices as the
+`data` argument, and will convert to the appropriate storage struct.
+
+Code using the type aliases (`Tensor`, `TensorView`, `TensorViewMut` etc.)
+does not need to change.
+
+#### New features
+
+- Added `TensorBase::{as_cow, into_cow}` (named after `std::borrow::Cow`) to
+  convert tensor storage to a type which is `Cow`-like. This is useful for
+  writing code which works with either borrowed or owned tensors
+  (https://github.com/robertknight/rten/pull/153).
+
+#### Bug fixes
+
+- Added missing checks for equality between old/new layout lengths in
+  reshape operations (https://github.com/robertknight/rten/pull/170,
+  https://github.com/robertknight/rten/pull/171)
+
+- Improved internal checks that storage slicing does not lead to out-of-bounds
+  accesses (https://github.com/robertknight/rten/pull/163)
+
+- Refactored tensor storage types to fix a violation of Rust's unique ownership
+  rules for mutable slices. This enables tests for rten-tensor and code using
+  this crate to be run under Miri
+  (https://github.com/robertknight/rten/pull/148).
+
+### rten-vecmath
+
+- Revised SIMD traits to make working with masks more ergonomic and efficient
+  (https://github.com/robertknight/rten/pull/152). Integer and floating point
+  types with the same number of lanes will now use the same mask type.
+
+## [0.8.0] - 2024-04-29
+
+### rten-tensor
+
+- Added `Alloc` trait which provides a simple allocator interface, and
+  `*_in`-suffixed variants of several `TensorBase` methods, which allows
+  specifying an allocator for the returned tensor's data buffer
+  (https://github.com/robertknight/rten/pull/123).
+
+### rten-vecmath
+
+- Fixed crashes in several functions when running on pre-AVX2 x64 CPUs (see
+  `rten` changes)
+
+### rten
+
+#### New features
+
+- Support `Elu` operator (https://github.com/robertknight/rten/pull/132)
+
+- Support `Reduce*` operators that take `axes` as a dynamic input rather than
+  static attribute (https://github.com/robertknight/rten/pull/132)
+
+#### Bug fixes
+
+- Fixed crash in several operators when running on x64 CPUs that do not
+  support AVX-2 instructions (https://github.com/robertknight/rten/pull/131,
+  https://github.com/robertknight/rten/pull/134)
+
+#### Performance improvements
+
+- Added a buffer pool that enables reuse of operator output and temporary
+  buffers, avoiding the overhead of allocating and freeing large buffers using
+  the system allocator (https://github.com/robertknight/rten/pull/108).
+
+  Statistics about buffer pool usage are printed as part of `RTEN_TIMING`
+  output.
+
+- Fixed a `MatMul` performance regression introduced in v0.7.0 due to virtual
+  calls to get kernel tile size (https://github.com/robertknight/rten/pull/101)
+
+- Optimize convolutions by using SIMD operations for im2col transform
+  (https://github.com/robertknight/rten/pull/104)
+
+- Parallelize depthwise convolution (https://github.com/robertknight/rten/pull/102)
+
+- Avoid redundant of zeroing buffers in `Conv`, `OneHot`, and various unary
+  operations (https://github.com/robertknight/rten/pull/97,
+  https://github.com/robertknight/rten/pull/99,
+  https://github.com/robertknight/rten/pull/101,
+  https://github.com/robertknight/rten/pull/106)
+
+- Optimize `Unsqueeze` by running in-place where possible (https://github.com/robertknight/rten/pull/96)
+
+- Optimize vector-matrix products where matrix is transposed (https://github.com/robertknight/rten/pull/94)
+
+- Reduced graph execution overhead by using faster hashing (https://github.com/robertknight/rten/pull/92)
+
+- Optimize `ScatterND` (https://github.com/robertknight/rten/pull/91)
+
+- Support AVX-512 acceleration for `Exp`, `Sigmoid`, `Tanh`, `Softmax` and
+  `Erf` operators (https://github.com/robertknight/rten/pull/131). This
+  requires nightly Rust and the `avx512` feature enabled.
+
+## [0.7.0] - 2024-04-12
+
+### rten-tensor
+
+- Add `Tensor::merge_axes` method to simplify layouts (https://github.com/robertknight/rten/pull/78)
+
+- Add `Tensor::{uninit, assume_init}` methods for working with uninitialized
+  buffers (https://github.com/robertknight/rten/pull/82)
+
+### rten
+
+- Reduced `Graph::run` overhead by reducing allocations
+  (https://github.com/robertknight/rten/pull/89)
+
+- Added `Model::partial_run` API to speed up autoregressive / recurrent models
+  by precomputing parts of the graph that depend only on inputs that are
+  unchanging across loop iterations (https://github.com/robertknight/rten/pull/86)
+
+- Optimize `MatMul` and binary operators by avoiding unnecessary zeroing of
+  output buffers (https://github.com/robertknight/rten/pull/82,
+  https://github.com/robertknight/rten/pull/88)
+
+- Fixed incorrect output from `Gemm` operator when the bias is zero and the "C"
+  input contained infinities / NaNs (https://github.com/robertknight/rten/pull/81)
+
+- Optimize matrix packing operations on Intel CPUs using AVX-2 instructions
+  (https://github.com/robertknight/rten/pull/80)
+
+- Optimize `Transpose` operations where input dimensions are powers of 2 by
+  using blocking and tiling (https://github.com/robertknight/rten/pull/78)
+
+- Exclude test files and tools from published crate
+  (https://github.com/robertknight/rten/pull/77)
+
+- Optimize RNN operators for the case where the input sequence is short, by
+  avoiding prepacking of weights in this case
+  (https://github.com/robertknight/rten/pull/74)
+
+## [0.6.0] - 2024-03-31
+
+### rten
+
+- Updated AVX-512 support to work with latest Rust nightly releases
+  (https://github.com/robertknight/rten/pull/58)
+
+- Improved performance of vector-matrix product operations
+  (https://github.com/robertknight/rten/pull/61)
+
+- Slightly improved WASM matrix multiplication performance with a dedicated
+  kernel (https://github.com/robertknight/rten/pull/64)
+
+- Fixed conversion of RNN operators (LSTM, GRU) that explicitly declare the
+  direction as forward (https://github.com/robertknight/rten/pull/67)
+
+- Support tensors with 3 or 5+ dimensions in `BatchNormalization` operator
+  (https://github.com/robertknight/rten/pull/68)
+
+- Support `RandomUniform` operator (https://github.com/robertknight/rten/pull/69)
+
+- Improve matrix prepacking performance by eliminating unnecessary
+  zero-initialization of buffers (https://github.com/robertknight/rten/pull/70)
+
+## [0.5.0] - 2024-02-29
+
+### rten
+
+ - Changed `OperatorType` enum in .rten schema from byte to ubyte, to allow for
+   more operator types in future (https://github.com/robertknight/rten/pull/56)
+
+ - Made `Model` instances `Send`, enabling use with PyO3 (https://github.com/robertknight/rten/pull/55)
+
+ - The ONNX => rten model conversion tool is now an installable Python package
+   called `rten-convert` (https://github.com/robertknight/rten/pull/53)
+
+ - Implemented `ReduceSumSquare` operator (36bbf89f)
+
+## [0.4.0] - 2024-02-08
+
+### rten
+
+ - Support `count_include_pad` attr in AveragePool operator (09ecb729)
+
+ - Support license/version/provenance metadata in RTen models
+   (https://github.com/robertknight/rten/pull/48)
+
+ - Fix error when a negative index was used with `Gather` operator (573ded4c)
+
+ - Improve performance of `MatMul` operator when row count of LHS is small and
+   batch size is large (https://github.com/robertknight/rten/pull/51)
+
+### rten-imageproc
+
+ - Optimized `find_contours` for large images (c471a6c, 7a14f43)
+
+### rten-tensor
+
+ - Optimize `TensorBase::map` for contiguous tensors (5562fd23)
+ - Add `TensorBase::{from_fn, from_simple_fn}` (5e654ea0)
+ - Add `TensorBase::try_from_data` (18817907)
+ - Support `get_unchecked` on owned/mutable tensors (06b02eaf)
+
+## [0.3.1] - 2024-01-23
+
+ - Updated rten-vecmath dependency to latest version
+
+## [0.3.0] - 2024-01-23
+
+### Breaking changes
+
+The static and dynamic tensor types (`NdTensorBase`, `TensorBase`) have been
+unified into a single implementation. Most code uses these via type aliases
+(`NdTensor`, `Tensor` etc.), which remain the same. However there have been some
+API changes as a result:
+
+ - The `View` and `NdView` traits were combined into `AsView`. The recommended
+   way to import this trait is via the prelude (`use rten_tensor::prelude::*`)
+
+ - Some inherent methods of `TensorBase` moved to the `AsView` trait. You may
+   need to add additional imports of this trait or the prelude.
+
+ - `NdTensor::from_data` now has the same API signature as `Tensor::from_data`.
+   This means the order of arguments is reversed compared to before. It is now
+   `from_data(shape, data)`. Creating tensors with custom strides is now done
+   via `from_data_with_strides` or `from_slice_with_strides`.
+
+ - Tensor methods for broadcasting and reshaping tensors now determine the rank
+   of the result from the type of the shape argument. If passed an array, they
+   return a static-rank view. If passed a slice, they return a dynamic-rank
+   view.
+
+ - Methods that insert, remove or swap axes now have an `_axis` suffix (eg.
+   `move_axis`). Previously some of these methods had a `_dim` suffix.
+
+ - The `slice` method now always returns a static rank view. Usage is
+   `tensor.slice::<M, _>(range)` where `M` is the rank of the result. To create
+   a view with a dynamic dimension count, use `tensor.slice_dyn(range)` instead.
+
+## New features
+
+ - Implemented LayerNormalization operator
+   ([#44](https://github.com/robertknight/rten/pull/44))
+ - Added "Depth Anything" monocular depth estimation example
+   ([#44](https://github.com/robertknight/rten/pull/44))
+ - Added support for `align_corners` value for `coordinate_transformation_mode`
+   attr in Resize operator ([#44](https://github.com/robertknight/rten/pull/44)).
+
+## Performance improvements
+
+ - Optimized index iteration for tensors (d3fd3c9)
+ - Optimized col2im transform used by ConvTranspose (fbc541b)
+ - Optimized depthwise convolution (20e83e8)
+ - Improved performance on Arm via a better optimized GEMM kernel
+   ([#32](https://github.com/robertknight/rten/pull/32)) and vectorized kernels
+   for other functions ([#31](https://github.com/robertknight/rten/pull/31)).
+
+## [0.2.0] - 2024-01-03
+
+ - Improved inference performance on ARM [#30](https://github.com/robertknight/rten/pull/30)
+
+## [0.1.1] - 2024-01-01
+
+ - Fix softmax operator on non-x64 / wasm32 platforms (59f4815)
+
+## [0.1.0] - 2023-12-31
+
+Initial release.

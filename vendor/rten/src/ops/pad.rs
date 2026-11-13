@@ -1,0 +1,789 @@
+use std::mem::MaybeUninit;
+
+use rten_shape_inference::ops as shape_ops;
+use rten_tensor::prelude::*;
+use rten_tensor::{NdTensorView, NdTensorViewMut, SliceItem, Tensor, TensorView};
+
+use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
+use crate::operator::{
+    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
+    OutputTypesContext,
+};
+use crate::ops::map_value_view;
+use crate::value::ValueView;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PadMode {
+    Constant,
+    Reflect,
+    Edge,
+    Wrap,
+}
+
+/// Number of elements a pad value adds to the start or end of an axis.
+fn pad_amount(pad: i32) -> usize {
+    pad.max(0) as usize
+}
+
+/// Number of elements a pad value removes from the start or end of an axis.
+fn crop_amount(pad: i32) -> usize {
+    pad.min(0).unsigned_abs() as usize
+}
+
+struct PadRegion {
+    /// Slice items which select the region of the input to use, or `None` for
+    /// the whole input.
+    input_region: Option<Vec<SliceItem>>,
+
+    /// Shape of the padded output.
+    out_shape: Vec<usize>,
+}
+
+/// Calculate the input region and output shape for a [`Pad`] operation.
+fn pad_region(input_shape: &[usize], padding: NdTensorView<i32, 1>) -> Result<PadRegion, OpError> {
+    let ndim = input_shape.len();
+
+    if padding.size(0) != ndim * 2 {
+        return Err(OpError::invalid_value(
+            "padding length should be 2 * input dims",
+        ));
+    }
+
+    let input_region = if padding.iter().any(|pad| *pad < 0) {
+        let mut input_region = Vec::with_capacity(ndim);
+        for (i, size) in input_shape.iter().enumerate() {
+            let crop_start = crop_amount(padding[i]);
+            let crop_end = crop_amount(padding[[ndim + i]]);
+            if crop_start + crop_end > *size {
+                return Err(OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                ));
+            }
+            input_region.push((crop_start..size - crop_end).into());
+        }
+        Some(input_region)
+    } else {
+        None
+    };
+
+    let out_shape: Vec<_> = input_shape
+        .iter()
+        .enumerate()
+        .map(|(i, size)| {
+            let start_pad = pad_amount(padding[i]);
+            let end_pad = pad_amount(padding[[ndim + i]]);
+            start_pad + size + end_pad - crop_amount(padding[i]) - crop_amount(padding[[ndim + i]])
+        })
+        .collect();
+
+    Ok(PadRegion {
+        input_region,
+        out_shape,
+    })
+}
+
+/// Return slice items which select the region of [`Pad`] output which is not
+/// part of the padding.
+fn non_pad_region(input_shape: &[usize], padding: NdTensorView<i32, 1>) -> Vec<SliceItem> {
+    input_shape
+        .iter()
+        .enumerate()
+        .map(|(i, size)| {
+            let start_pad = pad_amount(padding[i]);
+            (start_pad..start_pad + size).into()
+        })
+        .collect()
+}
+
+pub fn pad<T: Copy + Default + PartialEq>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    padding: &NdTensorView<i32, 1>,
+    mode: PadMode,
+    const_val: T,
+) -> Result<Tensor<T>, OpError> {
+    let PadRegion {
+        input_region,
+        out_shape,
+    } = pad_region(input.shape(), padding.view())?;
+
+    // Handle negative padding by cropping the input. The positive padding
+    // is then applied to the cropped view.
+    let input = if let Some(crop_region) = input_region {
+        input.slice(crop_region.as_slice())
+    } else {
+        input
+    };
+
+    // Just copy the tensor if no padding is required.
+    if out_shape == input.shape() {
+        return Ok(input.to_tensor_in(pool));
+    }
+
+    let output = match mode {
+        PadMode::Constant => {
+            let mut output = if const_val == T::default() {
+                // Special case zero for platforms that have optimized
+                // instructions for this.
+                Tensor::zeros_in(pool, &out_shape)
+            } else {
+                Tensor::full_in(pool, &out_shape, const_val)
+            };
+
+            output
+                .slice_mut(non_pad_region(input.shape(), padding.view()).as_slice())
+                .copy_from(&input);
+            output
+        }
+        // Pad modes which fill the padding region with elements from the
+        // source tensor.
+        PadMode::Reflect | PadMode::Edge | PadMode::Wrap => {
+            const PAD_DIMS: usize = 2;
+            let batch_dims = input.ndim().saturating_sub(PAD_DIMS);
+            if out_shape[..batch_dims] != input.shape()[..batch_dims] {
+                return Err(OpError::unsupported_value(
+                    "Pad only supports non-constant padding of last 2 dims",
+                ));
+            }
+
+            if input.shape()[batch_dims..].contains(&0) {
+                return Err(OpError::invalid_value(
+                    "Padded dimension for non-constant padding is empty",
+                ));
+            }
+
+            let pad_dims = input.ndim() - batch_dims;
+            let (pad_top, pad_left) = if pad_dims == 1 {
+                (0, pad_amount(padding[[batch_dims]]))
+            } else {
+                (
+                    pad_amount(padding[[batch_dims]]),
+                    pad_amount(padding[[batch_dims + 1]]),
+                )
+            };
+
+            let mut input = input.view();
+            let mut output = Tensor::uninit_in(pool, &out_shape);
+
+            // For inputs with fewer dims than the padding inner loop, insert
+            // extra 1-sized dims at the start.
+            while input.ndim() < PAD_DIMS {
+                input.insert_axis(0);
+                output.insert_axis(0);
+            }
+
+            for (out_img, in_img) in output
+                .inner_iter_mut::<PAD_DIMS>()
+                .zip(input.inner_iter::<PAD_DIMS>())
+            {
+                match mode {
+                    PadMode::Reflect => {
+                        fill_pad(out_img, in_img, pad_top, pad_left, ReflectPad);
+                    }
+                    PadMode::Edge => {
+                        fill_pad(out_img, in_img, pad_top, pad_left, EdgePad);
+                    }
+                    PadMode::Wrap => {
+                        fill_pad(out_img, in_img, pad_top, pad_left, WrapPad);
+                    }
+                    // Constant padding is handled separately.
+                    PadMode::Constant => unreachable!(),
+                }
+            }
+
+            while output.ndim() > out_shape.len() {
+                output.remove_axis(0);
+            }
+
+            // Safety: We filled all elements of output.
+            unsafe { output.assume_init() }
+        }
+    };
+
+    Ok(output)
+}
+
+/// Fill `dest` using elements from `src`.
+///
+/// For each output position, source element coordinates are generated using
+/// `src_index` and copied to the output.
+fn fill_pad<T: Copy, P: PadSource>(
+    mut dest: NdTensorViewMut<MaybeUninit<T>, 2>,
+    src: NdTensorView<T, 2>,
+    pad_top: usize,
+    pad_left: usize,
+    src_index: P,
+) {
+    let out_rows = dest.size(0);
+    let out_cols = dest.size(1);
+
+    let src_rows = src.size(0);
+    let src_cols = src.size(1);
+
+    for y in 0..out_rows {
+        let src_y = src_index.src_index(y, src_rows, pad_top);
+        debug_assert!(src_y < src_rows);
+
+        for x in 0..out_cols {
+            let src_x = src_index.src_index(x, src_cols, pad_left);
+            debug_assert!(src_x < src_cols);
+
+            // Safety:
+            //  - y and x are valid coords.
+            //  - src_y and src_x are valid coords since `src_index` returns
+            //    values in [0, len).
+            unsafe {
+                dest.get_unchecked_mut([y, x])
+                    .write(*src.get_unchecked([src_y, src_x]));
+            }
+        }
+    }
+}
+
+/// Computes the source elements to use when filling a tensor with padding.
+///
+/// # Safety
+///
+/// The `src_index` method must return indexes in `[0, len)`.
+unsafe trait PadSource {
+    /// Compute the coordinate of the source element to copy when filling a
+    /// tensor with padding.
+    ///
+    /// `dest` is the destination coordinate in [0, len), `len` is the size of
+    /// the dimension (always >= 1) and `pad_start` is the number of padding
+    /// elements added at the start of the dimension.
+    ///
+    /// The returned index must be in [0, len).
+    fn src_index(&self, dest: usize, len: usize, pad_start: usize) -> usize;
+}
+
+// Fill the padding region by reflecting the start or end of the source axis.
+struct ReflectPad;
+
+// Safety: `src_index` result is in [0, len).
+unsafe impl PadSource for ReflectPad {
+    fn src_index(&self, dest: usize, len: usize, pad_start: usize) -> usize {
+        let x = dest as isize;
+        let len = len as isize;
+        let pad_start = pad_start as isize;
+
+        // Compute all possible values and then pick one, so this gets compiled to
+        // conditional moves instead of branches.
+        let src_x_start = pad_start - x;
+        let src_x_mid = x - pad_start;
+        let src_x_end = len - (x - len - pad_start) - 2;
+
+        let src_x = if x < pad_start {
+            src_x_start
+        } else if x < len + pad_start {
+            src_x_mid
+        } else {
+            src_x_end
+        };
+
+        // Use `rem_euclid` so that `src_x ∈ [0, len)` if src_x < 0.
+        src_x.rem_euclid(len) as usize
+    }
+}
+
+/// Fill the padding region by taking elements from the start or end of the
+/// source axis.
+struct EdgePad;
+
+// Safety: `src_index` result is in [0, len).
+unsafe impl PadSource for EdgePad {
+    fn src_index(&self, dest: usize, len: usize, pad_start: usize) -> usize {
+        let len = len as isize;
+        let dest = dest as isize;
+        let src = dest - pad_start as isize;
+        src.clamp(0, len - 1) as usize
+    }
+}
+
+/// Fill the padding region by wrapping coordinates around to the start or end
+/// of the source axis.
+struct WrapPad;
+
+// Safety: `src_index` result is in [0, len).
+unsafe impl PadSource for WrapPad {
+    fn src_index(&self, dest: usize, len: usize, pad_start: usize) -> usize {
+        let len = len as isize;
+        let dest = dest as isize;
+        let pad_start = pad_start as isize;
+        (dest - pad_start).rem_euclid(len) as usize
+    }
+}
+
+#[derive(Debug)]
+pub struct Pad {
+    pub mode: PadMode,
+}
+
+impl Operator for Pad {
+    fn name(&self) -> &str {
+        "Pad"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(4)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let pads = inputs.require_as(1)?;
+        let axes: Option<NdTensorView<i32, 1>> = inputs.get_as(3)?;
+
+        if axes.is_some() {
+            return Err(OpError::unsupported_value(
+                "Pad operator does not yet support `axes` input",
+            ));
+        }
+
+        map_value_view!(input, x, {
+            let const_val = inputs.get_as(2)?.unwrap_or_default();
+            pad(ctx.pool(), x, &pads, self.mode, const_val).into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(Pad, _op, shape_ops::Pad);
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rten_tensor::prelude::*;
+    use rten_tensor::test_util::expect_equal;
+    use rten_tensor::{NdTensor, Tensor};
+    use rten_testing::TestCases;
+
+    use crate::buffer_pool::BufferPool;
+    use crate::operator::{OpError, OperatorExt};
+    use crate::ops::{Pad, PadMode, pad};
+    use crate::value::{DataType, TryFromValueError, Value, ValueType};
+
+    fn from_slice<T: Clone>(data: &[T]) -> Tensor<T> {
+        Tensor::from_data(&[data.len()], data.to_vec())
+    }
+
+    #[test]
+    fn test_pad() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+
+        // Same padding around each edge.
+        let input = Tensor::from_data(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let expected = Tensor::from_data(
+            &[4, 4],
+            vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        );
+        let const_pads = &[1, 1, 1, 1];
+        let result = pad(
+            &pool,
+            input.view(),
+            &const_pads.into(),
+            PadMode::Constant,
+            0.0,
+        )
+        .unwrap();
+        expect_equal(&result, &expected)?;
+
+        // Zero padding (no-op)
+        let zero_pads = &[0, 0, 0, 0];
+        let result = pad(
+            &pool,
+            input.view(),
+            &zero_pads.into(),
+            PadMode::Constant,
+            0.0,
+        )
+        .unwrap();
+        expect_equal(&result, &input)?;
+
+        // Un-even padding
+        let input = Tensor::from_data(&[1, 2, 2], vec![1, 2, 3, 4]);
+        let pads = &[0, 0, 0, 0, 1, 0];
+        let result = pad(&pool, input.view(), &pads.into(), PadMode::Constant, 0).unwrap();
+        assert_eq!(result.shape(), &[1, 3, 2]);
+        assert_eq!(result.data().unwrap(), &[1, 2, 3, 4, 0, 0]);
+
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct Case {
+        input: Tensor,
+        pads: NdTensor<i32, 1>,
+        mode: PadMode,
+        expected: Result<Tensor, OpError>,
+    }
+
+    fn test_pad_mode(cases: &[Case]) {
+        cases.test_each(|case| {
+            let Case {
+                input,
+                pads,
+                mode,
+                expected,
+            } = case;
+
+            let pool = BufferPool::new();
+            let result = pad(&pool, input.view(), &pads.view(), *mode, 0.);
+            match (result, expected) {
+                (Ok(result), Ok(expected)) => {
+                    expect_equal(&result, &expected).unwrap();
+                }
+                (result, expected) => assert_eq!(&result, expected),
+            }
+        });
+    }
+
+    #[test]
+    fn test_pad_constant() {
+        let cases = [
+            // Test case from ONNX spec.
+            Case {
+                input: [[1.0, 1.2], [2.3, 3.4], [4.5, 5.7]].into(),
+                pads: [0, 2, 0, 0].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([
+                    [0.0, 0.0, 1.0, 1.2],
+                    [0.0, 0.0, 2.3, 3.4],
+                    [0.0, 0.0, 4.5, 5.7],
+                ])),
+            },
+            // Negative pad at one end and a positive pad at the other.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, 1, 0, -1].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([[0., 1., 2., 3., 4.]])),
+            },
+            // Negative pads at both ends of an axis.
+            Case {
+                input: [1., 2., 3., 4., 5.].into(),
+                pads: [-1, -2].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([2., 3.])),
+            },
+            // Crop the start of an axis and pad the end of it.
+            Case {
+                input: [1., 2., 3., 4., 5.].into(),
+                pads: [-2, 1].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([3., 4., 5., 0.])),
+            },
+            // Crop away every element of an axis.
+            Case {
+                input: [1., 2., 3.].into(),
+                pads: [-1, -2].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::zeros(&[0])),
+            },
+            // Crop more elements than the axis contains.
+            Case {
+                input: [[1., 2.], [3., 4.]].into(),
+                pads: [-3, 0, 0, 0].into(),
+                mode: PadMode::Constant,
+                expected: Err(OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                )),
+            },
+        ];
+
+        test_pad_mode(&cases);
+    }
+
+    #[test]
+    fn test_pad_reflect() {
+        let cases = [
+            // Test case from ONNX spec.
+            //
+            // Pad start columns of a 2D tensor.
+            Case {
+                input: [[1.0, 1.2], [2.3, 3.4], [4.5, 5.7]].into(),
+                pads: [0, 2, 0, 0].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([
+                    [1.0, 1.2, 1.0, 1.2],
+                    [2.3, 3.4, 2.3, 3.4],
+                    [4.5, 5.7, 4.5, 5.7],
+                ])),
+            },
+            // Pad end columns of a 2D tensor.
+            Case {
+                input: [[1.0, 1.2], [2.3, 3.4], [4.5, 5.7]].into(),
+                pads: [0, 0, 0, 2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([
+                    [1.0, 1.2, 1.0, 1.2],
+                    [2.3, 3.4, 2.3, 3.4],
+                    [4.5, 5.7, 4.5, 5.7],
+                ])),
+            },
+            // Pad start and end columns of a 2D tensor.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, 3, 0, 3].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[4., 3., 2., 1., 2., 3., 4., 5., 4., 3., 2.]])),
+            },
+            // Pad start and end rows of a 2D tensor.
+            Case {
+                input: Tensor::from([1., 2., 3., 4., 5.]).into_shape([5, 1].as_slice()),
+                pads: [3, 0, 3, 0].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([4., 3., 2., 1., 2., 3., 4., 5., 4., 3., 2.])
+                    .into_shape([5 + 2 * 3, 1].as_slice())),
+            },
+            // Pad start and end of a 1D tensor.
+            Case {
+                input: [1., 2., 3., 4.].into(),
+                pads: [2, 2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([3., 2., 1., 2., 3., 4., 3., 2.])),
+            },
+            // Scalar input. This is always a noop since there are no dimensions
+            // to pad.
+            Case {
+                input: Tensor::from(2.),
+                pads: NdTensor::from([]),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from(2.)),
+            },
+            // Pad start columns of a 3D tensor.
+            Case {
+                input: [[[1., 2., 3.]]].into(),
+                pads: [0, 0, 2, 0, 0, 0].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[[3., 2., 1., 2., 3.]]])),
+            },
+            // Pad end columns of a 3D tensor.
+            Case {
+                input: [[[1., 2., 3.]]].into(),
+                pads: [0, 0, 0, 0, 0, 2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[[1., 2., 3., 2., 1.]]])),
+            },
+            // Pad start rows of a 3D tensor.
+            Case {
+                input: [[[1.], [2.], [3.]]].into(),
+                pads: [0, 2, 0, 0, 0, 0].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[[3.], [2.], [1.], [2.], [3.]]])),
+            },
+            // Pad channel dimension of a 3D tensor.
+            Case {
+                input: [[[1., 2., 3.]]].into(),
+                pads: [0, 0, 0, 2, 0, 0].into(),
+                mode: PadMode::Reflect,
+                expected: Err(OpError::unsupported_value(
+                    "Pad only supports non-constant padding of last 2 dims",
+                )),
+            },
+            // Pad zero-size dimension.
+            Case {
+                input: Tensor::zeros(&[3, 0]),
+                pads: NdTensor::from([0, 2, 0, 0]),
+                mode: PadMode::Reflect,
+                expected: Err(OpError::invalid_value(
+                    "Padded dimension for non-constant padding is empty",
+                )),
+            },
+            // Crop the start of an axis and reflect-pad the end.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[3., 4., 5., 4., 3.]])),
+            },
+            // Negative pads which empty an axis. No padding is applied, so the
+            // empty crop is returned rather than reflecting. ONNX Runtime and
+            // PyTorch disagree over whether this is an error.
+            Case {
+                input: [[1., 2., 3.]].into(),
+                pads: [0, -1, 0, -2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::zeros(&[1, 0])),
+            },
+            // Crop both ends of an axis and then reflect-pad it.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -1, 0, -1].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[2., 3., 4.]])),
+            },
+        ];
+
+        test_pad_mode(&cases);
+    }
+
+    // The Reflect, Edge and Wrap pad modes share most of the implementation.
+    // Most tests use the reflect mode, plus there are a smaller subset to test
+    // the different behaviors of Edge and Wrap.
+
+    #[test]
+    fn test_pad_edge() {
+        let cases = [
+            // Test case from ONNX spec.
+            Case {
+                input: [[1.0, 1.2], [2.3, 3.4], [4.5, 5.7]].into(),
+                pads: [0, 2, 0, 0].into(),
+                mode: PadMode::Edge,
+                expected: Ok(Tensor::from([
+                    [1.0, 1.0, 1.0, 1.2],
+                    [2.3, 2.3, 2.3, 3.4],
+                    [4.5, 4.5, 4.5, 5.7],
+                ])),
+            },
+            // Crop the start of an axis and edge-pad the end.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Edge,
+                expected: Ok(Tensor::from([[3., 4., 5., 5., 5.]])),
+            },
+        ];
+
+        test_pad_mode(&cases);
+    }
+
+    #[test]
+    fn test_pad_wrap() {
+        let cases = [
+            // Test case from ONNX spec.
+            Case {
+                input: [[1.0, 1.2], [2.3, 3.4], [4.5, 5.7]].into(),
+                pads: [2, 1, 1, 1].into(),
+                mode: PadMode::Wrap,
+                expected: Ok(Tensor::from([
+                    [3.4, 2.3, 3.4, 2.3],
+                    [5.7, 4.5, 5.7, 4.5],
+                    [1.2, 1.0, 1.2, 1.0],
+                    [3.4, 2.3, 3.4, 2.3],
+                    [5.7, 4.5, 5.7, 4.5],
+                    [1.2, 1.0, 1.2, 1.0],
+                ])),
+            },
+            // Crop the start of an axis and wrap-pad the end. The wrap uses the
+            // cropped axis, so it repeats 3 rather than continuing from 1.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Wrap,
+                expected: Ok(Tensor::from([[3., 4., 5., 3., 4.]])),
+            },
+        ];
+
+        test_pad_mode(&cases);
+    }
+
+    #[test]
+    fn test_pad_op() -> Result<(), Box<dyn Error>> {
+        let input = Tensor::from_data(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+        let pads = from_slice(&[1, 1, 1, 1]);
+        let expected = Tensor::from_data(
+            &[4, 4],
+            vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        );
+
+        let op = Pad {
+            mode: PadMode::Constant,
+        };
+        let result: Tensor<f32> = op.run_simple((&input, &pads)).unwrap();
+        expect_equal(&result, &expected)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pad_invalid_inputs() {
+        #[derive(Debug)]
+        struct Case {
+            input: Tensor<f32>,
+            pads: Tensor<i32>,
+            const_val: Option<Value>,
+            expected_error: OpError,
+        }
+
+        let input = Tensor::from([[1.0, 2.0], [3.0, 4.0]]);
+        let op = Pad {
+            mode: PadMode::Constant,
+        };
+
+        let cases = [
+            // Wrong padding vector length.
+            Case {
+                input: input.clone(),
+                pads: from_slice(&[1]),
+                const_val: None,
+                expected_error: OpError::invalid_value("padding length should be 2 * input dims"),
+            },
+            // Negative pads which remove more elements than an axis contains.
+            Case {
+                input: input.clone(),
+                pads: from_slice(&[-3, 0, 0, 0]),
+                const_val: None,
+                expected_error: OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                ),
+            },
+            // Wrong constant value type.
+            Case {
+                input: input.clone(),
+                pads: from_slice(&[1, 1, 1, -1]),
+                const_val: Some(Tensor::from(1).into()),
+                expected_error: OpError::InputCastFailed {
+                    index: 2,
+                    error: TryFromValueError::WrongType {
+                        actual: ValueType::Tensor(DataType::Int32),
+                        expected: ValueType::Tensor(DataType::Float),
+                    },
+                },
+            },
+            // Constant value not a scalar.
+            Case {
+                input: input.clone(),
+                pads: from_slice(&[1, 1, 1, -1]),
+                const_val: Some(from_slice(&[1.0, 2.0]).into()),
+                expected_error: OpError::InputCastFailed {
+                    index: 2,
+                    error: TryFromValueError::WrongRank {
+                        actual: 1,
+                        expected: 0,
+                    },
+                },
+            },
+        ];
+
+        cases.test_each(|case| {
+            let Case {
+                input,
+                pads,
+                const_val,
+                expected_error,
+            } = case;
+
+            let result = if let Some(const_val) = const_val {
+                op.run_simple::<_, Tensor<f32>>((input, pads, const_val))
+            } else {
+                op.run_simple::<_, Tensor<f32>>((input, pads))
+            };
+
+            assert_eq!(result.err().as_ref(), Some(expected_error));
+        });
+    }
+}

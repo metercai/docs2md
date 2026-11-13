@@ -1,0 +1,1594 @@
+//! Operators which query or change the shape of a tensor, or copy/move/reorder
+//! elements.
+
+use rten_base::bit_set::BitSet;
+use rten_base::num::AsUsize;
+use rten_shape_inference::ops as shape_ops;
+use rten_tensor::layout::is_valid_permutation;
+use rten_tensor::prelude::*;
+use rten_tensor::{CowTensor, NdTensorView, Tensor, TensorView};
+use smallvec::SmallVec;
+
+use crate::buffer_pool::{AutoReturn, BufferPool};
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
+use crate::operator::{
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext, static_dims,
+};
+use crate::ops::binary_elementwise::{broadcast_shapes, fast_broadcast_cycles_repeats};
+use crate::ops::{map_value_as_bits, map_view_as_bits, resolve_axes, resolve_axis};
+use crate::value::{BitCastTo, DataType, ValueType};
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum DepthToSpaceMode {
+    DepthColumnRow,
+    ColumnRowDepth,
+}
+
+pub fn depth_to_space<T: Clone>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    block_size: u32,
+    mode: DepthToSpaceMode,
+) -> Result<Tensor<T>, OpError> {
+    if block_size == 0 {
+        return Err(OpError::invalid_value("`block_size` must be > 0"));
+    }
+
+    let input = static_dims!(input, 4, "NCHW")?;
+    let [n, c, h, w] = input.shape();
+    let block_size = block_size.as_usize();
+
+    if c % (block_size * block_size) != 0 {
+        return Err(OpError::invalid_value(
+            "input channels must be a multiple of `block_size` squared",
+        ));
+    }
+
+    let new_c = c / (block_size * block_size);
+    let new_shape = [n, new_c, h * block_size, w * block_size];
+
+    // Reshape following steps in `DepthToSpace` ONNX spec.
+    // See https://onnx.ai/onnx/operators/onnx__DepthToSpace.html#summary
+    let tmp = input.to_contiguous_in(pool);
+    let tmp = match mode {
+        DepthToSpaceMode::DepthColumnRow => tmp.reshaped([n, block_size, block_size, new_c, h, w]),
+        DepthToSpaceMode::ColumnRowDepth => tmp.reshaped([n, new_c, block_size, block_size, h, w]),
+    };
+    let tmp = match mode {
+        DepthToSpaceMode::DepthColumnRow => tmp.permuted([0, 3, 4, 1, 5, 2]),
+        DepthToSpaceMode::ColumnRowDepth => tmp.permuted([0, 1, 4, 2, 5, 3]),
+    };
+    let mut tmp = tmp.to_tensor_in(pool).into_dyn();
+    tmp.reshape(&new_shape);
+
+    Ok(tmp)
+}
+
+#[derive(Debug)]
+pub struct DepthToSpace {
+    pub block_size: u32,
+    pub mode: DepthToSpaceMode,
+}
+
+impl Operator for DepthToSpace {
+    fn name(&self) -> &str {
+        "DepthToSpace"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require_as(0)?;
+        depth_to_space::<f32>(ctx.pool(), input, self.block_size, self.mode).into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    DepthToSpace,
+    op,
+    shape_ops::DepthToSpace {
+        block_size: op.block_size,
+    }
+);
+
+/// Return the tensor shape resulting from broadcasting `input_shape` with `shape`.
+fn expand_output_shape(
+    input_shape: &[usize],
+    shape: &NdTensorView<i32, 1>,
+) -> Result<SmallVec<[usize; 4]>, OpError> {
+    let shape_vec: SmallVec<[usize; 4]> = shape
+        .iter()
+        .map(|el| usize::try_from(*el))
+        .collect::<Result<_, _>>()
+        .map_err(|_| OpError::invalid_value("Target shape contains negative values"))?;
+    broadcast_shapes(input_shape, &shape_vec).ok_or(OpError::incompatible_input_shapes(
+        "Cannot broadcast input with target shape",
+    ))
+}
+
+/// Broadcast `input` to `out_shape`. This assumes that `out_shape` has already
+/// been verified to be a valid broadcast target.
+pub(crate) fn expand_to<T: Copy>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    out_shape: &[usize],
+) -> Tensor<T> {
+    let out_len = out_shape.iter().product();
+
+    match (
+        input.data(),
+        fast_broadcast_cycles_repeats(input.shape(), out_shape),
+    ) {
+        // Fast path for common case of contiguous input and broadcast that can
+        // be performed using cycle + repeat.
+        (Some(in_data), Some((cycles, repeats))) => {
+            assert!(out_len == input.len() * cycles * repeats);
+
+            let mut out_data: Vec<T> = pool.alloc(out_len);
+            let mut out_ptr = out_data.as_mut_ptr();
+            for _ in 0..cycles {
+                if repeats == 1 {
+                    // Super-fast path for cycling only.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(in_data.as_ptr(), out_ptr, in_data.len());
+                        out_ptr = out_ptr.add(in_data.len());
+                    }
+                } else {
+                    for el in in_data.iter() {
+                        for _ in 0..repeats {
+                            unsafe {
+                                *out_ptr = *el;
+                                out_ptr = out_ptr.add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            // Safety: We have initialized all output elements.
+            unsafe { out_data.set_len(out_len) };
+
+            Tensor::from_data(out_shape, out_data)
+        }
+        _ => input.broadcast(out_shape).to_tensor_in(pool),
+    }
+}
+
+pub fn expand<T: Copy>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    shape: &NdTensorView<i32, 1>,
+) -> Result<Tensor<T>, OpError> {
+    let out_shape = expand_output_shape(input.shape(), shape)?;
+    Ok(expand_to(pool, input, &out_shape))
+}
+
+#[derive(Debug)]
+pub struct Expand {}
+
+impl Operator for Expand {
+    fn name(&self) -> &str {
+        "Expand"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let shape = inputs.require_as(1)?;
+
+        map_view_as_bits!(input, x, dtype, {
+            expand(ctx.pool(), x, &shape)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        // Expand can run in place if it is a noop, ie. if the broadcasted
+        // shape is the same as the input shape.
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        let shape = ctx.inputs().require_as(1)?;
+
+        let out_shape = expand_output_shape(&input.shape(), &shape)?;
+        if input.shape() == out_shape {
+            return input.into_op_result();
+        }
+
+        map_value_as_bits!(input, input, dtype, {
+            let input = input.auto_return(ctx.pool());
+            let output = expand_to(ctx.pool(), input.view(), &out_shape);
+            output.bit_cast_to(dtype).into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&shape_ops::Expand)
+    }
+}
+
+fn flattened_shape(shape: &[usize], axis: isize) -> Result<[usize; 2], OpError> {
+    let outer_dims = if axis == shape.len() as isize {
+        shape.len()
+    } else {
+        resolve_axis(shape.len(), axis)?
+    };
+    let outer_size = shape.iter().take(outer_dims).product();
+    let inner_size = shape.iter().skip(outer_dims).product();
+    Ok([outer_size, inner_size])
+}
+
+pub fn flatten<T: Copy>(
+    pool: &BufferPool,
+    input: CowTensor<T>,
+    axis: isize,
+) -> Result<Tensor<T>, OpError> {
+    let shape = flattened_shape(input.shape(), axis)?;
+    let mut output = input.into_owned_in(pool);
+    output.reshape_in(pool, &shape);
+    Ok(output)
+}
+
+#[derive(Debug)]
+pub struct Flatten {
+    pub axis: isize,
+}
+
+impl Operator for Flatten {
+    fn name(&self) -> &str {
+        "Flatten"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require(0)?;
+        map_view_as_bits!(input, x, dtype, {
+            flatten(ctx.pool(), x.as_cow(), self.axis)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        map_value_as_bits!(input, x, dtype, {
+            flatten(ctx.pool(), x.into_cow(), self.axis)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    Flatten,
+    op,
+    shape_ops::Flatten {
+        axis: op.axis as i32
+    }
+);
+
+/// Compute the target shape for a reshape operation, given the shape of the
+/// input tensor and a target `shape` which may contain a "-1" entry to indicate
+/// a dimension whose size should be inferred.
+///
+/// Handling of zeros in the target shape depends on `allow_zero`. If false,
+/// the corresponding input dimension is copied, otherwise the zero is
+/// preserved in the output shape.
+fn resolve_shape(
+    input_shape: &[usize],
+    shape: &NdTensorView<i32, 1>,
+    allow_zero: bool,
+) -> Result<SmallVec<[usize; 4]>, OpError> {
+    // If exactly one of the new shape's dimensions is -1, infer the size
+    // from the input length and the sizes of the other dimensions.
+    let mut unspecified_dim = None;
+    let mut specified_dims_size = 1;
+    for (dim, &size) in shape.iter().enumerate() {
+        if size < -1 {
+            return Err(OpError::invalid_value("Invalid dimension size in shape"));
+        } else if size == 0 && !allow_zero {
+            if dim >= input_shape.len() {
+                return Err(OpError::invalid_value(
+                    "Zero dim has no corresponding input dim",
+                ));
+            }
+            specified_dims_size *= input_shape[dim];
+        } else if size != -1 {
+            specified_dims_size *= size as usize;
+        } else if unspecified_dim.is_some() {
+            return Err(OpError::invalid_value(
+                "Multiple dimensions in new shape set to -1",
+            ));
+        } else {
+            unspecified_dim = Some(dim);
+        }
+    }
+
+    let input_len: usize = input_shape.iter().product();
+    let length_mismatch = || {
+        Err(OpError::invalid_value(
+            "Input length does not match target shape",
+        ))
+    };
+
+    let unspecified_dim_size = if unspecified_dim.is_some() {
+        if specified_dims_size == 0 {
+            // The ONNX spec makes a target shape containing both a zero and a
+            // `-1` invalid, as the size of the `-1` dim cannot be determined
+            // uniquely when the other dims multiply to zero.
+            return Err(OpError::invalid_value(
+                "Cannot infer size of -1 dim when other dims are zero",
+            ));
+        } else if !input_len.is_multiple_of(specified_dims_size) {
+            return length_mismatch();
+        } else {
+            input_len / specified_dims_size
+        }
+    } else {
+        if specified_dims_size != input_len {
+            return length_mismatch();
+        }
+        // Unused, as the target shape has no `-1` dim.
+        0
+    };
+
+    Ok(shape
+        .iter()
+        .enumerate()
+        .map(|(dim, &size)| match size {
+            -1 => unspecified_dim_size,
+            0 if !allow_zero => input_shape[dim],
+            valid => valid as usize,
+        })
+        .collect())
+}
+
+pub fn reshape<T: Copy>(
+    pool: &BufferPool,
+    input: CowTensor<T>,
+    shape: &NdTensorView<i32, 1>,
+    allow_zero: bool,
+) -> Result<Tensor<T>, OpError> {
+    let out_shape = resolve_shape(input.shape(), shape, allow_zero)?;
+    let mut output = input.into_owned_in(pool);
+    output.reshape_in(pool, &out_shape);
+    Ok(output)
+}
+
+#[derive(Debug)]
+pub struct Reshape {
+    pub allow_zero: bool,
+}
+
+impl Operator for Reshape {
+    fn name(&self) -> &str {
+        "Reshape"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let shape = inputs.require_as(1)?;
+
+        map_view_as_bits!(input, x, dtype, {
+            reshape(ctx.pool(), x.as_cow(), &shape, self.allow_zero)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        let shape = ctx.inputs().require_as(1)?;
+
+        map_value_as_bits!(input, output, dtype, {
+            reshape(ctx.pool(), output.into_cow(), &shape, self.allow_zero)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    Reshape,
+    op,
+    shape_ops::Reshape {
+        allow_zero: op.allow_zero
+    }
+);
+
+#[derive(Debug, Default)]
+pub struct Shape {
+    pub start: Option<i32>,
+    pub end: Option<i32>,
+}
+
+impl Operator for Shape {
+    fn name(&self) -> &str {
+        "Shape"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require(0)?;
+
+        let shape_op = shape_ops::Shape {
+            start: self.start,
+            end: self.end,
+        };
+        let dim_range = shape_op.resolve_start_end(input.ndim());
+        let shape_slice = &input.shape()[dim_range];
+
+        // Allocate output from pool for consistency with other operators,
+        // even though the buffer is tiny, so there is no performance benefit.
+        let mut data = ctx.pool().alloc(input.ndim());
+        data.extend(shape_slice.iter().map(|&el| el as i32));
+
+        Tensor::from_data(&[shape_slice.len()], data).into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
+    }
+}
+
+impl_infer_shapes!(
+    Shape,
+    op,
+    shape_ops::Shape {
+        start: op.start,
+        end: op.end
+    }
+);
+
+#[derive(Debug)]
+pub struct Size {}
+
+impl Operator for Size {
+    fn name(&self) -> &str {
+        "Size"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require(0)?;
+        let len = input.len() as i32;
+
+        // Allocate output from pool for consistency with other operators,
+        // even though the buffer is tiny, so there is no performance benefit.
+        let mut output = Tensor::zeros_in(ctx.pool(), &[]);
+        output[[]] = len;
+
+        output.into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(Size, _op, shape_ops::Size);
+
+pub fn squeeze<T: Clone>(
+    pool: &BufferPool,
+    input: CowTensor<T>,
+    axes: Option<NdTensorView<i32, 1>>,
+) -> Result<Tensor<T>, OpError> {
+    let sorted_axes = if let Some(axes) = axes {
+        let axes = resolve_axes(input.ndim(), axes.iter())?;
+        for axis in axes.iter() {
+            if input.size(*axis) != 1 {
+                return Err(OpError::invalid_value(
+                    "Can only remove dimensions of size 1",
+                ));
+            }
+        }
+        axes
+    } else {
+        input
+            .shape()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, size)| if *size == 1 { Some(i) } else { None })
+            .collect()
+    };
+
+    let mut output = input.into_owned_in(pool);
+    for (n_removed, axis) in sorted_axes.into_iter().enumerate() {
+        output.remove_axis(axis - n_removed);
+    }
+
+    Ok(output)
+}
+
+#[derive(Debug)]
+pub struct Squeeze {}
+
+impl Operator for Squeeze {
+    fn name(&self) -> &str {
+        "Squeeze"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let axes = inputs.get_as(1)?;
+
+        map_view_as_bits!(input, x, dtype, {
+            squeeze(ctx.pool(), x.as_cow(), axes)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        let axes = ctx.inputs().get_as(1)?;
+
+        map_value_as_bits!(input, output, dtype, {
+            squeeze(ctx.pool(), output.into_cow(), axes)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&shape_ops::Squeeze)
+    }
+}
+
+pub fn transpose<T: Copy>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    permutation: Option<&[usize]>,
+) -> Result<Tensor<T>, OpError> {
+    let mut transposed = input.view();
+    match permutation {
+        Some(order) => {
+            if !is_valid_permutation(input.ndim(), order) {
+                return Err(OpError::invalid_value("Permutation is invalid"));
+            }
+            transposed.permute(order)
+        }
+        None => {
+            transposed.transpose();
+        }
+    };
+    let output = Tensor::uninit_in(pool, transposed.shape());
+    Ok(output.init_from(&transposed))
+}
+
+#[derive(Debug)]
+pub struct Transpose {
+    /// The order of the transposed dimensions. If ommitted, the dimensions
+    /// are reversed.
+    pub perm: Option<Vec<usize>>,
+}
+
+impl Operator for Transpose {
+    fn name(&self) -> &str {
+        "Transpose"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require(0)?;
+        let perm_slice = self.perm.as_deref();
+
+        map_view_as_bits!(input, x, dtype, {
+            transpose(ctx.pool(), x, perm_slice)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(
+    Transpose,
+    op,
+    shape_ops::Transpose {
+        perm: op.perm.as_deref(),
+    }
+);
+
+pub fn unsqueeze<T: Clone>(
+    pool: &BufferPool,
+    input: CowTensor<T>,
+    axes: &NdTensorView<i32, 1>,
+) -> Result<Tensor<T>, OpError> {
+    let mut resolved_axes: SmallVec<[usize; 4]> = SmallVec::with_capacity(axes.len());
+    for axis in axes.iter() {
+        let resolved = resolve_axis(input.ndim() + axes.len(), *axis as isize)?;
+        resolved_axes.push(resolved);
+    }
+    resolved_axes.sort();
+
+    if resolved_axes
+        .iter()
+        .zip(resolved_axes.iter().skip(1))
+        .any(|(prev, curr)| prev == curr)
+    {
+        return Err(OpError::invalid_value("Axes must be unique"));
+    }
+
+    let mut output = input.into_owned_in(pool);
+    for axis in resolved_axes {
+        output.insert_axis(axis);
+    }
+
+    Ok(output)
+}
+
+#[derive(Debug)]
+pub struct Unsqueeze {}
+
+impl Operator for Unsqueeze {
+    fn name(&self) -> &str {
+        "Unsqueeze"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let axes = inputs.require_as(1)?;
+
+        map_view_as_bits!(input, x, dtype, {
+            unsqueeze(ctx.pool(), x.as_cow(), &axes)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        let axes = ctx.inputs().require_as(1)?;
+
+        map_value_as_bits!(input, output, dtype, {
+            unsqueeze(ctx.pool(), output.into_cow(), &axes)
+                .map(|out| out.bit_cast_to(dtype))
+                .into_op_result()
+        })
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&rten_shape_inference::ops::Unsqueeze)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rten_bench::run_bench;
+    use rten_tensor::prelude::*;
+    use rten_tensor::rng::XorShiftRng;
+    use rten_tensor::test_util::expect_equal;
+    use rten_tensor::{NdTensor, Tensor};
+    use rten_testing::TestCases;
+
+    use super::{DepthToSpaceMode, depth_to_space};
+    use crate::buffer_pool::BufferPool;
+    use crate::operator::{OpError, OperatorExt};
+    use crate::ops::layout::{
+        Reshape, Shape, Size, expand, flatten, reshape, squeeze, transpose, unsqueeze,
+    };
+    use crate::value::Value;
+
+    #[test]
+    fn test_depth_to_space() {
+        #[derive(Debug)]
+        struct Case {
+            input: NdTensor<f32, 4>,
+            block_size: u32,
+            mode: DepthToSpaceMode,
+            expected: Result<Tensor, OpError>,
+        }
+
+        let input = NdTensor::from([
+            [[1.0]],
+            [[2.0]],
+            [[3.0]],
+            [[4.0]],
+            [[5.0]],
+            [[6.0]],
+            [[7.0]],
+            [[8.0]],
+        ])
+        .into_shape([1, 8, 1, 1]);
+
+        let cases = [
+            // DepthColumnRow (DCR) mode
+            Case {
+                input: input.clone(),
+                block_size: 2,
+                mode: DepthToSpaceMode::DepthColumnRow,
+                expected: Ok(
+                    NdTensor::from([[[1.0, 3.0], [5.0, 7.0]], [[2.0, 4.0], [6.0, 8.0]]])
+                        .into_shape([1, 2, 2, 2].as_slice()),
+                ),
+            },
+            // ColumnRowDepth (CRD) mode
+            Case {
+                input: input.clone(),
+                block_size: 2,
+                mode: DepthToSpaceMode::ColumnRowDepth,
+                expected: Ok(
+                    NdTensor::from([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+                        .into_shape([1, 2, 2, 2].as_slice()),
+                ),
+            },
+            // C % block_size^2 != 0
+            Case {
+                input: NdTensor::full([1, 16, 2, 2], 1.0),
+                block_size: 3,
+                mode: DepthToSpaceMode::ColumnRowDepth,
+                expected: Err(OpError::invalid_value(
+                    "input channels must be a multiple of `block_size` squared",
+                )),
+            },
+            // block_size == 0
+            Case {
+                input: NdTensor::full([1, 16, 2, 2], 1.0),
+                block_size: 0,
+                mode: DepthToSpaceMode::ColumnRowDepth,
+                expected: Err(OpError::invalid_value("`block_size` must be > 0")),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let result = depth_to_space(&pool, case.input.as_dyn(), case.block_size, case.mode);
+            assert_eq!(result, case.expected);
+        })
+    }
+
+    #[test]
+    fn test_expand() {
+        #[derive(Debug)]
+        struct Case {
+            input: Tensor<i32>,
+            shape: Vec<i32>,
+            expected: Result<(Vec<usize>, Option<Vec<i32>>), OpError>,
+        }
+
+        fn make_tensor(shape: impl AsRef<[usize]>) -> Tensor<i32> {
+            let len = shape.as_ref().iter().product::<usize>() as i32;
+            Tensor::arange(1, len + 1, None).into_shape(shape.as_ref())
+        }
+
+        let cases = [
+            // Broadcast scalar
+            Case {
+                input: Tensor::from(5),
+                shape: vec![2, 2],
+                expected: Ok((vec![2, 2], Some(vec![5, 5, 5, 5]))),
+            },
+            // Broadcast that changes dim count
+            Case {
+                input: make_tensor([3, 1]),
+                shape: vec![2, 3, 1],
+                expected: Ok((vec![2, 3, 1], None)),
+            },
+            // Broadcast that uses dimensions from both the input shape and target
+            // shape in the output shape.
+            Case {
+                input: make_tensor([3, 1]),
+                shape: vec![2, 1, 6],
+                expected: Ok((vec![2, 3, 6], None)),
+            },
+            // Broadcast that does not change dim count
+            Case {
+                input: make_tensor([3, 1]),
+                shape: vec![3, 4],
+                expected: Ok((vec![3, 4], None)),
+            },
+            // Broadcast of leading and trailing dims
+            Case {
+                input: make_tensor([1, 2, 1]),
+                shape: vec![2, 2, 2],
+                expected: Ok((vec![2, 2, 2], Some(vec![1, 1, 2, 2, 1, 1, 2, 2]))),
+            },
+            // Broadcast of inner dim
+            Case {
+                input: make_tensor([2, 1, 2]),
+                shape: vec![2, 2, 2],
+                expected: Ok((vec![2, 2, 2], Some(vec![1, 2, 1, 2, 3, 4, 3, 4]))),
+            },
+            // Invalid broadcast shape
+            Case {
+                input: Tensor::from([1, 2, 3]),
+                shape: vec![2, 2],
+                expected: Err(OpError::incompatible_input_shapes(
+                    "Cannot broadcast input with target shape",
+                )),
+            },
+            // Negative size
+            Case {
+                input: make_tensor([1]),
+                shape: vec![-1],
+                expected: Err(OpError::invalid_value(
+                    "Target shape contains negative values",
+                )),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let shape = NdTensorView::from(case.shape.as_slice());
+            let result = expand(&pool, case.input.view(), &shape);
+
+            match (&result, &case.expected) {
+                (Ok(output), Ok((expected_shape, expected_data))) => {
+                    assert_eq!(output.shape(), expected_shape.as_slice());
+                    if let Some(data) = expected_data {
+                        assert_eq!(output.data().unwrap(), data);
+                    }
+                }
+                (output, expected) => assert_eq!(output.as_ref().err(), expected.as_ref().err()),
+            }
+        })
+    }
+
+    #[test]
+    fn test_flatten() {
+        #[derive(Debug)]
+        struct Case {
+            shape: Vec<usize>,
+            axis: isize,
+            expected: Result<Vec<usize>, OpError>,
+        }
+
+        let cases = [
+            Case {
+                shape: [1, 5, 1, 1].into(),
+                axis: 1,
+                expected: Ok([1, 5].into()),
+            },
+            Case {
+                shape: [2, 3, 1, 4].into(),
+                axis: 2,
+                expected: Ok([6, 4].into()),
+            },
+            // Axis = 0
+            Case {
+                shape: [2, 3, 1, 4].into(),
+                axis: 0,
+                expected: Ok([1, 24].into()),
+            },
+            // Axis equal to rank of input
+            Case {
+                shape: [2, 2].into(),
+                axis: 2,
+                expected: Ok([4, 1].into()),
+            },
+            // Negative values count from the back
+            Case {
+                shape: [2, 3, 4].into(),
+                axis: -1,
+                expected: Ok([6, 4].into()),
+            },
+            Case {
+                shape: [2, 3, 4].into(),
+                axis: -2,
+                expected: Ok([2, 12].into()),
+            },
+            Case {
+                shape: [2, 3, 4].into(),
+                axis: -3,
+                expected: Ok([1, 24].into()),
+            },
+            // Values outside `[-r, r]` are invalid
+            Case {
+                shape: [2, 3, 4].into(),
+                axis: 4,
+                expected: Err(OpError::invalid_value(
+                    "Axis 4 is out of range. Must be in [-3, 3)",
+                )),
+            },
+            Case {
+                shape: [2, 3, 4].into(),
+                axis: -4,
+                expected: Err(OpError::invalid_value(
+                    "Axis -4 is out of range. Must be in [-3, 3)",
+                )),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let input = Tensor::<f32>::zeros(case.shape.as_slice());
+            let result =
+                flatten(&pool, input.as_cow(), case.axis).map(|tensor| tensor.shape().to_vec());
+            assert_eq!(result, case.expected);
+        })
+    }
+
+    #[test]
+    fn test_reshape() {
+        #[derive(Debug)]
+        struct Case<'a> {
+            input: &'a [usize],
+            shape: &'a [i32],
+            allow_zero: bool,
+            expected: Result<&'a [usize], OpError>,
+        }
+
+        let cases = [
+            // Valid shape with no zeros or -1s
+            Case {
+                input: &[2, 8],
+                shape: &[16],
+                allow_zero: false,
+                expected: Ok(&[16]),
+            },
+            // Valid shape with zeros
+            Case {
+                input: &[2, 8],
+                shape: &[0, 0],
+                allow_zero: false,
+                expected: Ok(&[2, 8]),
+            },
+            // Valid shape with zeros and input shape with zeros in
+            // corresponding dims.
+            Case {
+                input: &[0, 0],
+                shape: &[0, 0],
+                allow_zero: false,
+                expected: Ok(&[0, 0]),
+            },
+            // Valid shape with -1
+            Case {
+                input: &[2, 8],
+                shape: &[4, -1],
+                allow_zero: false,
+                expected: Ok(&[4, 4]),
+            },
+            // Valid shape with -1 and zero-length input
+            Case {
+                input: &[2, 0],
+                shape: &[4, -1],
+                allow_zero: false,
+                expected: Ok(&[4, 0]),
+            },
+            // Shape product that does not match input length
+            Case {
+                input: &[8],
+                shape: &[9],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Input length does not match target shape",
+                )),
+            },
+            // Shape with zero in dim that does not exist in input
+            Case {
+                input: &[2],
+                shape: &[2, 0],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Zero dim has no corresponding input dim",
+                )),
+            },
+            // allow_zero=true
+            Case {
+                input: &[0, 0, 10],
+                shape: &[10, 0, 0],
+                allow_zero: true,
+                expected: Ok(&[10, 0, 0]),
+            },
+            // allow_zero=true and non-zero input length
+            Case {
+                input: &[10, 1],
+                shape: &[10, 0],
+                allow_zero: true,
+                expected: Err(OpError::invalid_value(
+                    "Input length does not match target shape",
+                )),
+            },
+            // Multiple dims set to -1
+            Case {
+                input: &[2, 2],
+                shape: &[-1, -1],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Multiple dimensions in new shape set to -1",
+                )),
+            },
+            // Input length that is an exact multiple of the shape product
+            Case {
+                input: &[2, 8],
+                shape: &[1, 8],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Input length does not match target shape",
+                )),
+            },
+            // Attempted reshape of zero-length input to non-zero length output.
+            Case {
+                input: &[1, 2, 256, 0],
+                shape: &[1, 512, 256],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Input length does not match target shape",
+                )),
+            },
+            // Zero dim combined with -1, allow_zero=true
+            Case {
+                input: &[0, 4],
+                shape: &[0, -1],
+                allow_zero: true,
+                expected: Err(OpError::invalid_value(
+                    "Cannot infer size of -1 dim when other dims are zero",
+                )),
+            },
+            // Zero dim combined with -1, allow_zero=false
+            Case {
+                input: &[0, 4],
+                shape: &[0, -1],
+                allow_zero: false,
+                expected: Err(OpError::invalid_value(
+                    "Cannot infer size of -1 dim when other dims are zero",
+                )),
+            },
+        ];
+
+        for case in cases {
+            let pool = BufferPool::new();
+            let input = Tensor::<f32>::zeros(case.input);
+            let shape = NdTensorView::from(case.shape);
+            let result = reshape(&pool, input.as_cow(), &shape.view(), case.allow_zero);
+            let shape = result.as_ref().map(|t| t.shape());
+            assert_eq!(shape, case.expected.as_deref());
+        }
+    }
+
+    #[test]
+    fn test_reshape_in_place() {
+        let pool = BufferPool::new();
+        let input = Tensor::from_data(&[2, 2], vec![-0.5, 0.5, 3.0, -5.5]);
+        let shape = NdTensor::from([4]);
+        let expected = input.to_shape([4].as_slice());
+        let input = reshape(
+            &pool,
+            input.into_cow(),
+            &shape.view(),
+            false, /* allow_zero */
+        )
+        .unwrap();
+        assert_eq!(&input, &expected);
+    }
+
+    #[test]
+    fn test_reshape_op() -> Result<(), Box<dyn Error>> {
+        let input = Tensor::from_data(&[2, 2], vec![-0.5, 0.5, 3.0, -5.5]);
+        let shape = Tensor::from([4]);
+        let expected = input.to_shape([4].as_slice());
+
+        let op = Reshape { allow_zero: false };
+        let result: Tensor<f32> = op.run_simple((&input, &shape))?;
+
+        expect_equal(&result, &expected)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shape() {
+        #[derive(Debug)]
+        struct Case {
+            input: Value,
+            op: Shape,
+            expected: Vec<i32>,
+        }
+
+        let cases = [
+            // No `start` or `end` offsets.
+            Case {
+                input: Tensor::from_data(&[1, 1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).into(),
+                op: Shape::default(),
+                expected: [1, 1, 2, 2].into(),
+            },
+            Case {
+                input: Tensor::<i32>::zeros(&[1, 2, 3, 4]).into(),
+                op: Shape::default(),
+                expected: [1, 2, 3, 4].into(),
+            },
+            // Positive offsets.
+            Case {
+                input: Tensor::<i32>::zeros(&[1, 2, 3, 4]).into(),
+                op: Shape {
+                    start: Some(1),
+                    end: Some(3),
+                },
+                expected: [2, 3].into(),
+            },
+            // Negative offsets.
+            Case {
+                input: Tensor::<i32>::zeros(&[1, 2, 3, 4]).into(),
+                op: Shape {
+                    start: Some(-3),
+                    end: Some(-1),
+                },
+                expected: [2, 3].into(),
+            },
+            // Out of bound offsets.
+            Case {
+                input: Tensor::<i32>::zeros(&[1, 2, 3, 4]).into(),
+                op: Shape {
+                    start: Some(-6),
+                    end: Some(7),
+                },
+                expected: [1, 2, 3, 4].into(),
+            },
+            // Start > end
+            Case {
+                input: Tensor::<i32>::zeros(&[1, 2, 3, 4]).into(),
+                op: Shape {
+                    start: Some(2),
+                    end: Some(1),
+                },
+                expected: [].into(),
+            },
+            // Scalar tensor
+            Case {
+                input: Tensor::from(1i32).into(),
+                op: Shape::default(),
+                expected: [].into(),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let result: Tensor<i32> = case.op.run_simple(&case.input).unwrap();
+            assert_eq!(result.shape(), &[case.expected.len()]);
+            assert_eq!(result.to_vec(), case.expected);
+        });
+    }
+
+    #[test]
+    fn test_size() {
+        let op = Size {};
+        let input = Tensor::from([[1, 2], [3, 4]]);
+        let result: Tensor<i32> = op.run_simple(&input).unwrap();
+        assert_eq!(result.ndim(), 0);
+        assert_eq!(result.item(), Some(&4));
+    }
+
+    #[test]
+    fn test_squeeze() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[1, 5, 5, 1], &mut rng);
+        let mut expected = input.clone();
+
+        // Remove all 1-size axes.
+        expected.reshape(&[5, 5]);
+        let result = squeeze(&pool, input.as_cow(), None).unwrap();
+        expect_equal(&result, &expected)?;
+
+        // Remove final 1-size axis.
+        expected.reshape(&[1, 5, 5]);
+        let result = squeeze(&pool, input.as_cow(), Some(NdTensor::from([3]).view())).unwrap();
+        expect_equal(&result, &expected)?;
+
+        // Remove first 1-size axis.
+        expected.reshape(&[5, 5, 1]);
+        let result = squeeze(&pool, input.as_cow(), Some(NdTensor::from([0]).view())).unwrap();
+        expect_equal(&result, &expected)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_squeeze_in_place() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+        let mut rng = XorShiftRng::new(5678);
+
+        // Contiguous tensor
+        let input = Tensor::<f32>::rand(&[1, 1, 5, 5], &mut rng);
+        let expected = input.clone().into_shape([5, 5].as_slice());
+
+        let input = squeeze(&pool, input.into_cow(), None).unwrap();
+        expect_equal(&input, &expected)?;
+
+        // Non-contiguous tensor
+        let mut input = Tensor::<f32>::rand(&[1, 5, 2, 5], &mut rng);
+        input.permute(&[3, 2, 1, 0]);
+        let expected = input.clone().into_shape([5, 2, 5].as_slice());
+
+        let input = squeeze(&pool, input.into_cow(), None).unwrap();
+        expect_equal(&input, &expected)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_squeeze_invalid_inputs() {
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[1, 5, 5, 1], &mut rng);
+
+        let pool = BufferPool::new();
+        let result = squeeze(&pool, input.as_cow(), Some(NdTensor::from([1]).view()));
+
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value(
+                "Can only remove dimensions of size 1"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_transpose() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[10, 20], &mut rng);
+
+        let mut reversed = input.clone();
+        reversed.permute(&[1, 0]);
+
+        // With no explicit permutation given, the axes should be reversed.
+        let result = transpose(&pool, input.view(), None).unwrap();
+        expect_equal(&result, &reversed)?;
+
+        // With a no-op permutation given, the output should be unchanged.
+        let result = transpose(&pool, input.view(), Some(&[0, 1])).unwrap();
+        expect_equal(&result, &input)?;
+
+        // With a transposed permutation given, the axes should be reversed.
+        let result = transpose(&pool, input.view(), Some(&[1, 0])).unwrap();
+        expect_equal(&result, &reversed)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transpose_invalid_inputs() {
+        let pool = BufferPool::new();
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[10, 20], &mut rng);
+
+        // Too many dims
+        let result = transpose(&pool, input.view(), Some(&[0, 1, 1]));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Permutation is invalid"))
+        );
+
+        // Too few dims
+        let result = transpose(&pool, input.view(), Some(&[]));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Permutation is invalid"))
+        );
+
+        // Invalid dimension index
+        let result = transpose(&pool, input.view(), Some(&[2, 1]));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Permutation is invalid"))
+        );
+
+        // Repeated dimension index
+        let result = transpose(&pool, input.view(), Some(&[1, 1]));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Permutation is invalid"))
+        );
+    }
+
+    #[test]
+    fn test_unsqueeze() {
+        let pool = BufferPool::new();
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[3, 4, 5], &mut rng);
+
+        // Unsqueeze with axes in increasing order
+        let output = unsqueeze(&pool, input.as_cow(), &NdTensor::from([0, 4]).view()).unwrap();
+        assert_eq!(output.shape(), &[1, 3, 4, 5, 1]);
+
+        // Unsqueeze with axes in decreasing order
+        let output = unsqueeze(&pool, input.as_cow(), &NdTensor::from([4, 0]).view()).unwrap();
+        assert_eq!(output.shape(), &[1, 3, 4, 5, 1]);
+
+        // Unsqueeze a scalar into a 1-item vec
+        let scalar = Tensor::from(2.0);
+        let output = unsqueeze(&pool, scalar.as_cow(), &NdTensor::from([0]).view()).unwrap();
+        assert_eq!(output.shape(), &[1]);
+        assert_eq!(output.to_vec(), &[2.0]);
+    }
+
+    #[test]
+    fn test_unsqueeze_invalid_inputs() {
+        let pool = BufferPool::new();
+        let mut rng = XorShiftRng::new(5678);
+        let input = Tensor::<f32>::rand(&[10, 20], &mut rng);
+
+        // Invalid dimension index
+        let result = unsqueeze(&pool, input.as_cow(), &NdTensor::from([3]).view());
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value(
+                "Axis 3 is out of range. Must be in [-3, 3)"
+            ))
+        );
+
+        // Repeated dimension index
+        let result = unsqueeze(&pool, input.as_cow(), &NdTensor::from([1, 1]).view());
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Axes must be unique"))
+        );
+    }
+
+    use rten_tensor::{NdTensorView, TensorView, TensorViewMut};
+
+    fn reference_transpose_into<'a, T: Clone>(src: TensorView<T>, mut dest: TensorViewMut<T>) {
+        // Merge axes to maximize iteration count of the innermost loops.
+        let mut src = src.clone();
+        src.merge_axes();
+
+        while src.ndim() < 4 {
+            src.insert_axis(0);
+        }
+
+        let dest_data = dest.data_mut().unwrap();
+
+        let src: NdTensorView<T, 4> = src.nd_view();
+        let mut dest_offset = 0;
+        for i0 in 0..src.size(0) {
+            for i1 in 0..src.size(1) {
+                for i2 in 0..src.size(2) {
+                    for i3 in 0..src.size(3) {
+                        unsafe {
+                            let elt = src.get_unchecked([i0, i1, i2, i3]).clone();
+                            *dest_data.get_unchecked_mut(dest_offset) = elt;
+                            dest_offset += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_transpose() {
+        let mut rng = XorShiftRng::new(1234);
+
+        struct Case<'a> {
+            /// Input shape
+            shape: &'a [usize],
+
+            /// Permutation order (eg. `[1, 0]` for a matrix transpose)
+            perm: &'a [usize],
+        }
+
+        let cases = [
+            // No-op transpose
+            Case {
+                shape: &[512, 512],
+                perm: &[0, 1],
+            },
+            // Matrix transpose with power-of-2 sizes.
+            //
+            // In a naive transpose implementation, these are liable to
+            // experience slowdown due to poor cache usage. There can also be
+            // issues to a lesser extent with sizes which are a multiple of
+            // (cache_line_size / element_size).
+            Case {
+                shape: &[128, 128],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[256, 256],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[512, 512],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[1024, 1024],
+                perm: &[1, 0],
+            },
+            // Matrix transpose with non power-of-2 sizes.
+            Case {
+                shape: &[127, 127],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[255, 255],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[513, 513],
+                perm: &[1, 0],
+            },
+            Case {
+                shape: &[1023, 1023],
+                perm: &[1, 0],
+            },
+            // Transpose ops taken from Whisper encoder (base model) with 4
+            // batches of samples.
+            //
+            // Note the last two dimensions are powers of 2.
+            Case {
+                shape: &[4, 1500, 8, 64],
+                perm: &[0, 2, 1, 3],
+            },
+            Case {
+                shape: &[4, 8, 1500, 64],
+                perm: &[0, 2, 1, 3],
+            },
+            // Transpose ops taken from Whisper decoder (base model)
+            Case {
+                shape: &[1, 1500, 8, 64],
+                perm: &[0, 2, 3, 1],
+            },
+            Case {
+                shape: &[1, 288, 8, 64],
+                perm: &[0, 2, 1, 3],
+            },
+        ];
+
+        for Case { shape, perm } in cases {
+            let tensor = Tensor::<f32>::rand(shape, &mut rng);
+            let mut dest = Tensor::zeros(shape);
+
+            // Do a simple copy. This provides a lower-bound on how fast
+            // transpose can operate.
+            let copy_stats = run_bench(100, None, || {
+                dest.copy_from(&tensor.view());
+            });
+            assert_eq!(dest, tensor);
+
+            let reference_transpose_stats = run_bench(100, None, || {
+                let transposed = tensor.permuted(perm);
+                reference_transpose_into(
+                    transposed.view(),
+                    dest.reshaped_mut(transposed.shape()).unwrap(),
+                );
+            });
+
+            let transpose_stats = run_bench(100, None, || {
+                let transposed = tensor.permuted(perm);
+                dest.reshape(transposed.shape());
+                dest.copy_from(&transposed);
+            });
+            assert_eq!(dest, tensor.permuted(perm));
+
+            let transpose_overhead =
+                (transpose_stats.mean - copy_stats.mean).max(0.) / copy_stats.mean;
+            println!(
+                "transpose shape {:?} perm {:?} copy {:.3}ms ref transpose {:.3}ms opt transpose {:.3}ms overhead {}",
+                shape,
+                perm,
+                copy_stats.median,
+                reference_transpose_stats.median,
+                transpose_stats.median,
+                transpose_overhead
+            );
+        }
+    }
+}
