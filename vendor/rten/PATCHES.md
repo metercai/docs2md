@@ -42,6 +42,59 @@ gate was ≥10%); markdown byte-identical on all pages.
 change, re-vendor clean and delete this patch (and the
 `[patch.crates-io]` section in the root Cargo.toml).
 
+## Patch 2: topk — serial per-lane sort → parallel lanes
+
+**File:** `src/ops/reduce.rs`, function `topk`.
+
+**Upstream behaviour (0.27.0):** a serial `for (values, (out_values,
+indices)) in values.lanes(axis).zip(out_values.lanes_mut(axis))` loop, where
+each lane runs a `select_nth_unstable` partial sort (O(axis_size)). In the rec
+model the dominant TopK is k=8 over [7552, 1698] (axis_size=1698), so the loop
+runs 7552 serial select_nth calls. Profiled at 89–132 ms per rec run
+(30–31% of the rec stage) — the single largest rec op after the pointwise
+GEMMs were fixed by Patch 1.
+
+**Patch:** `values.lanes(axis).into_par_iter().zip(out_values.lanes(axis)
+.zip(out_indices.lanes(axis)).into_par_iter()).for_each(...)`. Each lane is
+independent (disjoint output lanes) and the per-lane select is unchanged, so
+the result is bit-identical. `T` and the `Ops::topk` trait bound gain
+`Send + Sync` (already implied by the existing `GemmInT`/`GemmOutT` bounds the
+call sites use).
+
+**Measured (b64 rec run):** TopK 89.1 ms → 11.8 ms (-86.7%).
+
+**Upstream status:** not fixed upstream.
+
+## Patch 3: depthwise_conv_2d — serial batch loop → nested rayon
+
+**File:** `src/ops/conv/depthwise.rs`, function
+`ConvExecutor::depthwise_conv_2d`.
+
+**Upstream behaviour (0.27.0):** `for n in 0..batch { out_chans.into_par_iter()
+... }` — `batch` *sequential* rayon regions, each parallel over its channels.
+Per-item work is ~0.5–1.6 ms, so at batch=64 the serial per-item spawn/join
+round trips add up. Profiled at 54.7 ms (k=9) + 13.2 ms (3x3) per b64 rec
+run (15.6% of the stage).
+
+**Patch:** the outer `for n in 0..batch` becomes `output.axis_iter_mut(0)
+.into_par_iter().zip(input.axis_iter(0).into_par_iter()).for_each(|(mut
+out_item, input_item)| { ... })`, keeping the inner `out_chans.into_par_iter()`
+over channels. At batch=1 the task set is identical to upstream (all channels
+parallel, no regression); at batch=64 the 8192 channel tasks are distributed
+in a single wave instead of 64 sequential joins.
+
+**Numerical semantics: unchanged.** Same per-(item, channel) work, same
+accumulation. 48-page product A/B byte-identical.
+
+**Measured (b64 rec run):** depthwise conv 54.7 ms → 13.7 ms (-75%).
+
+**Upstream status:** not fixed upstream.
+
+**Note (flat-flatten rejected):** an earlier variant flattened (batch,
+channel) into one `0..batch*out_c` region. It was faster at high batch but
+*regressed* small-batch pages (batch=1: 128 channel tasks serial inside one
+task). The nested version is >= upstream at every batch size and was kept.
+
 ## How to re-vendor / upgrade rten
 
 1. Copy the new crate source (e.g. from the cargo registry) over this

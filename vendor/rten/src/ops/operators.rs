@@ -85,7 +85,9 @@ pub trait Operators {
         sorted: bool,
     ) -> Result<(Tensor<Self::Elem>, Tensor<i32>), OpError>
     where
-        Self::Elem: Copy + Default + PartialOrd + IsNaN;
+        // `Send + Sync` is required by the parallel (lane-parallel)
+        // implementation; see PATCHES.md.
+        Self::Elem: Copy + Default + PartialOrd + IsNaN + Send + Sync;
 }
 
 /// Trait which exposes ONNX operators as methods of tensors.
@@ -203,7 +205,7 @@ impl<T: Send, S: Storage<Elem = T> + Sync, L: Layout + Clone + Sync> Operators
         sorted: bool,
     ) -> Result<(Tensor<Self::Elem>, Tensor<i32>), OpError>
     where
-        T: Copy + Default + PartialOrd + IsNaN,
+        T: Copy + Default + PartialOrd + IsNaN + Send + Sync,
     {
         run_operator(|pool| topk(pool, self.as_dyn(), k, axis, largest, sorted))
     }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use rayon::prelude::*;
 use rten_base::num::{Identities, IsNaN, MinMax};
 use rten_shape_inference::ops as shape_ops;
 use rten_simd::SimdOp;
@@ -1232,7 +1233,7 @@ impl Operator for ReduceSumSquare {
 
 impl_infer_shapes_for_reduce_op!(ReduceSumSquare);
 
-pub fn topk<T: Copy + Default + PartialOrd + IsNaN>(
+pub fn topk<T: Copy + Default + PartialOrd + IsNaN + Send + Sync>(
     pool: &BufferPool,
     values: TensorView<T>,
     k: usize,
@@ -1279,27 +1280,35 @@ pub fn topk<T: Copy + Default + PartialOrd + IsNaN>(
         }
     };
 
-    // Temporary array of (value, index).
-    let mut tmp: Vec<(T, usize)> = Vec::with_capacity(axis_size);
-
-    for (values, (out_values, indices)) in values
+    // PATCH (docs2md, 2026-11-13): evaluate the lanes in parallel. Each lane
+    // is independent and writes to disjoint output lanes, so the result is
+    // bit-identical to the serial loop. Upstream TopK is serial and, at the
+    // rec model's [B, T, V] shape, is the single most expensive op; see
+    // PATCHES.md.
+    values
         .lanes(axis)
-        .zip(out_values.lanes_mut(axis).zip(indices.lanes_mut(axis)))
-    {
-        tmp.clear();
-        tmp.extend(values.copied().zip(0..axis_size));
-        tmp.select_nth_unstable_by(k - 1, topk_cmp);
-        tmp.truncate(k);
+        .into_par_iter()
+        .zip(
+            out_values
+                .lanes_mut(axis)
+                .into_par_iter()
+                .zip(indices.lanes_mut(axis).into_par_iter()),
+        )
+        .for_each(|(values, (out_values, indices))| {
+            let mut tmp: Vec<(T, usize)> = Vec::with_capacity(axis_size);
+            tmp.extend(values.copied().zip(0..axis_size));
+            tmp.select_nth_unstable_by(k - 1, topk_cmp);
+            tmp.truncate(k);
 
-        if sorted {
-            tmp.sort_unstable_by(topk_cmp);
-        }
+            if sorted {
+                tmp.sort_unstable_by(topk_cmp);
+            }
 
-        for ((out_val, out_idx), (val, idx)) in out_values.zip(indices).zip(tmp.iter()) {
-            *out_val = *val;
-            *out_idx = *idx as i32;
-        }
-    }
+            for ((out_val, out_idx), (val, idx)) in out_values.zip(indices).zip(tmp.iter()) {
+                *out_val = *val;
+                *out_idx = *idx as i32;
+            }
+        });
 
     Ok((out_values, indices))
 }

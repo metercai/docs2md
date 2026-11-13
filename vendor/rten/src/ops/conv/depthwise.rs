@@ -297,7 +297,15 @@ impl<X: Copy + Default + Sync, W: Copy + Default + Sync, Y: Copy + Default>
         out_hw: [usize; 2],
         input_zero: Option<X>,
         kernel_zero: Option<&[W]>,
-    ) -> NdTensor<Y, 4> {
+    ) -> NdTensor<Y, 4>
+    where
+        // Required by the batch-parallel loop (each rayon task holds slices
+        // of the input / output tensors). Satisfied by every type the
+        // executor is instantiated with (GemmInT/GemmOutT imply Send + Sync).
+        X: Copy + Send + Sync,
+        W: Copy + Send + Sync,
+        Y: Copy + Send + Sync,
+    {
         let [batch, _in_c, _in_h, in_w]: [usize; 4] = input.shape();
         let [out_c, _, _k_h, k_w]: [usize; 4] = kernel.shape();
         let [_pad_top, pad_left, _pad_bottom, _pad_right] = padding;
@@ -333,36 +341,46 @@ impl<X: Copy + Default + Sync, W: Copy + Default + Sync, Y: Copy + Default>
             })
             .collect();
 
+        // PATCH (docs2md, 2026-11-13): parallelize the outer batch loop too.
+        // Upstream ran `batch` SEQUENTIAL rayon regions (one per item, over
+        // its channels); the per-item join round trips are wasted at these
+        // task sizes (the same pathology as the pointwise conv loop, see
+        // PATCHES.md). The inner channel parallelism is unchanged, so at
+        // batch=1 this is task-for-task identical to upstream; at higher
+        // batch all `batch * out_c` channel tasks share one pool wave
+        // instead of `batch` sequential waves. Bit-identical: each task
+        // writes one disjoint output channel.
         let n_init = AtomicUsize::new(0);
-        for n in 0..batch {
-            let mut out_chans = output.slice_mut(n);
-            let input = input.slice(n);
-
-            out_chans
-                .axis_iter_mut(0)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(out_chan, mut out_chans)| {
-                    let mut out_chans = out_chans
-                        .reshaped_mut([1, out_chans.size(0), out_chans.size(1)])
-                        .unwrap();
-                    self.depthwise_conv_2d_block(
-                        out_chans.view_mut(),
-                        out_chan..out_chan + 1,
-                        input,
-                        kernel.view(),
-                        bias,
-                        padding,
-                        strides,
-                        dilations,
-                        &col_range_for_kernel_x,
-                        input_zero,
-                        kernel_zero,
-                    );
-
-                    n_init.fetch_add(out_chans.len(), Ordering::SeqCst);
-                });
-        }
+        let chan_len = out_h * out_w;
+        output
+            .axis_iter_mut(0)
+            .into_par_iter()
+            .zip(input.axis_iter(0).into_par_iter())
+            .for_each(|(mut out_item, input_item)| {
+                out_item
+                    .axis_iter_mut(0)
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(out_chan, mut ch)| {
+                        let mut ch = ch
+                            .reshaped_mut([1, ch.size(0), ch.size(1)])
+                            .unwrap();
+                        self.depthwise_conv_2d_block(
+                            ch.view_mut(),
+                            out_chan..out_chan + 1,
+                            input_item,
+                            kernel.view(),
+                            bias,
+                            padding,
+                            strides,
+                            dilations,
+                            &col_range_for_kernel_x,
+                            input_zero,
+                            kernel_zero,
+                        );
+                        n_init.fetch_add(chan_len, Ordering::SeqCst);
+                    });
+            });
 
         // Safety: We initialized all output rows
         assert!(n_init.load(Ordering::SeqCst) == output.len());
